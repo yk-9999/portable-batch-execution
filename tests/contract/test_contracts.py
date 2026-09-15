@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -19,7 +19,7 @@ def artifact():
 
 def test_contract_security_boundaries():
     provenance = Provenance(
-        producer="test", revision="r", created_at=datetime.now(timezone.utc)
+        producer="test", revision="r", created_at=datetime.now(UTC)
     )
     with pytest.raises(ValidationError):
         ArtifactRef(object_id="x", uri="https://u:p@example/x", sha256="bad")
