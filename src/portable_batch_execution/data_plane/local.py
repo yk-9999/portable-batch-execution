@@ -3,6 +3,8 @@ from __future__ import annotations
 from hashlib import sha256
 from pathlib import Path
 from threading import RLock
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from portable_batch_execution.contracts import (
     ArtifactRef,
@@ -47,15 +49,22 @@ class LocalFilesystemDataPlane:
             size_bytes=len(data),
         )
 
+    @staticmethod
+    def _artifact_path(ref: ArtifactRef) -> Path:
+        parsed = urlparse(ref.uri)
+        if parsed.scheme != "file" or parsed.netloc:
+            raise ValueError("artifact ref must be a local file URI")
+        return Path(url2pathname(parsed.path))
+
     def read(self, ref: ArtifactRef) -> bytes:
-        path = Path(ref.uri.removeprefix("file:///"))
+        path = self._artifact_path(ref)
         if path.parent != self._artifacts or path.name != ref.object_id:
             raise ValueError("artifact ref is outside this data plane")
         return path.read_bytes()
 
     def exists(self, ref: ArtifactRef) -> bool:
         try:
-            path = Path(ref.uri.removeprefix("file:///"))
+            path = self._artifact_path(ref)
             return (
                 path.parent == self._artifacts
                 and path.name == ref.object_id
