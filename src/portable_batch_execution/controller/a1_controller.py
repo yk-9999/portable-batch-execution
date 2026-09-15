@@ -52,6 +52,78 @@ def _load_public_synthetic_plan() -> dict:
     return plan
 
 
+_WAVE_DISPATCH_HISTORY_KEY = "dispatches"
+
+
+def _dispatch_record(execution: BackendExecutionRef) -> dict:
+    return {
+        "backend_id": execution.backend_id,
+        "execution_id": execution.execution_id,
+        "web_url": execution.web_url,
+    }
+
+
+def _dispatch_metadata_match(left: dict, right: dict) -> bool:
+    return (
+        left.get("backend_id") == right.get("backend_id")
+        and str(left.get("execution_id")) == str(right.get("execution_id"))
+        and left.get("web_url") == right.get("web_url")
+    )
+
+
+def _normalize_wave_dispatch_history(entry: dict) -> list[dict]:
+    history = entry.get(_WAVE_DISPATCH_HISTORY_KEY)
+    if isinstance(history, list):
+        normalized: list[dict] = []
+        for item in history:
+            if not isinstance(item, dict) or not item.get("execution_id"):
+                raise ValueError("invalid dispatch history entry")
+            normalized.append(
+                {
+                    "backend_id": item.get("backend_id", "github-actions"),
+                    "execution_id": str(item["execution_id"]),
+                    "web_url": item.get("web_url"),
+                }
+            )
+        return normalized
+    if entry.get("execution_id"):
+        return [
+            {
+                "backend_id": entry.get("backend_id", "github-actions"),
+                "execution_id": str(entry["execution_id"]),
+                "web_url": entry.get("web_url"),
+            }
+        ]
+    return []
+
+
+def _serialize_wave_dispatch_entry(dispatches: list[dict]) -> dict:
+    if not dispatches:
+        raise ValueError("dispatch history cannot be empty")
+    latest = dispatches[-1]
+    return {
+        _WAVE_DISPATCH_HISTORY_KEY: dispatches,
+        "backend_id": latest["backend_id"],
+        "execution_id": latest["execution_id"],
+        "web_url": latest.get("web_url"),
+    }
+
+
+def _inspect_dispatch_waves(waves: dict) -> dict:
+    inspected: dict = {}
+    if not isinstance(waves, dict):
+        return inspected
+    for wave_id, entry in waves.items():
+        if not isinstance(entry, dict):
+            continue
+        dispatches = _normalize_wave_dispatch_history(entry)
+        inspected[wave_id] = {
+            "dispatches": dispatches,
+            "latest_execution_id": dispatches[-1]["execution_id"] if dispatches else None,
+        }
+    return inspected
+
+
 class A1Controller:
     """Prepare private runs, dispatch waves, and reconcile manifests as sole writer."""
 
@@ -88,6 +160,28 @@ class A1Controller:
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload) + "\n", encoding="utf-8")
         temporary.replace(path)
+
+    def _record_wave_dispatch(
+        self,
+        state: dict,
+        wave_id: str,
+        execution: BackendExecutionRef,
+    ) -> BackendExecutionRef:
+        waves = state.setdefault("waves", {})
+        if not isinstance(waves, dict):
+            raise TypeError("invalid dispatch waves")
+        entry = waves.get(wave_id, {})
+        history = _normalize_wave_dispatch_history(entry) if isinstance(entry, dict) and entry else []
+        record = _dispatch_record(execution)
+        for existing in history:
+            if existing["execution_id"] == record["execution_id"]:
+                if not _dispatch_metadata_match(existing, record):
+                    raise ValueError("conflicting dispatch metadata for execution_id")
+                waves[wave_id] = _serialize_wave_dispatch_entry(history)
+                return execution
+        history.append(record)
+        waves[wave_id] = _serialize_wave_dispatch_entry(history)
+        return execution
 
     def prepare_private_synthetic_run(
         self,
@@ -172,39 +266,40 @@ class A1Controller:
             raise ValueError("resolved wave does not match dispatch request")
         execution = self.backend.submit_wave(WaveSubmission(wave))
         state = self._read_dispatch_state(run_id)
-        state["waves"][wave_id] = {
-            "backend_id": execution.backend_id,
-            "execution_id": execution.execution_id,
-            "web_url": execution.web_url,
-        }
+        recorded = self._record_wave_dispatch(state, wave_id, execution)
         self._write_dispatch_state(run_id, state)
-        return execution
+        return recorded
 
     def inspect_run(self, run_id: str) -> dict:
         run_id = opaque_identifier(run_id, "run_id")
         manifest = self.data_plane.read_manifest(run_id)
         dispatch = self._read_dispatch_state(run_id)
+        waves = dispatch.get("waves", {})
+        queried_execution_id = None
         backend_status = None
-        if self.backend is not None:
-            waves = dispatch.get("waves", {})
-            if isinstance(waves, dict) and len(waves) == 1:
-                entry = next(iter(waves.values()))
-                if isinstance(entry, dict) and entry.get("execution_id"):
+        if self.backend is not None and isinstance(waves, dict) and len(waves) == 1:
+            entry = next(iter(waves.values()))
+            if isinstance(entry, dict):
+                dispatches = _normalize_wave_dispatch_history(entry)
+                if dispatches:
+                    latest = dispatches[-1]
+                    queried_execution_id = latest["execution_id"]
                     backend_status = self.backend.get_run(
                         BackendExecutionRef(
-                            entry.get("backend_id", "github-actions"),
-                            str(entry["execution_id"]),
-                            entry.get("web_url"),
+                            latest.get("backend_id", "github-actions"),
+                            latest["execution_id"],
+                            latest.get("web_url"),
                         )
                     )
         return {
             "logical_run_id": run_id,
             "manifest_revision": manifest.revision if manifest else None,
             "manifest_status": manifest.status if manifest else None,
-            "dispatch": dispatch.get("waves", {}),
+            "dispatch": _inspect_dispatch_waves(waves if isinstance(waves, dict) else {}),
             "backend_status": None
             if backend_status is None
             else {
+                "queried_execution_id": queried_execution_id,
                 "execution_id": backend_status.execution_id,
                 "status": backend_status.status,
             },
