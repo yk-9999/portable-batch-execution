@@ -150,7 +150,7 @@
         "value": {
           "minimum": 0,
           "title": "Value",
-          "type": "number"
+          "type": "integer"
         },
         "unit": {
           "enum": [

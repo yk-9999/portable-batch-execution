@@ -1,7 +1,9 @@
+import re
 from datetime import datetime
+from math import isfinite
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 PACK_OPS = {
     "tabular-batch": {
@@ -74,6 +76,22 @@ class ArtifactRef(Frozen):
     media_type: str | None = None
     size_bytes: int | None = Field(None, ge=0)
 
+    @field_validator("sha256")
+    @classmethod
+    def valid_digest(cls, value: str) -> str:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise ValueError("sha256 required")
+        return value
+
+    @field_validator("uri")
+    @classmethod
+    def safe_uri(cls, value: str) -> str:
+        if re.search(
+            r"://[^/]+@|[?#].*(token|secret|password|credential)", value, re.IGNORECASE
+        ):
+            raise ValueError("secret URI")
+        return value
+
 
 class Provenance(Frozen):
     producer: str
@@ -117,7 +135,7 @@ class ExecutionPolicy(Frozen):
 
 
 class Extent(Frozen):
-    value: float = Field(ge=0)
+    value: int = Field(ge=0)
     unit: Literal["records", "seconds", "minutes", "hours", "days"]
 
 
@@ -125,6 +143,13 @@ class RangeSpec(Frozen):
     kind: Literal["index", "time", "key"]
     start: str | int | float | None = None
     end: str | int | float | None = None
+
+    @field_validator("start", "end")
+    @classmethod
+    def safe_scalar(cls, value):
+        if isinstance(value, bool) or isinstance(value, float) and not isfinite(value):
+            raise ValueError("safe scalar required")
+        return value
 
 
 class ShardCorrectnessSpec(Frozen):
@@ -173,6 +198,31 @@ class JobSpec(Frozen):
             "executable",
         } & set(self.operation_params):
             raise ValueError("closed operation parameters")
+
+        def walk(value):
+            if isinstance(value, dict):
+                if {
+                    "shell",
+                    "command",
+                    "cmd",
+                    "python",
+                    "python_code",
+                    "script",
+                    "sql",
+                    "import_path",
+                    "entrypoint",
+                    "executable",
+                } & set(value):
+                    raise ValueError("reserved nested parameter")
+                for item in value.values():
+                    walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+            elif value is not None and not isinstance(value, (str, int, float, bool)):
+                raise ValueError("JSON compatible params only")
+
+        walk(self.operation_params)
         return self
 
 
@@ -188,6 +238,12 @@ class ShardSpec(Frozen):
     input_digest: str
     execution_fingerprint: str
 
+    @model_validator(mode="after")
+    def affinity(self):
+        if self.correctness.mode == "partition_affinity" and not self.partition_key:
+            raise ValueError("partition key required")
+        return self
+
 
 class WaveSpec(Frozen):
     schema_version: Literal["1"] = "1"
@@ -196,6 +252,12 @@ class WaveSpec(Frozen):
     ordinal: int = Field(ge=0)
     shard_ids: tuple[str, ...]
     max_parallel: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def unique(self):
+        if not self.shard_ids or len(self.shard_ids) != len(set(self.shard_ids)):
+            raise ValueError("unique nonempty shards")
+        return self
 
 
 class ShardAttemptRecord(Frozen):
@@ -215,6 +277,21 @@ class ShardAttemptRecord(Frozen):
     failure: str | None = None
     backend_execution_id: str | None = None
     backend_job_id: str | None = None
+
+    @model_validator(mode="after")
+    def invariants(self):
+        if self.finished_at < self.started_at or any(
+            v < 0 for v in self.counts.values()
+        ):
+            raise ValueError("invalid attempt")
+        if (
+            self.status == "succeeded"
+            and self.failure
+            or self.status == "failed"
+            and not self.failure
+        ):
+            raise ValueError("failure invariant")
+        return self
 
 
 class RunManifest(Frozen):
@@ -240,3 +317,22 @@ class RunManifest(Frozen):
     )
     final_output_refs: tuple[ArtifactRef, ...] = ()
     backend_executions: tuple[dict[str, Any], ...] = ()
+
+    @model_validator(mode="after")
+    def manifest_invariants(self):
+        expected = set(self.expected_shard_ids)
+        if (
+            len(expected) != len(self.expected_shard_ids)
+            or self.updated_at < self.created_at
+        ):
+            raise ValueError("manifest invariant")
+        if (
+            not set(
+                self.completed_shard_ids
+                + self.missing_shard_ids
+                + self.duplicate_shard_ids
+            )
+            <= expected
+        ):
+            raise ValueError("unknown shard")
+        return self
