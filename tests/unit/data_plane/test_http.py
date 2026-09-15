@@ -10,6 +10,17 @@ from portable_batch_execution.data_plane import (
 )
 
 
+def test_http_plane_rejects_non_https_base_url_without_leaking_secrets():
+    token = "SENTINEL_TOKEN_DO_NOT_LEAK"
+    base_url = "http://plane.example/private-path"
+    with pytest.raises(ValueError, match="HTTPS origin URL") as error:
+        HttpPrivateDataPlane(base_url, token)
+    message = str(error.value)
+    assert token not in message
+    assert "plane.example" not in message
+    assert "http://" not in message
+
+
 def test_http_plane_resolves_exact_opaque_pair_and_uses_bearer(monkeypatch):
     seen = {}
     def handler(request):

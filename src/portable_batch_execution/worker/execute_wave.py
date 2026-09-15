@@ -69,9 +69,26 @@ def _matching_current_attempts(
     ]
 
 
-def _private_attempt_id(wave_id: str, shard_id: str, current_attempt_count: int) -> str:
+def _private_generation_discriminator(
+    input_digest: str, execution_fingerprint: str
+) -> str:
+    material = f"{input_digest}\x1f{execution_fingerprint}".encode()
+    return sha256(material).hexdigest()[:12]
+
+
+def _private_attempt_id(
+    wave_id: str,
+    shard_id: str,
+    *,
+    input_digest: str,
+    execution_fingerprint: str,
+    current_attempt_count: int,
+) -> str:
+    generation = _private_generation_discriminator(
+        input_digest, execution_fingerprint
+    )
     ordinal = current_attempt_count + 1
-    return f"{wave_id}-{shard_id}-{ordinal}"
+    return f"{wave_id}-{shard_id}-{generation}-{ordinal}"
 
 
 def _artifact_ref_matches_bytes(data: bytes, ref: ArtifactRef) -> bool:
@@ -225,7 +242,13 @@ def execute_private_wave(
         if not shard.input_refs:
             raise ValueError("private shard has no input artifact")
         started_at = datetime.now(UTC)
-        attempt_id = _private_attempt_id(wave_id, shard.shard_id, len(current))
+        attempt_id = _private_attempt_id(
+            wave_id,
+            shard.shard_id,
+            input_digest=shard.input_digest,
+            execution_fingerprint=shard.execution_fingerprint,
+            current_attempt_count=len(current),
+        )
         input_ref = shard.input_refs[0]
         try:
             try:

@@ -51,7 +51,7 @@ uv run python scripts/export_schemas.py
 
 Trusted `workflow_dispatch` can retain the committed `wave-0000` public smoke
 path, or select private mode with only opaque `run_id` and `wave_id`. Private
-mode reads `PBE_PRIVATE_DATA_PLANE_BASE_URL` and
+mode reads `PBE_PRIVATE_DATA_PLANE_BASE_URL` (HTTPS origin only) and
 `PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN` from the workflow environment. The
 controller implements `GET /v1/runs/{run_id}/waves/{wave_id}`, artifact content
 at `/v1/artifacts/{object_id}/content`, artifact upload, and run attempt

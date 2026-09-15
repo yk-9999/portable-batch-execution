@@ -23,8 +23,15 @@ class PrivateDataPlaneError(RuntimeError):
 class HttpPrivateDataPlane:
     def __init__(self, base_url: str, bearer_token: str, *, client: httpx.Client | None = None):
         parsed = urlsplit(base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError("private data plane base URL must be an origin URL")
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("private data plane base URL must be an HTTPS origin URL")
         if not bearer_token:
             raise ValueError("private data plane bearer token is required")
         self.base_url = base_url.rstrip("/")

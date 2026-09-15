@@ -9,6 +9,7 @@ from portable_batch_execution.contracts import ArtifactRef, ShardAttemptRecord
 from portable_batch_execution.kernel import exhausted_shards
 from portable_batch_execution.worker.execute_wave import (
     PrivateWaveExecutionError,
+    _private_attempt_id,
     execute_private_wave,
 )
 
@@ -171,7 +172,52 @@ def test_stale_attempts_do_not_consume_ordinal_or_budget():
         side_effect=RuntimeError(_SENTINEL),
     ), pytest.raises(PrivateWaveExecutionError):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)
-    assert plane.appended[-1].attempt_id == "opaque-wave-opaque-shard-1"
+    assert plane.appended[-1].attempt_id == _private_attempt_id(
+        "opaque-wave",
+        "opaque-shard",
+        input_digest="current",
+        execution_fingerprint="fixed",
+        current_attempt_count=0,
+    )
+    assert len([item for item in plane.appended if item.input_digest == "current"]) == 1
+
+
+def test_new_generation_reuses_ordinal_without_colliding_with_stale_generation():
+    now = datetime.now(UTC)
+    stale_attempt_id = _private_attempt_id(
+        "opaque-wave",
+        "opaque-shard",
+        input_digest="stale",
+        execution_fingerprint="stale",
+        current_attempt_count=0,
+    )
+    stale = ShardAttemptRecord(
+        logical_run_id="opaque-run",
+        shard_id="opaque-shard",
+        attempt_id=stale_attempt_id,
+        status="failed",
+        input_digest="stale",
+        execution_fingerprint="stale",
+        started_at=now,
+        finished_at=now,
+        failure="shard_execution_failed",
+    )
+    plane = _plane(appended=[stale])
+    with patch(
+        "portable_batch_execution.worker.execute_wave.TabularPack.execute",
+        side_effect=RuntimeError(_SENTINEL),
+    ), pytest.raises(PrivateWaveExecutionError):
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    current_attempt_id = _private_attempt_id(
+        "opaque-wave",
+        "opaque-shard",
+        input_digest="current",
+        execution_fingerprint="fixed",
+        current_attempt_count=0,
+    )
+    assert current_attempt_id.endswith("-1")
+    assert current_attempt_id != stale_attempt_id
+    assert plane.appended[-1].attempt_id == current_attempt_id
     assert len([item for item in plane.appended if item.input_digest == "current"]) == 1
 
 
