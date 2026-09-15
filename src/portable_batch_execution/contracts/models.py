@@ -50,6 +50,7 @@ PACK_OPS = {
         "ml.embedding",
         "ml.similarity",
         "ml.clustering",
+        "ml.char_wb_tfidf_logistic_score",
     },
     "media-batch": {
         "media.decode",

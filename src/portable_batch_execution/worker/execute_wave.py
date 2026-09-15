@@ -20,6 +20,9 @@ from portable_batch_execution.contracts import (
 )
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
 from portable_batch_execution.packs import TabularPack
+from portable_batch_execution.packs.ml.char_wb_tfidf_logistic_score import (
+    execute_char_wb_tfidf_logistic_score,
+)
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})
@@ -41,6 +44,7 @@ _PRIVATE_TABULAR_MULTI_INPUT_OPS = frozenset(
         "tabular.format_migration",
     }
 )
+_PRIVATE_ML_SINGLE_INPUT_OPS = frozenset({"ml.char_wb_tfidf_logistic_score"})
 
 
 class PrivateWaveExecutionError(RuntimeError):
@@ -223,11 +227,17 @@ def execute_private_wave(
         raise ValueError("private data plane resolved a different run or wave")
     if tuple(shard.shard_id for shard in shards) != wave.shard_ids or any(shard.logical_run_id != run_id for shard in shards):
         raise ValueError("private data plane returned mismatched shards")
-    if job.pack != "tabular-batch":
-        raise ValueError("private wave operation is not available on the public runner")
-    if job.operation in _PRIVATE_TABULAR_MULTI_INPUT_OPS:
-        raise ValueError("private wave operation requires a typed multi-input contract")
-    if job.operation not in _PRIVATE_TABULAR_SINGLE_INPUT_OPS:
+    if job.pack == "tabular-batch":
+        if job.operation in _PRIVATE_TABULAR_MULTI_INPUT_OPS:
+            raise ValueError("private wave operation requires a typed multi-input contract")
+        if job.operation not in _PRIVATE_TABULAR_SINGLE_INPUT_OPS:
+            raise ValueError("private wave operation is not available on the public runner")
+        private_pack = "tabular-batch"
+    elif job.pack == "ml-batch":
+        if job.operation not in _PRIVATE_ML_SINGLE_INPUT_OPS:
+            raise ValueError("private wave operation is not available on the public runner")
+        private_pack = "ml-batch"
+    else:
         raise ValueError("private wave operation is not available on the public runner")
     prior = plane.read_attempts(run_id)
     attempts: list[ShardAttemptRecord] = []
@@ -266,22 +276,41 @@ def execute_private_wave(
                     _execution_failure_code(exc, stage="input_decode")
                 ) from None
             try:
-                rows = json.loads(text)
+                parsed_input = json.loads(text)
             except ValueError as exc:
                 raise _ShardStageFailure(
                     _execution_failure_code(exc, stage="input_parse")
                 ) from None
-            if not isinstance(rows, list):
-                raise _ShardStageFailure(
-                    _execution_failure_code(TypeError(), stage="input_parse")
-                )
-            try:
-                result = pack.execute(job, shard, job.operation_params, {"data": rows})
-            except Exception as exc:  # noqa: BLE001
-                raise _ShardStageFailure(
-                    _execution_failure_code(exc, stage="pack")
-                ) from None
-            output = json.dumps(result.to_dicts(), sort_keys=True).encode("utf-8")
+            if private_pack == "tabular-batch":
+                if not isinstance(parsed_input, list):
+                    raise _ShardStageFailure(
+                        _execution_failure_code(TypeError(), stage="input_parse")
+                    )
+                try:
+                    result = pack.execute(
+                        job, shard, job.operation_params, {"data": parsed_input}
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise _ShardStageFailure(
+                        _execution_failure_code(exc, stage="pack")
+                    ) from None
+                output = json.dumps(result.to_dicts(), sort_keys=True).encode("utf-8")
+                input_rows = len(parsed_input)
+                output_rows = result.height
+            else:
+                if not isinstance(parsed_input, dict):
+                    raise _ShardStageFailure(
+                        _execution_failure_code(TypeError(), stage="input_parse")
+                    )
+                try:
+                    result_payload = execute_char_wb_tfidf_logistic_score(parsed_input)
+                except Exception as exc:  # noqa: BLE001
+                    raise _ShardStageFailure(
+                        _execution_failure_code(exc, stage="pack")
+                    ) from None
+                output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
+                input_rows = len(parsed_input.get("rows", ()))
+                output_rows = len(result_payload["rows"])
             try:
                 output_ref = plane.write(output, "application/json")
             except Exception as exc:  # noqa: BLE001
@@ -302,7 +331,7 @@ def execute_private_wave(
                 wave_id=wave_id,
                 output_refs=(output_ref,),
                 output_digest=sha256(output).hexdigest(),
-                counts={"input_rows": len(rows), "output_rows": result.height},
+                counts={"input_rows": input_rows, "output_rows": output_rows},
             )
         except _ShardStageFailure as failed:
             attempt = ShardAttemptRecord(

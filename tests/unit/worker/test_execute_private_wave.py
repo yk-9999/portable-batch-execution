@@ -25,11 +25,24 @@ def _plane(
     read_raises=None,
     write_raises=False,
     operation="tabular.rolling",
+    pack="tabular-batch",
+    ml_payload=None,
     input_ref_overrides=None,
     write_ref_overrides=None,
 ):
-    rows = rows if rows is not None else [{"group": "a", "value": 1}]
-    payload = json.dumps(rows).encode()
+    if pack == "ml-batch":
+        document = ml_payload if ml_payload is not None else {
+            "schema_version": "pbe.ml.char-wb-tfidf-logistic-score.v1",
+            "model": {
+                "features": [{"feature": "ab", "idf": 1.0, "coefficient": 0.0}],
+                "intercept": 0.0,
+            },
+            "rows": [{"row_id": "row-1", "text": "ab"}],
+        }
+        payload = json.dumps(document).encode()
+    else:
+        rows = rows if rows is not None else [{"group": "a", "value": 1}]
+        payload = json.dumps(rows).encode()
     input_ref_fields = {
         "object_id": "input",
         "uri": "pbe://private/input",
@@ -53,18 +66,22 @@ def _plane(
     job = {
         "job_id": "job",
         "logical_run_id": "opaque-run",
-        "pack": "tabular-batch",
+        "pack": pack,
         "operation": operation,
         "input_manifest_ref": input_ref.model_dump(mode="json"),
         "sharding": {},
         "execution": {"max_parallel": 1, "max_attempts_per_shard": max_attempts},
         "security_profile": "offline",
         "provenance": {"producer": "test", "revision": "1", "created_at": now},
-        "operation_params": {
-            "column": "value",
-            "window_size": 2,
-            "output_column": "rolling",
-        },
+        "operation_params": (
+            {}
+            if pack == "ml-batch"
+            else {
+                "column": "value",
+                "window_size": 2,
+                "output_column": "rolling",
+            }
+        ),
     }
     wave = {
         "logical_run_id": "opaque-run",
@@ -87,9 +104,10 @@ def _plane(
         def read(self, ref):
             if read_raises:
                 raise read_raises
-            return json.dumps(rows).encode()
+            return payload
 
         def write(self, data, media_type):
+            self.last_written = data
             if write_raises:
                 raise RuntimeError(_SENTINEL)
             output_ref_fields = {
@@ -305,6 +323,67 @@ def test_input_size_mismatch_records_sanitized_failure():
     with pytest.raises(PrivateWaveExecutionError):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)
     assert plane.appended[0].failure == "input_artifact_mismatch"
+
+
+def test_ml_char_wb_success_records_row_counts():
+    plane = _plane(
+        pack="ml-batch",
+        operation="ml.char_wb_tfidf_logistic_score",
+        ml_payload={
+            "schema_version": "pbe.ml.char-wb-tfidf-logistic-score.v1",
+            "model": {
+                "features": [{"feature": "ab", "idf": 1.0, "coefficient": 0.0}],
+                "intercept": 0.0,
+            },
+            "rows": [
+                {"row_id": "a", "text": "ab"},
+                {"row_id": "b", "text": "xy"},
+            ],
+        },
+    )
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert len(attempts) == 1
+    record = attempts[0]
+    assert record.status == "succeeded"
+    assert record.counts == {"input_rows": 2, "output_rows": 2}
+    output = json.loads(plane.last_written.decode())
+    assert (
+        output["schema_version"]
+        == "pbe.ml.char-wb-tfidf-logistic-score-result.v1"
+    )
+    assert [item["row_id"] for item in output["rows"]] == ["a", "b"]
+
+
+def test_ml_malformed_contract_records_sanitized_failure():
+    plane = _plane(
+        pack="ml-batch",
+        operation="ml.char_wb_tfidf_logistic_score",
+        ml_payload={
+            "schema_version": "pbe.ml.char-wb-tfidf-logistic-score.v1",
+            "model": {
+                "features": [{"feature": "ab", "idf": 1.0, "coefficient": 0.0}],
+                "intercept": 0.0,
+            },
+            "rows": [
+                {"row_id": "a", "text": "ok"},
+                {"row_id": "a", "text": _SENTINEL},
+            ],
+        },
+    )
+    with pytest.raises(PrivateWaveExecutionError) as error:
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    record = plane.appended[0]
+    assert record.status == "failed"
+    assert record.failure == "shard_pack_execution_failed"
+    assert _SENTINEL not in json.dumps(record.model_dump(mode="json"))
+    assert _SENTINEL not in str(error.value)
+
+
+def test_rejects_unapproved_ml_operation():
+    plane = _plane(pack="ml-batch", operation="ml.tfidf")
+    with pytest.raises(ValueError, match="not available on the public runner"):
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert plane.appended == []
 
 
 def test_output_reference_mismatch_records_sanitized_failure():
