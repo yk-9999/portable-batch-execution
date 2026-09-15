@@ -1,0 +1,14 @@
+{
+  "observations": [
+    {"entity": "a", "at": 2},
+    {"entity": "a", "at": 5},
+    {"entity": "b", "at": 3},
+    {"entity": "b", "at": 7}
+  ],
+  "facts": [
+    {"entity": "a", "at": 1, "value": "a-1"},
+    {"entity": "a", "at": 4, "value": "a-4"},
+    {"entity": "b", "at": 2, "value": "b-2"},
+    {"entity": "b", "at": 6, "value": "b-6"}
+  ]
+}
