@@ -11,6 +11,7 @@ from portable_batch_execution.contracts import (
     RunManifest,
     ShardAttemptRecord,
 )
+from portable_batch_execution.controller.closed_wave_registry import safe_file_component
 
 from .base import RevisionConflictError
 
@@ -83,8 +84,7 @@ class LocalFilesystemDataPlane:
         )
 
     def _run_directory(self, run_id: str) -> Path:
-        if not run_id or Path(run_id).name != run_id:
-            raise ValueError("invalid run id")
+        safe_file_component(run_id, "run_id")
         path = self._runs / run_id
         path.mkdir(exist_ok=True)
         return path
@@ -93,6 +93,7 @@ class LocalFilesystemDataPlane:
         """Persist an immutable attempt record; duplicate IDs are rejected."""
         with self._lock:
             run = self._run_directory(record.logical_run_id)
+            safe_file_component(record.attempt_id, "attempt_id")
             attempts = run / "attempts"
             attempts.mkdir(exist_ok=True)
             path = attempts / f"{record.attempt_id}.json"

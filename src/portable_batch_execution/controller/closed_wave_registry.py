@@ -9,17 +9,23 @@ from threading import RLock
 from portable_batch_execution.contracts import JobSpec, ShardSpec, WaveSpec
 
 _FORBIDDEN = "/\\?#"
+_MAX_COMPONENT_LEN = 128
 
 
-def opaque_identifier(value: str, name: str) -> str:
+def safe_file_component(value: str, name: str) -> str:
     if (
         not isinstance(value, str)
         or not value
-        or len(value) > 128
+        or len(value) > _MAX_COMPONENT_LEN
+        or value in (".", "..")
         or any(character in value for character in _FORBIDDEN)
     ):
         raise ValueError(f"{name} must be an opaque identifier")
     return value
+
+
+def opaque_identifier(value: str, name: str) -> str:
+    return safe_file_component(value, name)
 
 
 class ClosedWaveRegistry:

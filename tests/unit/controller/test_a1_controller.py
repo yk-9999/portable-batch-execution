@@ -52,6 +52,10 @@ def test_dispatch_state_rejects_path_like_run_id(tmp_path):
     controller = A1Controller(tmp_path)
     with pytest.raises(ValueError, match="opaque identifier"):
         controller.inspect_run("../escape")
+    with pytest.raises(ValueError, match="opaque identifier"):
+        controller.inspect_run("..")
+    sentinel = tmp_path / "controller" / "dispatch" / "escape.json"
+    assert not sentinel.exists()
 
 
 def test_dispatch_persists_exact_backend_execution_id(tmp_path):
