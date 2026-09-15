@@ -21,3 +21,7 @@ class RunStateStore(Protocol):
     def write_next_manifest(
         self, manifest: RunManifest, expected_revision: int
     ) -> RunManifest: ...
+
+
+class RevisionConflictError(RuntimeError):
+    """The persisted manifest revision did not match the caller's CAS value."""
