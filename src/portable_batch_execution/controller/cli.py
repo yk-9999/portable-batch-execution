@@ -12,16 +12,42 @@ from portable_batch_execution.data_plane.http_server import (
     serve_private_data_plane_from_environment,
 )
 
+_GITHUB_TOKEN_FILE_ERROR = "github token file is not available"
+
+
+def _read_nonempty_utf8_secret_file(path: str) -> str:
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        raise ValueError(_GITHUB_TOKEN_FILE_ERROR) from None
+    token = raw.strip()
+    if not token:
+        raise ValueError(_GITHUB_TOKEN_FILE_ERROR)
+    return token
+
+
+def _github_token_from_args(args: argparse.Namespace) -> str | None:
+    path = getattr(args, "github_token_file", None)
+    if path is None:
+        return None
+    return _read_nonempty_utf8_secret_file(path)
+
 
 def _controller(args: argparse.Namespace) -> A1Controller:
     backend = None
     if args.github_owner and args.github_repo and args.github_workflow:
+        token = _github_token_from_args(args)
+        backend_kwargs: dict[str, object] = {
+            "dispatch_ref": args.github_ref,
+            "private_data_plane": True,
+        }
+        if token is not None:
+            backend_kwargs["token"] = token
         backend = GitHubActionsBackend(
             args.github_owner,
             args.github_repo,
             args.github_workflow,
-            dispatch_ref=args.github_ref,
-            private_data_plane=True,
+            **backend_kwargs,
         )
     return A1Controller(Path(args.state_root), backend=backend)
 
@@ -47,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     dispatch.add_argument("--github-repo", required=True)
     dispatch.add_argument("--github-workflow", required=True)
     dispatch.add_argument("--github-ref", default="main")
+    dispatch.add_argument("--github-token-file")
     dispatch.set_defaults(command="dispatch")
 
     inspect = sub.add_parser("inspect", help="Inspect controller state")
@@ -56,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
     inspect.add_argument("--github-repo")
     inspect.add_argument("--github-workflow")
     inspect.add_argument("--github-ref", default="main")
+    inspect.add_argument("--github-token-file")
     inspect.set_defaults(command="inspect")
 
     reconcile = sub.add_parser("reconcile", help="Refresh canonical manifest")
