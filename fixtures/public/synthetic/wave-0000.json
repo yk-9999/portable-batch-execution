@@ -1,0 +1,16 @@
+{
+  "input_fixture": "rolling-input.json",
+  "job": {
+    "job_id": "public-synthetic-rolling",
+    "logical_run_id": "public-synthetic-rolling-v1",
+    "pack": "tabular-batch",
+    "operation": "tabular.rolling",
+    "sharding": {"mode": "independent"},
+    "execution": {"max_parallel": 1, "max_attempts_per_shard": 1},
+    "security_profile": "offline",
+    "provenance": {"producer": "public-synthetic-fixture", "revision": "v1", "created_at": "2026-01-01T00:00:00Z"},
+    "operation_params": {"column": "value", "window_size": 3, "output_column": "rolling"}
+  },
+  "wave": {"logical_run_id": "public-synthetic-rolling-v1", "wave_id": "wave-0000", "ordinal": 0, "shard_ids": ["shard-000000"], "max_parallel": 1},
+  "shards": [{"shard_id": "shard-000000", "ordinal": 0, "primary_range": {"kind": "index", "start": 0, "end": 9}, "input_digest": "public-rolling-input-v1", "execution_fingerprint": "public-tabular-rolling-v1"}]
+}

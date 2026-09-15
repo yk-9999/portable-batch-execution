@@ -1,20 +1,27 @@
+import inspect
 import json
 
 import httpx
 import pytest
 
+from portable_batch_execution.backends.base import ExecutionBackend, WaveSubmission
 from portable_batch_execution.backends.github_actions import (
     BackendExecutionRef,
     GitHubActionsAPIError,
     GitHubActionsBackend,
     map_run_status,
 )
+from portable_batch_execution.contracts import WaveSpec
 
 
 def client(handler):
     return httpx.Client(
         base_url="https://api.github.com", transport=httpx.MockTransport(handler)
     )
+
+
+def submission() -> WaveSubmission:
+    return WaveSubmission(WaveSpec(logical_run_id="run", wave_id="wave-0000", ordinal=0, shard_ids=("shard-0",), max_parallel=1))
 
 
 def test_submit_wave_uses_env_token_and_returns_run_details(monkeypatch):
@@ -30,8 +37,8 @@ def test_submit_wave_uses_env_token_and_returns_run_details(monkeypatch):
         }
         return httpx.Response(201, json={"workflow_run_id": 42, "html_url": "https://run"})
 
-    backend = GitHubActionsBackend("o", "r", "execute-wave.yml", client=client(handler))
-    assert backend.submit_wave("feature/test", {"wave_id": "wave-0000"}) == BackendExecutionRef(
+    backend = GitHubActionsBackend("o", "r", "execute-wave.yml", dispatch_ref="feature/test", client=client(handler))
+    assert backend.submit_wave(submission()) == BackendExecutionRef(
         "github-actions", "42", "https://run"
     )
 
@@ -69,8 +76,8 @@ def test_get_evidence_and_cancel():
 
     backend = GitHubActionsBackend("o", "r", "w", client=client(handler))
     execution = BackendExecutionRef("github-actions", "7")
-    assert backend.collect_execution_evidence(execution)["status"] == "succeeded"
-    assert backend.cancel_run(execution) is True
+    assert backend.collect_execution_evidence(execution).status == "succeeded"
+    assert backend.cancel_run(execution) is None
     assert requests == [
         ("GET", "/repos/o/r/actions/runs/7"),
         ("POST", "/repos/o/r/actions/runs/7/cancel"),
@@ -87,3 +94,13 @@ def test_api_error_is_structured():
     with pytest.raises(GitHubActionsAPIError, match=r"get run failed \(403\): denied") as error:
         backend.get_run(BackendExecutionRef("github-actions", "7"))
     assert error.value.status_code == 403
+
+
+def test_github_backend_structurally_satisfies_shared_protocol_signatures():
+    backend = GitHubActionsBackend("o", "r", "w", client=client(lambda _request: httpx.Response(200)))
+
+    assert isinstance(backend, ExecutionBackend)
+    assert tuple(inspect.signature(GitHubActionsBackend.submit_wave).parameters) == ("self", "request")
+    assert tuple(inspect.signature(GitHubActionsBackend.get_run).parameters) == ("self", "execution")
+    assert tuple(inspect.signature(GitHubActionsBackend.cancel_run).parameters) == ("self", "execution")
+    assert tuple(inspect.signature(GitHubActionsBackend.collect_execution_evidence).parameters) == ("self", "execution")

@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
+from portable_batch_execution.backends.github_actions import GitHubActionsBackend
 from portable_batch_execution.contracts import (
     ArtifactRef,
     ExecutionPolicy,
@@ -58,8 +59,13 @@ def shard(ordinal: int) -> ShardSpec:
     )
 
 
-def test_600_shards_plan_as_256_256_88():
-    waves = plan_waves("run-1", [shard(i) for i in range(600)], max_parallel=256, max_per_wave=256)
+def test_600_shards_plan_as_256_256_88_with_github_capabilities():
+    waves = plan_waves(
+        "run-1",
+        [shard(i) for i in range(600)],
+        max_parallel=256,
+        capabilities=GitHubActionsBackend("owner", "repo", "wave.yml").capabilities(),
+    )
 
     assert [len(wave.shard_ids) for wave in waves] == [256, 256, 88]
     assert [wave.ordinal for wave in waves] == [0, 1, 2]
@@ -72,12 +78,15 @@ def test_resume_accepts_a_later_success_and_keeps_only_one_canonical_attempt():
     expected = {"a", "b"}
     attempts = [attempt("a", "failed", "first"), attempt("a", attempt_id="retry"), attempt("b")]
 
-    canonical, missing, duplicate = completeness(expected, attempts)
+    planned = [shard(0), shard(1)]
+    planned[0] = planned[0].model_copy(update={"shard_id": "a"})
+    planned[1] = planned[1].model_copy(update={"shard_id": "b"})
+    canonical, missing, duplicate = completeness(expected, attempts, planned)
 
     assert [record.attempt_id for record in canonical] == ["retry", "one"]
     assert missing == ()
     assert duplicate == ()
-    assert can_finalize(expected, attempts)
+    assert can_finalize(expected, attempts, planned)
 
 
 @pytest.mark.parametrize(
@@ -89,9 +98,12 @@ def test_resume_accepts_a_later_success_and_keeps_only_one_canonical_attempt():
 )
 def test_duplicate_or_missing_success_blocks_finalize(attempts, reason):
     expected = {"a", "b"}
-    _, missing, duplicate = completeness(expected, attempts)
+    planned = [shard(0), shard(1)]
+    planned[0] = planned[0].model_copy(update={"shard_id": "a"})
+    planned[1] = planned[1].model_copy(update={"shard_id": "b"})
+    _, missing, duplicate = completeness(expected, attempts, planned)
 
-    assert not can_finalize(expected, attempts)
+    assert not can_finalize(expected, attempts, planned)
     if reason == "duplicate":
         assert duplicate == ("a",)
         assert missing == ()

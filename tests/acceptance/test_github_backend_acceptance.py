@@ -4,10 +4,12 @@ import json
 
 import httpx
 
+from portable_batch_execution.backends.base import WaveSubmission
 from portable_batch_execution.backends.github_actions import (
     BackendExecutionRef,
     GitHubActionsBackend,
 )
+from portable_batch_execution.contracts import WaveSpec
 
 
 def test_github_backend_dispatches_a_wave_and_returns_the_backend_run_reference():
@@ -28,13 +30,15 @@ def test_github_backend_dispatches_a_wave_and_returns_the_backend_run_reference(
         client=client,
     )
 
-    execution = backend.submit_wave("main", {"run_id": "run-1", "wave_id": "wave-0000"})
+    execution = backend.submit_wave(
+        WaveSubmission(WaveSpec(logical_run_id="run-1", wave_id="wave-0000", ordinal=0, shard_ids=("shard-0",), max_parallel=1))
+    )
 
     assert requests[0].url.path == "/repos/public-owner/public-repo/actions/workflows/wave.yml/dispatches"
     assert requests[0].headers["Authorization"] == "Bearer public-test-token"
     assert json.loads(requests[0].content) == {
         "ref": "main",
-        "inputs": {"run_id": "run-1", "wave_id": "wave-0000"},
+        "inputs": {"wave_id": "wave-0000"},
         "return_run_details": True,
     }
     assert execution.execution_id == "42"
@@ -57,18 +61,12 @@ def test_github_backend_collects_and_cancels_the_same_execution_id():
     backend = GitHubActionsBackend("owner", "repo", "wave.yml", client=client)
     execution = BackendExecutionRef("github-actions", "42")
 
-    assert backend.collect_execution_evidence(execution) == {
-        "backend_id": "github-actions",
-        "execution_id": "42",
-        "status": "failed",
-        "github_status": "completed",
-        "conclusion": None,
-        "web_url": None,
-        "created_at": None,
-        "updated_at": None,
-        "run_started_at": None,
-    }
-    assert backend.cancel_run(execution)
+    evidence = backend.collect_execution_evidence(execution)
+    assert evidence.backend_id == "github-actions"
+    assert evidence.execution_id == "42"
+    assert evidence.status == "failed"
+    assert evidence.details == {"github_status": "completed", "conclusion": None}
+    assert backend.cancel_run(execution) is None
     assert paths == [
         ("GET", "/repos/owner/repo/actions/runs/42"),
         ("POST", "/repos/owner/repo/actions/runs/42/cancel"),

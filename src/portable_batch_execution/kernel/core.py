@@ -152,10 +152,12 @@ def plan_waves(
         raise ValueError("shard IDs must be unique")
     if any(shard.logical_run_id != run_id for shard in ordered):
         raise ValueError("all shards must belong to run_id")
-    backend_limit = capabilities.max_shards_per_wave if capabilities else 256
-    if backend_limit <= 0:
-        raise ValueError("backend max_shards_per_wave must be positive")
-    limit = min(max_per_wave or backend_limit, backend_limit)
+    if capabilities is None and max_per_wave is None:
+        raise ValueError("backend capabilities or an explicit max_per_wave is required")
+    limits = [limit for limit in (max_per_wave, capabilities.max_shards_per_wave if capabilities else None) if limit is not None]
+    if any(limit <= 0 for limit in limits):
+        raise ValueError("wave limits must be positive")
+    limit = min(limits)
     return [
         WaveSpec(
             logical_run_id=run_id,
@@ -173,25 +175,20 @@ def plan_waves(
 def completeness(
     expected: set[str],
     attempts: list[ShardAttemptRecord],
-    shards: Iterable[ShardSpec] | None = None,
+    shards: Iterable[ShardSpec],
 ) -> tuple[tuple[ShardAttemptRecord, ...], tuple[str, ...], tuple[str, ...]]:
     """Choose unambiguous successes; stale fingerprints never satisfy a shard."""
-    shard_map = (
-        {shard.shard_id: shard for shard in shards} if shards is not None else {}
-    )
+    shard_map = {shard.shard_id: shard for shard in shards}
+    if set(shard_map) != expected:
+        raise ValueError("planned shards must exactly match expected shard IDs")
     by_shard: dict[str, list[ShardAttemptRecord]] = defaultdict(list)
     for attempt in attempts:
         shard = shard_map.get(attempt.shard_id)
         if (
             attempt.shard_id in expected
             and attempt.status == "succeeded"
-            and (
-                not shard_map
-                or (
-                    attempt.input_digest == shard.input_digest
-                    and attempt.execution_fingerprint == shard.execution_fingerprint
-                )
-            )
+            and attempt.input_digest == shard.input_digest
+            and attempt.execution_fingerprint == shard.execution_fingerprint
         ):
             by_shard[attempt.shard_id].append(attempt)
     missing = tuple(sorted(shard_id for shard_id in expected if not by_shard[shard_id]))
@@ -217,7 +214,12 @@ def retryable_shards(
         by_shard[attempt.shard_id].append(attempt)
     result = []
     for shard in sorted(shards, key=lambda item: (item.ordinal, item.shard_id)):
-        records = by_shard[shard.shard_id]
+        records = [
+            record
+            for record in by_shard[shard.shard_id]
+            if record.input_digest == shard.input_digest
+            and record.execution_fingerprint == shard.execution_fingerprint
+        ]
         success = any(
             record.status == "succeeded"
             and record.input_digest == shard.input_digest
@@ -234,7 +236,7 @@ def retryable_shards(
 def can_finalize(
     expected: set[str],
     attempts: list[ShardAttemptRecord],
-    shards: Iterable[ShardSpec] | None = None,
+    shards: Iterable[ShardSpec],
 ) -> bool:
     _, missing, duplicate = completeness(expected, attempts, shards)
     return not missing and not duplicate
@@ -246,10 +248,15 @@ class RunController:
     def __init__(self, state_store):
         self.state_store = state_store
 
-    def refresh(self, manifest: RunManifest, expected_revision: int) -> RunManifest:
+    def refresh(
+        self,
+        manifest: RunManifest,
+        expected_revision: int,
+        planned_shards: Iterable[ShardSpec],
+    ) -> RunManifest:
         attempts = self.state_store.read_attempts(manifest.logical_run_id)
         canonical, missing, duplicate = completeness(
-            set(manifest.expected_shard_ids), list(attempts)
+            set(manifest.expected_shard_ids), list(attempts), planned_shards
         )
         ready = not missing and not duplicate
         next_manifest = manifest.model_copy(

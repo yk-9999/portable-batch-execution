@@ -21,4 +21,6 @@ jobs:
           python-version: "3.11"
       - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
       - run: uv sync --dev
-      - run: uv run pytest tests/unit/worker
+      - run: uv run python -m portable_batch_execution.worker.execute_wave --wave-id "$PBE_WAVE_ID"
+        env:
+          PBE_WAVE_ID: ${{ inputs.wave_id }}

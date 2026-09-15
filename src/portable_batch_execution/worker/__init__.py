@@ -1,3 +1,3 @@
-"""Closed worker entry points for GitHub Actions wave execution."""
+"""Closed worker entry points for public synthetic wave execution."""
 
-from .execute_wave import execute_wave as execute_wave
+from .execute_wave import execute_public_wave as execute_public_wave
