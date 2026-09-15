@@ -4,7 +4,10 @@ import json
 
 import httpx
 
-from portable_batch_execution.backends.github_actions import GitHubActionsBackend
+from portable_batch_execution.backends.github_actions import (
+    BackendExecutionRef,
+    GitHubActionsBackend,
+)
 
 
 def test_github_backend_dispatches_a_wave_and_returns_the_backend_run_reference():
@@ -52,9 +55,19 @@ def test_github_backend_collects_and_cancels_the_same_execution_id():
         base_url="https://api.github.test", transport=httpx.MockTransport(handler)
     )
     backend = GitHubActionsBackend("owner", "repo", "wave.yml", client=client)
-    execution = backend.submit_wave("main", {}) if False else type("Execution", (), {"execution_id": "42"})()
+    execution = BackendExecutionRef("github-actions", "42")
 
-    assert backend.collect_execution_evidence(execution) == {"id": 42, "status": "completed"}
+    assert backend.collect_execution_evidence(execution) == {
+        "backend_id": "github-actions",
+        "execution_id": "42",
+        "status": "failed",
+        "github_status": "completed",
+        "conclusion": None,
+        "web_url": None,
+        "created_at": None,
+        "updated_at": None,
+        "run_started_at": None,
+    }
     assert backend.cancel_run(execution)
     assert paths == [
         ("GET", "/repos/owner/repo/actions/runs/42"),
