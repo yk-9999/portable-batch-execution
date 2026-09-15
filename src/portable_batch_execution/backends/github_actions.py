@@ -30,6 +30,16 @@ class GitHubActionsAPIError(RuntimeError):
         super().__init__(f"GitHub Actions {operation} failed ({response.status_code}){suffix}")
 
 
+def _opaque_identifier(value: str, name: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or any(character in value for character in "/\\?#")
+    ):
+        raise ValueError(f"{name} must be an opaque identifier")
+
+
 def map_run_status(run: dict[str, Any]) -> str:
     """Map GitHub's status/conclusion pair to the portable execution status."""
     status = run.get("status")
@@ -54,11 +64,13 @@ class GitHubActionsBackend:
         dispatch_ref: str = "main",
         token: str | None = None,
         client: httpx.Client | None = None,
+        private_data_plane: bool = False,
     ):
         self.owner = owner
         self.repo = repo
         self.workflow_id = workflow_id
         self.dispatch_ref = dispatch_ref
+        self.private_data_plane = private_data_plane
         self.token = token if token is not None else os.environ.get("PBE_GITHUB_TOKEN")
         self.client = client or httpx.Client(
             base_url="https://api.github.com", timeout=30.0
@@ -85,13 +97,23 @@ class GitHubActionsBackend:
         return response
 
     def submit_wave(self, request: WaveSubmission) -> BackendExecutionRef:
+        if self.private_data_plane:
+            _opaque_identifier(request.wave.logical_run_id, "run_id")
+            _opaque_identifier(request.wave.wave_id, "wave_id")
+            inputs = {
+                "wave_id": request.wave.wave_id,
+                "run_id": request.wave.logical_run_id,
+                "private": True,
+            }
+        else:
+            inputs = {"wave_id": request.wave.wave_id}
         response = self._request(
             "submit wave",
             "POST",
             f"/repos/{self.owner}/{self.repo}/actions/workflows/{self.workflow_id}/dispatches",
             json={
                 "ref": self.dispatch_ref,
-                "inputs": {"wave_id": request.wave.wave_id},
+                "inputs": inputs,
                 "return_run_details": True,
             },
         )

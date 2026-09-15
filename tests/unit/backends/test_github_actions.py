@@ -20,8 +20,76 @@ def client(handler):
     )
 
 
+def _reject_http(_request):
+    raise AssertionError("no HTTP")
+
+
 def submission() -> WaveSubmission:
     return WaveSubmission(WaveSpec(logical_run_id="run", wave_id="wave-0000", ordinal=0, shard_ids=("shard-0",), max_parallel=1))
+
+
+def test_submit_wave_private_data_plane_dispatches_opaque_run_and_wave():
+    def handler(request):
+        assert json.loads(request.content) == {
+            "ref": "main",
+            "inputs": {
+                "wave_id": "opaque-wave",
+                "run_id": "opaque-run",
+                "private": True,
+            },
+            "return_run_details": True,
+        }
+        return httpx.Response(201, json={"workflow_run_id": 9, "html_url": "https://run/9"})
+
+    backend = GitHubActionsBackend(
+        "o",
+        "r",
+        "execute-wave.yml",
+        private_data_plane=True,
+        client=client(handler),
+    )
+    submission = WaveSubmission(
+        WaveSpec(
+            logical_run_id="opaque-run",
+            wave_id="opaque-wave",
+            ordinal=0,
+            shard_ids=("opaque-shard",),
+            max_parallel=1,
+        )
+    )
+    assert backend.submit_wave(submission) == BackendExecutionRef(
+        "github-actions", "9", "https://run/9"
+    )
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("logical_run_id", "wave_id"),
+)
+def test_submit_wave_private_data_plane_rejects_unsafe_identifiers(field):
+    values = {
+        "logical_run_id": "opaque-run",
+        "wave_id": "opaque-wave",
+    }
+    values[field] = "../escape"
+    submission = WaveSubmission(
+        WaveSpec(
+            logical_run_id=values["logical_run_id"],
+            wave_id=values["wave_id"],
+            ordinal=0,
+            shard_ids=("opaque-shard",),
+            max_parallel=1,
+        )
+    )
+    backend = GitHubActionsBackend(
+        "o",
+        "r",
+        "w",
+        private_data_plane=True,
+        client=client(_reject_http),
+    )
+    with pytest.raises(ValueError, match="must be an opaque identifier"):
+        backend.submit_wave(submission)
 
 
 def test_submit_wave_uses_env_token_and_returns_run_details(monkeypatch):
