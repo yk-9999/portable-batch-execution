@@ -1,0 +1,118 @@
+"""CLI for the bounded A1 private data plane controller."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from portable_batch_execution.backends.github_actions import GitHubActionsBackend
+from portable_batch_execution.controller.a1_controller import A1Controller
+from portable_batch_execution.data_plane.http_server import (
+    serve_private_data_plane_from_environment,
+)
+
+
+def _controller(args: argparse.Namespace) -> A1Controller:
+    backend = None
+    if args.github_owner and args.github_repo and args.github_workflow:
+        backend = GitHubActionsBackend(
+            args.github_owner,
+            args.github_repo,
+            args.github_workflow,
+            dispatch_ref=args.github_ref,
+            private_data_plane=True,
+        )
+    return A1Controller(Path(args.state_root), backend=backend)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="A1 private batch controller")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    serve = sub.add_parser("serve-data-plane", help="Run loopback private data plane HTTP")
+    serve.set_defaults(command="serve-data-plane")
+
+    prepare = sub.add_parser("prepare-synthetic", help="Register a private synthetic run")
+    prepare.add_argument("--state-root", required=True)
+    prepare.add_argument("--run-id")
+    prepare.add_argument("--wave-id")
+    prepare.set_defaults(command="prepare-synthetic")
+
+    dispatch = sub.add_parser("dispatch", help="Dispatch one private wave")
+    dispatch.add_argument("--state-root", required=True)
+    dispatch.add_argument("--run-id", required=True)
+    dispatch.add_argument("--wave-id", required=True)
+    dispatch.add_argument("--github-owner", required=True)
+    dispatch.add_argument("--github-repo", required=True)
+    dispatch.add_argument("--github-workflow", required=True)
+    dispatch.add_argument("--github-ref", default="main")
+    dispatch.set_defaults(command="dispatch")
+
+    inspect = sub.add_parser("inspect", help="Inspect controller state")
+    inspect.add_argument("--state-root", required=True)
+    inspect.add_argument("--run-id", required=True)
+    inspect.add_argument("--github-owner")
+    inspect.add_argument("--github-repo")
+    inspect.add_argument("--github-workflow")
+    inspect.add_argument("--github-ref", default="main")
+    inspect.set_defaults(command="inspect")
+
+    reconcile = sub.add_parser("reconcile", help="Refresh canonical manifest")
+    reconcile.add_argument("--state-root", required=True)
+    reconcile.add_argument("--run-id", required=True)
+    reconcile.set_defaults(command="reconcile")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "serve-data-plane":
+        server = serve_private_data_plane_from_environment()
+        host, port = server.server_address
+        print(json.dumps({"bind": f"{host}:{port}"}))
+        server.serve_forever()
+        return 0
+
+    if args.command == "prepare-synthetic":
+        prepared = _controller(args).prepare_private_synthetic_run(
+            logical_run_id=args.run_id,
+            wave_id=args.wave_id,
+        )
+        print(
+            json.dumps(
+                {
+                    "logical_run_id": prepared.logical_run_id,
+                    "wave_id": prepared.wave_id,
+                    "manifest_revision": prepared.manifest.revision,
+                }
+            )
+        )
+        return 0
+
+    if args.command == "dispatch":
+        execution = _controller(args).dispatch_private_wave(args.run_id, args.wave_id)
+        print(
+            json.dumps(
+                {
+                    "backend_id": execution.backend_id,
+                    "execution_id": execution.execution_id,
+                }
+            )
+        )
+        return 0
+
+    if args.command == "inspect":
+        payload = _controller(args).inspect_run(args.run_id)
+        print(json.dumps(payload))
+        return 0
+
+    if args.command == "reconcile":
+        manifest = _controller(args).reconcile_run(args.run_id)
+        print(json.dumps({"revision": manifest.revision, "status": manifest.status}))
+        return 0
+
+    parser.error("unknown command")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -24,6 +24,9 @@ dev = [
   "scikit-learn>=1.5",
 ]
 
+[project.scripts]
+pbe-a1-controller = "portable_batch_execution.controller.cli:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["--import-mode=importlib"]
