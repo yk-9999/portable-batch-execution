@@ -128,3 +128,54 @@ def test_dispatch_rejects_missing_github_token_file_without_leaking(tmp_path, ca
     assert _PATH_MARKER not in str(exc.value)
     captured = capsys.readouterr()
     assert _PATH_MARKER not in captured.out + captured.err
+
+
+def test_prepare_synthetic_without_github_args(tmp_path, capsys):
+    with (
+        patch.object(cli, "GitHubActionsBackend") as backend_cls,
+        patch.object(cli, "A1Controller") as controller_cls,
+    ):
+        controller_cls.return_value.prepare_private_synthetic_run.return_value = MagicMock(
+            logical_run_id="opaque-run",
+            wave_id="opaque-wave",
+            manifest=MagicMock(revision=0),
+        )
+        rc = cli.main(
+            [
+                "prepare-synthetic",
+                "--state-root",
+                str(tmp_path),
+            ]
+        )
+
+    assert rc == 0
+    backend_cls.assert_not_called()
+    assert controller_cls.call_args.kwargs["backend"] is None
+    captured = capsys.readouterr()
+    assert "opaque-run" in captured.out
+
+
+def test_reconcile_without_github_args(tmp_path, capsys):
+    with (
+        patch.object(cli, "GitHubActionsBackend") as backend_cls,
+        patch.object(cli, "A1Controller") as controller_cls,
+    ):
+        controller_cls.return_value.reconcile_run.return_value = MagicMock(
+            revision=2,
+            status="succeeded",
+        )
+        rc = cli.main(
+            [
+                "reconcile",
+                "--state-root",
+                str(tmp_path),
+                "--run-id",
+                "opaque-run",
+            ]
+        )
+
+    assert rc == 0
+    backend_cls.assert_not_called()
+    assert controller_cls.call_args.kwargs["backend"] is None
+    captured = capsys.readouterr()
+    assert '"revision": 2' in captured.out

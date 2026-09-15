@@ -35,18 +35,21 @@ def _github_token_from_args(args: argparse.Namespace) -> str | None:
 
 def _controller(args: argparse.Namespace) -> A1Controller:
     backend = None
-    if args.github_owner and args.github_repo and args.github_workflow:
+    github_owner = getattr(args, "github_owner", None)
+    github_repo = getattr(args, "github_repo", None)
+    github_workflow = getattr(args, "github_workflow", None)
+    if github_owner and github_repo and github_workflow:
         token = _github_token_from_args(args)
         backend_kwargs: dict[str, object] = {
-            "dispatch_ref": args.github_ref,
+            "dispatch_ref": getattr(args, "github_ref", "main"),
             "private_data_plane": True,
         }
         if token is not None:
             backend_kwargs["token"] = token
         backend = GitHubActionsBackend(
-            args.github_owner,
-            args.github_repo,
-            args.github_workflow,
+            github_owner,
+            github_repo,
+            github_workflow,
             **backend_kwargs,
         )
     return A1Controller(Path(args.state_root), backend=backend)
