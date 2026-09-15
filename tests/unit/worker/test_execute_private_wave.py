@@ -1,0 +1,218 @@
+import json
+from datetime import UTC, datetime
+from hashlib import sha256
+from unittest.mock import patch
+
+import pytest
+
+from portable_batch_execution.contracts import ArtifactRef, ShardAttemptRecord
+from portable_batch_execution.kernel import exhausted_shards
+from portable_batch_execution.worker.execute_wave import (
+    PrivateWaveExecutionError,
+    execute_private_wave,
+)
+
+_SENTINEL = "SENTINEL_PRIVATE_LEAK_DO_NOT_LOG"
+
+
+def _plane(
+    *,
+    rows=None,
+    shards=None,
+    max_attempts=4,
+    appended=None,
+    read_raises=None,
+    write_raises=False,
+):
+    rows = rows if rows is not None else [{"group": "a", "value": 1}]
+    input_ref = ArtifactRef(
+        object_id="input",
+        uri="pbe://private/input",
+        sha256="sha256:" + sha256(json.dumps(rows).encode()).hexdigest(),
+    )
+    now = datetime.now(UTC).isoformat()
+    shard_specs = shards or [
+        {
+            "logical_run_id": "opaque-run",
+            "shard_id": "opaque-shard",
+            "ordinal": 0,
+            "correctness": {},
+            "input_refs": [input_ref.model_dump(mode="json")],
+            "input_digest": "current",
+            "execution_fingerprint": "fixed",
+        }
+    ]
+    job = {
+        "job_id": "job",
+        "logical_run_id": "opaque-run",
+        "pack": "tabular-batch",
+        "operation": "tabular.rolling",
+        "input_manifest_ref": input_ref.model_dump(mode="json"),
+        "sharding": {},
+        "execution": {"max_parallel": 1, "max_attempts_per_shard": max_attempts},
+        "security_profile": "offline",
+        "provenance": {"producer": "test", "revision": "1", "created_at": now},
+        "operation_params": {
+            "column": "value",
+            "window_size": 2,
+            "output_column": "rolling",
+        },
+    }
+    wave = {
+        "logical_run_id": "opaque-run",
+        "wave_id": "opaque-wave",
+        "ordinal": 0,
+        "shard_ids": [item["shard_id"] for item in shard_specs],
+        "max_parallel": 1,
+    }
+
+    class Plane:
+        def __init__(self):
+            self.appended = list(appended or [])
+
+        def resolve_wave(self, run_id, wave_id):
+            return {"job": job, "wave": wave, "shards": shard_specs}
+
+        def read_attempts(self, run_id):
+            return tuple(self.appended)
+
+        def read(self, ref):
+            if read_raises:
+                raise read_raises
+            return json.dumps(rows).encode()
+
+        def write(self, data, media_type):
+            if write_raises:
+                raise RuntimeError(_SENTINEL)
+            return ArtifactRef(
+                object_id="output",
+                uri="pbe://private/output",
+                sha256="sha256:" + sha256(data).hexdigest(),
+            )
+
+        def append_attempt(self, record):
+            self.appended.append(record)
+
+    return Plane()
+
+
+def test_failed_execution_appends_one_failed_record():
+    plane = _plane()
+    with patch(
+        "portable_batch_execution.worker.execute_wave.TabularPack.execute",
+        side_effect=RuntimeError(_SENTINEL),
+    ), pytest.raises(PrivateWaveExecutionError) as error:
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert len(plane.appended) == 1
+    record = plane.appended[0]
+    assert record.status == "failed"
+    assert record.failure == "shard_pack_execution_failed"
+    assert record.output_refs == ()
+    assert record.output_digest is None
+    assert _SENTINEL not in json.dumps(record.model_dump(mode="json"))
+    assert _SENTINEL not in str(error.value)
+    assert error.value.attempts == (record,)
+
+
+def test_four_matching_failures_exhaust_attempt_budget():
+    plane = _plane()
+    with patch(
+        "portable_batch_execution.worker.execute_wave.TabularPack.execute",
+        side_effect=RuntimeError(_SENTINEL),
+    ):
+        for _ in range(4):
+            with pytest.raises(PrivateWaveExecutionError):
+                execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert len(plane.appended) == 4
+    assert execute_private_wave("opaque-run", "opaque-wave", plane=plane) == ()
+    shard = plane.resolve_wave("opaque-run", "opaque-wave")["shards"][0]
+    from portable_batch_execution.contracts import ExecutionPolicy, ShardSpec
+
+    policy = ExecutionPolicy(max_parallel=1, max_attempts_per_shard=4)
+    assert (
+        exhausted_shards(
+            (ShardSpec.model_validate(shard),),
+            tuple(plane.appended),
+            policy,
+        )
+        != ()
+    )
+
+
+def test_stale_attempts_do_not_consume_ordinal_or_budget():
+    now = datetime.now(UTC)
+    stale = [
+        ShardAttemptRecord(
+            logical_run_id="opaque-run",
+            shard_id="opaque-shard",
+            attempt_id=f"stale-{index}",
+            status="failed",
+            input_digest="stale",
+            execution_fingerprint="stale",
+            started_at=now,
+            finished_at=now,
+            failure="shard_execution_failed",
+        )
+        for index in range(9)
+    ]
+    plane = _plane(appended=stale)
+    with patch(
+        "portable_batch_execution.worker.execute_wave.TabularPack.execute",
+        side_effect=RuntimeError(_SENTINEL),
+    ), pytest.raises(PrivateWaveExecutionError):
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert plane.appended[-1].attempt_id == "opaque-wave-opaque-shard-1"
+    assert len([item for item in plane.appended if item.input_digest == "current"]) == 1
+
+
+def test_successful_shards_continue_when_another_shard_fails():
+    rows = [{"group": "a", "value": 1}, {"group": "a", "value": 2}]
+    input_ref = ArtifactRef(
+        object_id="input",
+        uri="pbe://private/input",
+        sha256="sha256:" + sha256(json.dumps(rows).encode()).hexdigest(),
+    )
+    input_payload = input_ref.model_dump(mode="json")
+    plane = _plane(
+        rows=rows,
+        shards=[
+            {
+                "logical_run_id": "opaque-run",
+                "shard_id": "fail-shard",
+                "ordinal": 0,
+                "correctness": {},
+                "input_refs": [input_payload],
+                "input_digest": "current",
+                "execution_fingerprint": "fixed",
+            },
+            {
+                "logical_run_id": "opaque-run",
+                "shard_id": "ok-shard",
+                "ordinal": 1,
+                "correctness": {},
+                "input_refs": [input_payload],
+                "input_digest": "current",
+                "execution_fingerprint": "fixed",
+            },
+        ],
+    )
+
+    from portable_batch_execution.packs import TabularPack
+
+    original_execute = TabularPack.execute
+
+    def execute_side_effect(pack, job, shard, params, inputs):
+        if shard.shard_id == "fail-shard":
+            raise RuntimeError(_SENTINEL)
+        return original_execute(pack, job, shard, params, inputs)
+
+    with (
+        patch.object(TabularPack, "execute", execute_side_effect),
+        pytest.raises(PrivateWaveExecutionError) as error,
+    ):
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert len(error.value.attempts) == 2
+    by_shard = {item.shard_id: item for item in plane.appended[-2:]}
+    assert by_shard["fail-shard"].status == "failed"
+    assert by_shard["ok-shard"].status == "succeeded"
+    assert _SENTINEL not in str(error.value)

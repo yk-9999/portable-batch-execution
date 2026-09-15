@@ -24,6 +24,51 @@ _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})
 
 
+class PrivateWaveExecutionError(RuntimeError):
+    """One or more shards failed during private wave execution."""
+
+    def __init__(self, attempts: tuple[ShardAttemptRecord, ...]) -> None:
+        self.attempts = attempts
+        super().__init__("private wave execution completed with shard failures")
+
+
+class _ShardStageFailure(Exception):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+def _matching_current_attempts(
+    prior: tuple[ShardAttemptRecord, ...], shard: ShardSpec
+) -> list[ShardAttemptRecord]:
+    return [
+        item
+        for item in prior
+        if item.shard_id == shard.shard_id
+        and item.input_digest == shard.input_digest
+        and item.execution_fingerprint == shard.execution_fingerprint
+    ]
+
+
+def _private_attempt_id(wave_id: str, shard_id: str, current_attempt_count: int) -> str:
+    ordinal = current_attempt_count + 1
+    return f"{wave_id}-{shard_id}-{ordinal}"
+
+
+def _execution_failure_code(exc: BaseException, *, stage: str) -> str:
+    if stage == "input_read":
+        return "input_artifact_read_failed"
+    if stage == "input_decode":
+        return "input_artifact_decode_failed"
+    if stage == "input_parse":
+        return "input_artifact_invalid"
+    if stage == "pack":
+        return "shard_pack_execution_failed"
+    if stage == "output":
+        return "output_artifact_write_failed"
+    return "shard_execution_failed"
+
+
 def _repository_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -142,25 +187,85 @@ def execute_private_wave(
     prior = plane.read_attempts(run_id)
     attempts: list[ShardAttemptRecord] = []
     pack = TabularPack()
+    wave_failures = 0
     for shard in shards:
-        current = [item for item in prior if item.shard_id == shard.shard_id and item.input_digest == shard.input_digest and item.execution_fingerprint == shard.execution_fingerprint]
-        if any(item.status == "succeeded" for item in current) or len(current) >= job.execution.max_attempts_per_shard:
+        current = _matching_current_attempts(prior, shard)
+        if any(item.status == "succeeded" for item in current):
+            continue
+        if len(current) >= job.execution.max_attempts_per_shard:
             continue
         if not shard.input_refs:
             raise ValueError("private shard has no input artifact")
-        try:
-            rows = json.loads(plane.read(shard.input_refs[0]).decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise TypeError("private input artifact is not a JSON record array") from exc
-        if not isinstance(rows, list):
-            raise TypeError("private input artifact is not a JSON record array")
         started_at = datetime.now(UTC)
-        result = pack.execute(job, shard, job.operation_params, {"data": rows})
-        output = json.dumps(result.to_dicts(), sort_keys=True).encode("utf-8")
-        output_ref = plane.write(output, "application/json")
-        attempt = ShardAttemptRecord(logical_run_id=run_id, shard_id=shard.shard_id, attempt_id=f"{wave_id}-{shard.shard_id}", status="succeeded", input_digest=shard.input_digest, execution_fingerprint=shard.execution_fingerprint, started_at=started_at, finished_at=datetime.now(UTC), wave_id=wave_id, output_refs=(output_ref,), output_digest=sha256(output).hexdigest(), counts={"input_rows": len(rows), "output_rows": result.height})
+        attempt_id = _private_attempt_id(wave_id, shard.shard_id, len(current))
+        try:
+            try:
+                payload = plane.read(shard.input_refs[0])
+            except Exception as exc:  # noqa: BLE001
+                raise _ShardStageFailure(
+                    _execution_failure_code(exc, stage="input_read")
+                ) from None
+            try:
+                text = payload.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise _ShardStageFailure(
+                    _execution_failure_code(exc, stage="input_decode")
+                ) from None
+            try:
+                rows = json.loads(text)
+            except ValueError as exc:
+                raise _ShardStageFailure(
+                    _execution_failure_code(exc, stage="input_parse")
+                ) from None
+            if not isinstance(rows, list):
+                raise _ShardStageFailure(
+                    _execution_failure_code(TypeError(), stage="input_parse")
+                )
+            try:
+                result = pack.execute(job, shard, job.operation_params, {"data": rows})
+            except Exception as exc:  # noqa: BLE001
+                raise _ShardStageFailure(
+                    _execution_failure_code(exc, stage="pack")
+                ) from None
+            output = json.dumps(result.to_dicts(), sort_keys=True).encode("utf-8")
+            try:
+                output_ref = plane.write(output, "application/json")
+            except Exception as exc:  # noqa: BLE001
+                raise _ShardStageFailure(
+                    _execution_failure_code(exc, stage="output")
+                ) from None
+            attempt = ShardAttemptRecord(
+                logical_run_id=run_id,
+                shard_id=shard.shard_id,
+                attempt_id=attempt_id,
+                status="succeeded",
+                input_digest=shard.input_digest,
+                execution_fingerprint=shard.execution_fingerprint,
+                started_at=started_at,
+                finished_at=datetime.now(UTC),
+                wave_id=wave_id,
+                output_refs=(output_ref,),
+                output_digest=sha256(output).hexdigest(),
+                counts={"input_rows": len(rows), "output_rows": result.height},
+            )
+        except _ShardStageFailure as failed:
+            attempt = ShardAttemptRecord(
+                logical_run_id=run_id,
+                shard_id=shard.shard_id,
+                attempt_id=attempt_id,
+                status="failed",
+                input_digest=shard.input_digest,
+                execution_fingerprint=shard.execution_fingerprint,
+                started_at=started_at,
+                finished_at=datetime.now(UTC),
+                wave_id=wave_id,
+                failure=failed.code,
+            )
+            wave_failures += 1
         plane.append_attempt(attempt)
         attempts.append(attempt)
+    if wave_failures:
+        raise PrivateWaveExecutionError(tuple(attempts))
     return tuple(attempts)
 
 def main(argv: list[str] | None = None) -> int:
@@ -171,7 +276,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.mode == "private" and not args.run_id:
         parser.error("--mode private requires --run-id")
-    attempts = execute_private_wave(args.run_id, args.wave_id) if args.mode == "private" else execute_public_wave(args.wave_id)
+    try:
+        attempts = (
+            execute_private_wave(args.run_id, args.wave_id)
+            if args.mode == "private"
+            else execute_public_wave(args.wave_id)
+        )
+    except PrivateWaveExecutionError as exc:
+        attempts = exc.attempts
+        print(
+            json.dumps(
+                {
+                    "wave_id": args.wave_id,
+                    "attempt_ids": [item.attempt_id for item in attempts],
+                }
+            )
+        )
+        return 1
     print(json.dumps({"wave_id": args.wave_id, "attempt_ids": [item.attempt_id for item in attempts]}))
     return 0
 
