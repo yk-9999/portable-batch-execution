@@ -157,3 +157,28 @@ def test_security_rejects_executable_or_secret_bearing_job_inputs():
 
     with pytest.raises(ValidationError):
         RangeSpec(kind="index", start=float("nan"))
+import json
+from datetime import UTC, datetime
+from hashlib import sha256
+
+from portable_batch_execution.worker.execute_wave import execute_private_wave
+
+
+def test_private_mode_resolves_opaque_contracts_and_skips_completed_shards():
+    rows = [{"group": "a", "value": 1}, {"group": "a", "value": 2}]
+    input_ref = ArtifactRef(object_id="input", uri="pbe://private/input", sha256="sha256:" + sha256(json.dumps(rows).encode()).hexdigest())
+    now = datetime.now(UTC).isoformat()
+    job = {"job_id":"job", "logical_run_id":"opaque-run", "pack":"tabular-batch", "operation":"tabular.rolling", "input_manifest_ref":input_ref.model_dump(mode="json"), "sharding":{}, "execution":{"max_parallel":1,"max_attempts_per_shard":4}, "security_profile":"offline", "provenance":{"producer":"test","revision":"1","created_at":now}, "operation_params":{"column":"value","window_size":2,"output_column":"rolling"}}
+    shard = {"logical_run_id":"opaque-run", "shard_id":"opaque-shard", "ordinal":0, "correctness":{}, "input_refs":[input_ref.model_dump(mode="json")], "input_digest":"current", "execution_fingerprint":"fixed"}
+    wave = {"logical_run_id":"opaque-run", "wave_id":"opaque-wave", "ordinal":0, "shard_ids":["opaque-shard"], "max_parallel":1}
+    class Plane:
+        def __init__(self): self.resolved = []; self.appended = []
+        def resolve_wave(self, run_id, wave_id): self.resolved.append((run_id,wave_id)); return {"job":job,"wave":wave,"shards":[shard]}
+        def read_attempts(self, run_id): return tuple(self.appended)
+        def read(self, ref): return json.dumps(rows).encode()
+        def write(self, data, media_type): return ArtifactRef(object_id="output", uri="pbe://private/output", sha256="sha256:" + sha256(data).hexdigest())
+        def append_attempt(self, record): self.appended.append(record)
+    plane = Plane()
+    assert len(execute_private_wave("opaque-run", "opaque-wave", plane=plane)) == 1
+    assert plane.resolved == [("opaque-run", "opaque-wave")]
+    assert execute_private_wave("opaque-run", "opaque-wave", plane=plane) == ()

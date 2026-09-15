@@ -46,3 +46,21 @@ uv run python scripts/export_schemas.py
 - Arbitrary SQL supplied through a JobSpec
 - Daemon or real-time workloads
 - Storing private project data, models, or results in this public repository
+
+## Private Data Plane
+
+Trusted `workflow_dispatch` can retain the committed `wave-0000` public smoke
+path, or select private mode with only opaque `run_id` and `wave_id`. Private
+mode reads `PBE_PRIVATE_DATA_PLANE_BASE_URL` and
+`PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN` from the workflow environment. The
+controller implements `GET /v1/runs/{run_id}/waves/{wave_id}`, artifact content
+at `/v1/artifacts/{object_id}/content`, artifact upload, and run attempt
+endpoints. It returns closed JobSpec, WaveSpec, and ShardSpec contracts; the
+public worker never accepts a path, URL, command, code, import, or secret as an
+input and only dispatches its fixed public operation registry. Artifact URIs
+are metadata and must never carry credentials.
+
+The kernel exposes `exhausted_shards` for current unsuccessful attempts that
+reach the configured per-shard budget (the initial attempt counts). Project
+controllers may use that state to choose their own fallback; fallback
+implementations and private project logic remain outside this repository.

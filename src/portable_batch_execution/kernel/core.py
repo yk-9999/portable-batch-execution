@@ -292,3 +292,19 @@ class RunController:
             }
         )
         return self.state_store.write_next_manifest(next_manifest, expected_revision)
+
+def exhausted_shards(
+    shards: Iterable[ShardSpec],
+    attempts: Iterable[ShardAttemptRecord],
+    policy: ExecutionPolicy,
+) -> tuple[ShardSpec, ...]:
+    """Return current, unsuccessful shards that used their whole attempt budget."""
+    by_shard: dict[str, list[ShardAttemptRecord]] = defaultdict(list)
+    for attempt in attempts:
+        by_shard[attempt.shard_id].append(attempt)
+    exhausted = []
+    for shard in sorted(shards, key=lambda item: (item.ordinal, item.shard_id)):
+        current = [record for record in by_shard[shard.shard_id] if record.input_digest == shard.input_digest and record.execution_fingerprint == shard.execution_fingerprint]
+        if len(current) >= policy.max_attempts_per_shard and not any(record.status == "succeeded" for record in current):
+            exhausted.append(shard)
+    return tuple(exhausted)

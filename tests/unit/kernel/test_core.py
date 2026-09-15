@@ -90,3 +90,18 @@ def test_stale_attempts_do_not_exhaust_current_retry_budget():
 
     stale = ShardAttemptRecord(logical_run_id="run", shard_id=shard.shard_id, attempt_id="stale", status="succeeded", input_digest="old", execution_fingerprint="old", started_at=now, finished_at=now)
     assert retryable_shards([shard], [stale], ExecutionPolicy(max_parallel=1, max_attempts_per_shard=1)) == (shard,)
+
+
+def test_exhausted_shards_counts_initial_attempt_and_three_retries_only():
+    from portable_batch_execution.contracts import ShardAttemptRecord
+    from portable_batch_execution.kernel import exhausted_shards
+    ref = ArtifactRef(object_id="x", uri="file:///x", sha256="sha256:" + "a" * 64)
+    shard = plan_shards("run", RangeSpec(kind="index", start=0, end=1), 1, ShardCorrectnessSpec(), (ref,), "current", "fingerprint")[0]
+    now = datetime.now(UTC)
+    def attempt(attempt_id, status="failed", digest="current"):
+        return ShardAttemptRecord(logical_run_id="run", shard_id=shard.shard_id, attempt_id=attempt_id, status=status, input_digest=digest, execution_fingerprint="fingerprint", started_at=now, finished_at=now, failure="failed" if status == "failed" else None)
+    policy = ExecutionPolicy(max_parallel=1, max_attempts_per_shard=4)
+    assert exhausted_shards([shard], [attempt(str(i)) for i in range(3)], policy) == ()
+    assert exhausted_shards([shard], [attempt(str(i)) for i in range(4)], policy) == (shard,)
+    assert exhausted_shards([shard], [attempt(str(i)) for i in range(3)] + [attempt("success", "succeeded")], policy) == ()
+    assert exhausted_shards([shard], [attempt(str(i), digest="stale") for i in range(9)] + [attempt(str(i)) for i in range(3)], policy) == ()

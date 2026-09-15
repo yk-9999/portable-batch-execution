@@ -118,11 +118,60 @@ def execute_public_wave(
         return tuple(attempts)
 
 
+def execute_private_wave(
+    run_id: str, wave_id: str, *, plane=None
+) -> tuple[ShardAttemptRecord, ...]:
+    """Execute an externally resolved closed tabular wave through the private plane."""
+    from portable_batch_execution.data_plane import HttpPrivateDataPlane
+
+    plane = plane or HttpPrivateDataPlane.from_environment()
+    payload = plane.resolve_wave(run_id, wave_id)
+    try:
+        job = JobSpec.model_validate(payload["job"])
+        wave = WaveSpec.model_validate(payload["wave"])
+        shards = tuple(ShardSpec.model_validate(item) for item in payload["shards"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("private data plane returned invalid closed wave contracts") from exc
+    if job.logical_run_id != run_id or wave.logical_run_id != run_id or wave.wave_id != wave_id:
+        raise ValueError("private data plane resolved a different run or wave")
+    if tuple(shard.shard_id for shard in shards) != wave.shard_ids or any(shard.logical_run_id != run_id for shard in shards):
+        raise ValueError("private data plane returned mismatched shards")
+    # The public runner is intentionally a fixed registry, never an import hook.
+    if job.pack != "tabular-batch" or job.operation not in {"tabular.normalize", "tabular.cast", "tabular.sort", "tabular.dedup", "tabular.join", "tabular.pit_join", "tabular.window", "tabular.rolling", "tabular.statistics", "tabular.format_migration"}:
+        raise ValueError("private wave operation is not available on the public runner")
+    prior = plane.read_attempts(run_id)
+    attempts: list[ShardAttemptRecord] = []
+    pack = TabularPack()
+    for shard in shards:
+        current = [item for item in prior if item.shard_id == shard.shard_id and item.input_digest == shard.input_digest and item.execution_fingerprint == shard.execution_fingerprint]
+        if any(item.status == "succeeded" for item in current) or len(current) >= job.execution.max_attempts_per_shard:
+            continue
+        if not shard.input_refs:
+            raise ValueError("private shard has no input artifact")
+        try:
+            rows = json.loads(plane.read(shard.input_refs[0]).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise TypeError("private input artifact is not a JSON record array") from exc
+        if not isinstance(rows, list):
+            raise TypeError("private input artifact is not a JSON record array")
+        started_at = datetime.now(UTC)
+        result = pack.execute(job, shard, job.operation_params, {"data": rows})
+        output = json.dumps(result.to_dicts(), sort_keys=True).encode("utf-8")
+        output_ref = plane.write(output, "application/json")
+        attempt = ShardAttemptRecord(logical_run_id=run_id, shard_id=shard.shard_id, attempt_id=f"{wave_id}-{shard.shard_id}", status="succeeded", input_digest=shard.input_digest, execution_fingerprint=shard.execution_fingerprint, started_at=started_at, finished_at=datetime.now(UTC), wave_id=wave_id, output_refs=(output_ref,), output_digest=sha256(output).hexdigest(), counts={"input_rows": len(rows), "output_rows": result.height})
+        plane.append_attempt(attempt)
+        attempts.append(attempt)
+    return tuple(attempts)
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Execute one approved public synthetic wave.")
+    parser = argparse.ArgumentParser(description="Execute one approved wave.")
     parser.add_argument("--wave-id", required=True)
+    parser.add_argument("--run-id")
+    parser.add_argument("--mode", choices=("public", "private"), default="public")
     args = parser.parse_args(argv)
-    attempts = execute_public_wave(args.wave_id)
+    if args.mode == "private" and not args.run_id:
+        parser.error("--mode private requires --run-id")
+    attempts = execute_private_wave(args.run_id, args.wave_id) if args.mode == "private" else execute_public_wave(args.wave_id)
     print(json.dumps({"wave_id": args.wave_id, "attempt_ids": [item.attempt_id for item in attempts]}))
     return 0
 
