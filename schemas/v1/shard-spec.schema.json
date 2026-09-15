@@ -1,0 +1,279 @@
+{
+  "$defs": {
+    "ArtifactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "object_id": {
+          "title": "Object Id",
+          "type": "string"
+        },
+        "uri": {
+          "title": "Uri",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Media Type"
+        },
+        "size_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Size Bytes"
+        }
+      },
+      "required": [
+        "object_id",
+        "uri",
+        "sha256"
+      ],
+      "title": "ArtifactRef",
+      "type": "object"
+    },
+    "Extent": {
+      "additionalProperties": false,
+      "properties": {
+        "value": {
+          "minimum": 0,
+          "title": "Value",
+          "type": "number"
+        },
+        "unit": {
+          "enum": [
+            "records",
+            "seconds",
+            "minutes",
+            "hours",
+            "days"
+          ],
+          "title": "Unit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "unit"
+      ],
+      "title": "Extent",
+      "type": "object"
+    },
+    "RangeSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": [
+            "index",
+            "time",
+            "key"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start"
+        },
+        "end": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "integer"
+            },
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "RangeSpec",
+      "type": "object"
+    },
+    "ShardCorrectnessSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "default": "independent",
+          "enum": [
+            "independent",
+            "partition_affinity"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "lookback": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Extent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "lookforward": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Extent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "halo_before": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Extent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "halo_after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Extent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "global_order_required": {
+          "default": false,
+          "title": "Global Order Required",
+          "type": "boolean"
+        },
+        "global_finalize_required": {
+          "default": false,
+          "title": "Global Finalize Required",
+          "type": "boolean"
+        }
+      },
+      "title": "ShardCorrectnessSpec",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1",
+      "default": "1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "logical_run_id": {
+      "title": "Logical Run Id",
+      "type": "string"
+    },
+    "shard_id": {
+      "title": "Shard Id",
+      "type": "string"
+    },
+    "ordinal": {
+      "minimum": 0,
+      "title": "Ordinal",
+      "type": "integer"
+    },
+    "partition_key": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Partition Key"
+    },
+    "primary_range": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RangeSpec"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "correctness": {
+      "$ref": "#/$defs/ShardCorrectnessSpec"
+    },
+    "input_refs": {
+      "items": {
+        "$ref": "#/$defs/ArtifactRef"
+      },
+      "title": "Input Refs",
+      "type": "array"
+    },
+    "input_digest": {
+      "title": "Input Digest",
+      "type": "string"
+    },
+    "execution_fingerprint": {
+      "title": "Execution Fingerprint",
+      "type": "string"
+    }
+  },
+  "required": [
+    "logical_run_id",
+    "shard_id",
+    "ordinal",
+    "correctness",
+    "input_refs",
+    "input_digest",
+    "execution_fingerprint"
+  ],
+  "title": "ShardSpec",
+  "type": "object"
+}

@@ -1,0 +1,45 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1",
+      "default": "1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "logical_run_id": {
+      "title": "Logical Run Id",
+      "type": "string"
+    },
+    "wave_id": {
+      "title": "Wave Id",
+      "type": "string"
+    },
+    "ordinal": {
+      "minimum": 0,
+      "title": "Ordinal",
+      "type": "integer"
+    },
+    "shard_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Shard Ids",
+      "type": "array"
+    },
+    "max_parallel": {
+      "exclusiveMinimum": 0,
+      "title": "Max Parallel",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "logical_run_id",
+    "wave_id",
+    "ordinal",
+    "shard_ids",
+    "max_parallel"
+  ],
+  "title": "WaveSpec",
+  "type": "object"
+}

@@ -1,0 +1,363 @@
+{
+  "$defs": {
+    "AdapterDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_id": {
+          "title": "Adapter Id",
+          "type": "string"
+        },
+        "adapter_version": {
+          "title": "Adapter Version",
+          "type": "string"
+        },
+        "adapter_api_version": {
+          "const": "1",
+          "default": "1",
+          "title": "Adapter Api Version",
+          "type": "string"
+        },
+        "adapter_digest": {
+          "title": "Adapter Digest",
+          "type": "string"
+        },
+        "supported_operations": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Supported Operations",
+          "type": "array"
+        }
+      },
+      "required": [
+        "adapter_id",
+        "adapter_version",
+        "adapter_digest",
+        "supported_operations"
+      ],
+      "title": "AdapterDescriptor",
+      "type": "object"
+    },
+    "ArtifactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "object_id": {
+          "title": "Object Id",
+          "type": "string"
+        },
+        "uri": {
+          "title": "Uri",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Media Type"
+        },
+        "size_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Size Bytes"
+        }
+      },
+      "required": [
+        "object_id",
+        "uri",
+        "sha256"
+      ],
+      "title": "ArtifactRef",
+      "type": "object"
+    },
+    "CompatibilitySpec": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_version": {
+          "const": "1",
+          "default": "1",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "kernel_api_version": {
+          "const": "1",
+          "default": "1",
+          "title": "Kernel Api Version",
+          "type": "string"
+        },
+        "pack_api_version": {
+          "const": "1",
+          "default": "1",
+          "title": "Pack Api Version",
+          "type": "string"
+        },
+        "adapter_api_version": {
+          "const": "1",
+          "default": "1",
+          "title": "Adapter Api Version",
+          "type": "string"
+        }
+      },
+      "title": "CompatibilitySpec",
+      "type": "object"
+    },
+    "ExecutionPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "max_parallel": {
+          "exclusiveMinimum": 0,
+          "title": "Max Parallel",
+          "type": "integer"
+        },
+        "max_attempts_per_shard": {
+          "exclusiveMinimum": 0,
+          "title": "Max Attempts Per Shard",
+          "type": "integer"
+        },
+        "resume_enabled": {
+          "default": true,
+          "title": "Resume Enabled",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "max_parallel",
+        "max_attempts_per_shard"
+      ],
+      "title": "ExecutionPolicy",
+      "type": "object"
+    },
+    "Extent": {
+      "additionalProperties": false,
+      "properties": {
+        "value": {
+          "minimum": 0,
+          "title": "Value",
+          "type": "number"
+        },
+        "unit": {
+          "enum": [
+            "records",
+            "seconds",
+            "minutes",
+            "hours",
+            "days"
+          ],
+          "title": "Unit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "unit"
+      ],
+      "title": "Extent",
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "producer": {
+          "title": "Producer",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "parent_run_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Parent Run Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "producer",
+        "revision",
+        "created_at"
+      ],
+      "title": "Provenance",
+      "type": "object"
+    },
+    "ShardCorrectnessSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "default": "independent",
+          "enum": [
+            "independent",
+            "partition_affinity"
+          ],
+          "title": "Mode",
+          "type": "string"
+        },
+        "lookback": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Extent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "lookforward": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Extent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "halo_before": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Extent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "halo_after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Extent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "global_order_required": {
+          "default": false,
+          "title": "Global Order Required",
+          "type": "boolean"
+        },
+        "global_finalize_required": {
+          "default": false,
+          "title": "Global Finalize Required",
+          "type": "boolean"
+        }
+      },
+      "title": "ShardCorrectnessSpec",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1",
+      "default": "1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "job_id": {
+      "title": "Job Id",
+      "type": "string"
+    },
+    "logical_run_id": {
+      "title": "Logical Run Id",
+      "type": "string"
+    },
+    "pack": {
+      "enum": [
+        "tabular-batch",
+        "acquisition-batch",
+        "replay-eval-batch",
+        "ml-batch",
+        "media-batch"
+      ],
+      "title": "Pack",
+      "type": "string"
+    },
+    "operation": {
+      "title": "Operation",
+      "type": "string"
+    },
+    "input_manifest_ref": {
+      "$ref": "#/$defs/ArtifactRef"
+    },
+    "sharding": {
+      "$ref": "#/$defs/ShardCorrectnessSpec"
+    },
+    "execution": {
+      "$ref": "#/$defs/ExecutionPolicy"
+    },
+    "security_profile": {
+      "enum": [
+        "offline",
+        "bounded-network",
+        "external-api"
+      ],
+      "title": "Security Profile",
+      "type": "string"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "adapter": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AdapterDescriptor"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "operation_params": {
+      "additionalProperties": true,
+      "title": "Operation Params",
+      "type": "object"
+    },
+    "compatibility": {
+      "$ref": "#/$defs/CompatibilitySpec"
+    }
+  },
+  "required": [
+    "job_id",
+    "logical_run_id",
+    "pack",
+    "operation",
+    "input_manifest_ref",
+    "sharding",
+    "execution",
+    "security_profile",
+    "provenance"
+  ],
+  "title": "JobSpec",
+  "type": "object"
+}

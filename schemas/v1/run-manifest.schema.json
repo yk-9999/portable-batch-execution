@@ -1,0 +1,410 @@
+{
+  "$defs": {
+    "ArtifactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "object_id": {
+          "title": "Object Id",
+          "type": "string"
+        },
+        "uri": {
+          "title": "Uri",
+          "type": "string"
+        },
+        "sha256": {
+          "title": "Sha256",
+          "type": "string"
+        },
+        "media_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Media Type"
+        },
+        "size_bytes": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Size Bytes"
+        }
+      },
+      "required": [
+        "object_id",
+        "uri",
+        "sha256"
+      ],
+      "title": "ArtifactRef",
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "properties": {
+        "producer": {
+          "title": "Producer",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "parent_run_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Parent Run Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "producer",
+        "revision",
+        "created_at"
+      ],
+      "title": "Provenance",
+      "type": "object"
+    },
+    "ShardAttemptRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1",
+          "default": "1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "logical_run_id": {
+          "title": "Logical Run Id",
+          "type": "string"
+        },
+        "shard_id": {
+          "title": "Shard Id",
+          "type": "string"
+        },
+        "attempt_id": {
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "cancelled"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "input_digest": {
+          "title": "Input Digest",
+          "type": "string"
+        },
+        "execution_fingerprint": {
+          "title": "Execution Fingerprint",
+          "type": "string"
+        },
+        "started_at": {
+          "format": "date-time",
+          "title": "Started At",
+          "type": "string"
+        },
+        "finished_at": {
+          "format": "date-time",
+          "title": "Finished At",
+          "type": "string"
+        },
+        "wave_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Wave Id"
+        },
+        "output_refs": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ArtifactRef"
+          },
+          "title": "Output Refs",
+          "type": "array"
+        },
+        "output_digest": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Output Digest"
+        },
+        "counts": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Counts",
+          "type": "object"
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Failure"
+        },
+        "backend_execution_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backend Execution Id"
+        },
+        "backend_job_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backend Job Id"
+        }
+      },
+      "required": [
+        "logical_run_id",
+        "shard_id",
+        "attempt_id",
+        "status",
+        "input_digest",
+        "execution_fingerprint",
+        "started_at",
+        "finished_at"
+      ],
+      "title": "ShardAttemptRecord",
+      "type": "object"
+    },
+    "WaveSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "1",
+          "default": "1",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "logical_run_id": {
+          "title": "Logical Run Id",
+          "type": "string"
+        },
+        "wave_id": {
+          "title": "Wave Id",
+          "type": "string"
+        },
+        "ordinal": {
+          "minimum": 0,
+          "title": "Ordinal",
+          "type": "integer"
+        },
+        "shard_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Shard Ids",
+          "type": "array"
+        },
+        "max_parallel": {
+          "exclusiveMinimum": 0,
+          "title": "Max Parallel",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "logical_run_id",
+        "wave_id",
+        "ordinal",
+        "shard_ids",
+        "max_parallel"
+      ],
+      "title": "WaveSpec",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1",
+      "default": "1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "logical_run_id": {
+      "title": "Logical Run Id",
+      "type": "string"
+    },
+    "revision": {
+      "minimum": 0,
+      "title": "Revision",
+      "type": "integer"
+    },
+    "job_spec_digest": {
+      "title": "Job Spec Digest",
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "planned",
+        "running",
+        "finalizing",
+        "succeeded",
+        "failed",
+        "cancelled"
+      ],
+      "title": "Status",
+      "type": "string"
+    },
+    "expected_shard_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Expected Shard Ids",
+      "type": "array"
+    },
+    "created_at": {
+      "format": "date-time",
+      "title": "Created At",
+      "type": "string"
+    },
+    "updated_at": {
+      "format": "date-time",
+      "title": "Updated At",
+      "type": "string"
+    },
+    "provenance": {
+      "$ref": "#/$defs/Provenance"
+    },
+    "waves": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/WaveSpec"
+      },
+      "title": "Waves",
+      "type": "array"
+    },
+    "discovered_attempts": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ShardAttemptRecord"
+      },
+      "title": "Discovered Attempts",
+      "type": "array"
+    },
+    "canonical_attempts": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ShardAttemptRecord"
+      },
+      "title": "Canonical Attempts",
+      "type": "array"
+    },
+    "completed_shard_ids": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Completed Shard Ids",
+      "type": "array"
+    },
+    "missing_shard_ids": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Missing Shard Ids",
+      "type": "array"
+    },
+    "duplicate_shard_ids": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Duplicate Shard Ids",
+      "type": "array"
+    },
+    "finalization_status": {
+      "default": "not_started",
+      "enum": [
+        "not_started",
+        "ready",
+        "finalized",
+        "failed"
+      ],
+      "title": "Finalization Status",
+      "type": "string"
+    },
+    "final_output_refs": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ArtifactRef"
+      },
+      "title": "Final Output Refs",
+      "type": "array"
+    },
+    "backend_executions": {
+      "default": [],
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Backend Executions",
+      "type": "array"
+    }
+  },
+  "required": [
+    "logical_run_id",
+    "revision",
+    "job_spec_digest",
+    "status",
+    "expected_shard_ids",
+    "created_at",
+    "updated_at",
+    "provenance"
+  ],
+  "title": "RunManifest",
+  "type": "object"
+}
