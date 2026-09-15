@@ -1,0 +1,5 @@
+{
+  "texts": ["excellent fast service", "great quality", "very happy", "love this product", "poor quality", "slow support", "very disappointed", "hate this product"],
+  "labels": [1, 1, 1, 1, 0, 0, 0, 0],
+  "groups": ["a", "a", "b", "b", "c", "c", "d", "d"]
+}
