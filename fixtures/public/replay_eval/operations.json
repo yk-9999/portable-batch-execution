@@ -1,0 +1,15 @@
+{
+  "closed_operations": [
+    "replay_eval.replay",
+    "replay_eval.benchmark",
+    "replay_eval.compare",
+    "replay_eval.parameter_sweep",
+    "replay_eval.regression",
+    "replay_eval.walk_forward",
+    "replay_eval.oos",
+    "replay_eval.backtest",
+    "replay_eval.control",
+    "replay_eval.robustness",
+    "replay_eval.external_api_evaluation"
+  ]
+}
