@@ -92,6 +92,12 @@ class ArtifactRef(Frozen):
             raise ValueError("secret URI")
         return value
 
+    @model_validator(mode="after")
+    def identifier_matches_digest(self):
+        if not self.object_id:
+            raise ValueError("object_id required")
+        return self
+
 
 class Provenance(Frozen):
     producer: str
@@ -111,6 +117,12 @@ class InputManifest(Frozen):
     manifest_id: str
     entries: tuple[InputManifestEntry, ...]
     provenance: Provenance
+
+    @model_validator(mode="after")
+    def unique_entries(self):
+        if len({entry.name for entry in self.entries}) != len(self.entries):
+            raise ValueError("input entry names must be unique")
+        return self
 
 
 class AdapterDescriptor(Frozen):
@@ -151,6 +163,51 @@ class RangeSpec(Frozen):
             raise ValueError("safe scalar required")
         return value
 
+    @model_validator(mode="after")
+    def ordered_and_typed(self):
+        if self.kind == "index":
+            if any(
+                value is not None
+                and (not isinstance(value, int) or isinstance(value, bool) or value < 0)
+                for value in (self.start, self.end)
+            ):
+                raise ValueError("index boundaries must be non-negative integers")
+        elif self.kind == "time":
+            if any(
+                value is not None and not isinstance(value, str)
+                for value in (self.start, self.end)
+            ):
+                raise ValueError("time boundaries must be ISO strings")
+            for value in (self.start, self.end):
+                if value is not None:
+                    try:
+                        parsed = datetime.fromisoformat(value)
+                    except ValueError as exc:
+                        raise ValueError("time boundaries must be ISO 8601") from exc
+                    if parsed.tzinfo is None:
+                        raise ValueError("time boundaries must be timezone-aware")
+            if self.start is not None and self.end is not None:
+                self.as_datetime_bounds()
+        if self.kind != "time" and self.start is not None and self.end is not None:
+            try:
+                if self.start > self.end:
+                    raise ValueError("range end precedes start")
+            except TypeError as exc:
+                raise ValueError("range boundaries must have matching types") from exc
+        return self
+
+    def as_datetime_bounds(self) -> tuple[datetime, datetime]:
+        if self.kind != "time" or self.start is None or self.end is None:
+            raise ValueError("time range requires start and end")
+        try:
+            start = datetime.fromisoformat(self.start)
+            end = datetime.fromisoformat(self.end)
+        except ValueError as exc:
+            raise ValueError("time boundaries must be ISO 8601") from exc
+        if start.tzinfo is None or end.tzinfo is None or end < start:
+            raise ValueError("time boundaries must be ordered and timezone-aware")
+        return start, end
+
 
 class ShardCorrectnessSpec(Frozen):
     mode: Literal["independent", "partition_affinity"] = "independent"
@@ -160,6 +217,22 @@ class ShardCorrectnessSpec(Frozen):
     halo_after: Extent | None = None
     global_order_required: bool = False
     global_finalize_required: bool = False
+
+    @model_validator(mode="after")
+    def compatible_extents(self):
+        extents = tuple(
+            value
+            for value in (
+                self.lookback,
+                self.lookforward,
+                self.halo_before,
+                self.halo_after,
+            )
+            if value is not None
+        )
+        if extents and len({extent.unit == "records" for extent in extents}) > 1:
+            raise ValueError("record and time extents cannot be mixed")
+        return self
 
 
 class JobSpec(Frozen):
@@ -242,6 +315,27 @@ class ShardSpec(Frozen):
     def affinity(self):
         if self.correctness.mode == "partition_affinity" and not self.partition_key:
             raise ValueError("partition key required")
+        if self.primary_range is not None:
+            extents = tuple(
+                value
+                for value in (
+                    self.correctness.lookback,
+                    self.correctness.lookforward,
+                    self.correctness.halo_before,
+                    self.correctness.halo_after,
+                )
+                if value is not None
+            )
+            if self.primary_range.kind == "index" and any(
+                extent.unit != "records" for extent in extents
+            ):
+                raise ValueError("index shards require record extents")
+            if self.primary_range.kind == "time" and any(
+                extent.unit == "records" for extent in extents
+            ):
+                raise ValueError("time shards require time extents")
+            if self.primary_range.kind == "key" and extents:
+                raise ValueError("key shards cannot expand numeric or time extents")
         return self
 
 
@@ -291,6 +385,8 @@ class ShardAttemptRecord(Frozen):
             and not self.failure
         ):
             raise ValueError("failure invariant")
+        if self.status != "succeeded" and (self.output_refs or self.output_digest):
+            raise ValueError("non-successful attempt cannot publish output")
         return self
 
 
@@ -335,4 +431,25 @@ class RunManifest(Frozen):
             <= expected
         ):
             raise ValueError("unknown shard")
+        if len({record.shard_id for record in self.canonical_attempts}) != len(
+            self.canonical_attempts
+        ):
+            raise ValueError("canonical attempts must be unique")
+        if any(
+            record.status != "succeeded" or record.shard_id not in expected
+            for record in self.canonical_attempts
+        ):
+            raise ValueError("canonical attempts must be successful expected shards")
+        if tuple(
+            sorted(record.shard_id for record in self.canonical_attempts)
+        ) != tuple(sorted(self.completed_shard_ids)):
+            raise ValueError("completed shards must match canonical attempts")
+        if self.finalization_status == "finalized" and (
+            self.status != "succeeded" or not self.final_output_refs
+        ):
+            raise ValueError("finalized manifest requires succeeded status and outputs")
+        if self.finalization_status in {"ready", "finalized"} and (
+            self.missing_shard_ids or self.duplicate_shard_ids
+        ):
+            raise ValueError("finalization is blocked by incomplete shards")
         return self

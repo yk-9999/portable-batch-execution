@@ -2,19 +2,43 @@ from __future__ import annotations
 
 from hashlib import sha256
 from pathlib import Path
+from threading import RLock
 
-from portable_batch_execution.contracts import ArtifactRef
+from portable_batch_execution.contracts import (
+    ArtifactRef,
+    RunManifest,
+    ShardAttemptRecord,
+)
+
+from .base import RevisionConflictError
 
 
 class LocalFilesystemDataPlane:
     def __init__(self, root: Path):
-        self.root = root
-        root.mkdir(parents=True, exist_ok=True)
+        self.root = root.resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = RLock()
+
+    @property
+    def _artifacts(self) -> Path:
+        path = self.root / "artifacts"
+        path.mkdir(exist_ok=True)
+        return path
+
+    @property
+    def _runs(self) -> Path:
+        path = self.root / "runs"
+        path.mkdir(exist_ok=True)
+        return path
 
     def write(self, data: bytes, media_type: str | None = None) -> ArtifactRef:
         digest = sha256(data).hexdigest()
-        p = self.root / digest
-        p.write_bytes(data)
+        p = self._artifacts / digest
+        with self._lock:
+            if not p.exists():
+                temp = p.with_suffix(".tmp")
+                temp.write_bytes(data)
+                temp.replace(p)
         return ArtifactRef(
             object_id=digest,
             uri=p.as_uri(),
@@ -24,7 +48,110 @@ class LocalFilesystemDataPlane:
         )
 
     def read(self, ref: ArtifactRef) -> bytes:
-        return Path(ref.uri.removeprefix("file:///")).read_bytes()
+        path = Path(ref.uri.removeprefix("file:///"))
+        if path.parent != self._artifacts or path.name != ref.object_id:
+            raise ValueError("artifact ref is outside this data plane")
+        return path.read_bytes()
+
+    def exists(self, ref: ArtifactRef) -> bool:
+        try:
+            path = Path(ref.uri.removeprefix("file:///"))
+            return (
+                path.parent == self._artifacts
+                and path.name == ref.object_id
+                and path.is_file()
+            )
+        except ValueError:
+            return False
 
     def verify(self, ref: ArtifactRef) -> bool:
-        return f"sha256:{sha256(self.read(ref)).hexdigest()}" == ref.sha256
+        try:
+            data = self.read(ref)
+        except (OSError, ValueError):
+            return False
+        return f"sha256:{sha256(data).hexdigest()}" == ref.sha256 and (
+            ref.size_bytes is None or len(data) == ref.size_bytes
+        )
+
+    def _run_directory(self, run_id: str) -> Path:
+        if not run_id or Path(run_id).name != run_id:
+            raise ValueError("invalid run id")
+        path = self._runs / run_id
+        path.mkdir(exist_ok=True)
+        return path
+
+    def append_attempt(self, record: ShardAttemptRecord) -> None:
+        """Persist an immutable attempt record; duplicate IDs are rejected."""
+        with self._lock:
+            run = self._run_directory(record.logical_run_id)
+            attempts = run / "attempts"
+            attempts.mkdir(exist_ok=True)
+            path = attempts / f"{record.attempt_id}.json"
+            if path.exists():
+                existing = ShardAttemptRecord.model_validate_json(
+                    path.read_text(encoding="utf-8")
+                )
+                if existing != record:
+                    raise ValueError("attempt_id already belongs to a different record")
+                return
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(record.model_dump_json() + "\n", encoding="utf-8")
+            temporary.replace(path)
+
+    def read_attempts(self, run_id: str) -> tuple[ShardAttemptRecord, ...]:
+        run = self._run_directory(run_id)
+        attempts = run / "attempts"
+        if not attempts.exists():
+            return ()
+        records = [
+            ShardAttemptRecord.model_validate_json(path.read_text(encoding="utf-8"))
+            for path in attempts.glob("*.json")
+        ]
+        return tuple(
+            sorted(
+                records,
+                key=lambda record: (
+                    record.finished_at,
+                    record.started_at,
+                    record.attempt_id,
+                ),
+            )
+        )
+
+    def read_manifest(self, run_id: str) -> RunManifest | None:
+        path = self._run_directory(run_id) / "latest.json"
+        return (
+            RunManifest.model_validate_json(path.read_text(encoding="utf-8"))
+            if path.exists()
+            else None
+        )
+
+    def write_next_manifest(
+        self, manifest: RunManifest, expected_revision: int
+    ) -> RunManifest:
+        """Compare-and-swap latest manifest and retain every immutable revision."""
+        with self._lock:
+            manifest = RunManifest.model_validate(manifest.model_dump())
+            run = self._run_directory(manifest.logical_run_id)
+            current = self.read_manifest(manifest.logical_run_id)
+            current_revision = current.revision if current else -1
+            if current_revision != expected_revision:
+                raise RevisionConflictError(
+                    f"expected revision {expected_revision}, found {current_revision}"
+                )
+            if manifest.revision != expected_revision + 1:
+                raise ValueError("next manifest revision must increment by one")
+            history = run / "manifests"
+            history.mkdir(exist_ok=True)
+            revision_path = history / f"{manifest.revision:020d}.json"
+            if revision_path.exists():
+                raise RevisionConflictError("manifest revision already exists")
+            encoded = manifest.model_dump_json() + "\n"
+            temporary = revision_path.with_suffix(".tmp")
+            temporary.write_text(encoded, encoding="utf-8")
+            temporary.replace(revision_path)
+            latest = run / "latest.json"
+            latest_temp = latest.with_suffix(".tmp")
+            latest_temp.write_text(encoded, encoding="utf-8")
+            latest_temp.replace(latest)
+            return manifest

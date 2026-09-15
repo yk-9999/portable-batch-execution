@@ -18,9 +18,7 @@ def artifact():
 
 
 def test_contract_security_boundaries():
-    provenance = Provenance(
-        producer="test", revision="r", created_at=datetime.now(UTC)
-    )
+    provenance = Provenance(producer="test", revision="r", created_at=datetime.now(UTC))
     with pytest.raises(ValidationError):
         ArtifactRef(object_id="x", uri="https://u:p@example/x", sha256="bad")
     with pytest.raises(ValidationError):
