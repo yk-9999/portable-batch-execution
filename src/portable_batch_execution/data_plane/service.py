@@ -10,14 +10,12 @@ from urllib.parse import unquote
 
 from portable_batch_execution.contracts import (
     ArtifactRef,
-    RunManifest,
     ShardAttemptRecord,
 )
 from portable_batch_execution.controller.closed_wave_registry import (
     ClosedWaveRegistry,
     opaque_identifier,
 )
-from portable_batch_execution.data_plane.base import RevisionConflictError
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
 
 
@@ -102,24 +100,8 @@ class PrivateDataPlaneService:
                     return 404, {"Content-Type": "application/json"}, b'{"error":"not found"}'
                 return 200, {"Content-Type": "application/json"}, manifest.model_dump_json().encode("utf-8")
             if method == "PUT" and len(segments) == 4 and segments[:2] == ["v1", "runs"] and segments[3] == "manifest":
-                run_id = opaque_identifier(segments[2], "run_id")
-                if_match = headers.get("if-match")
-                if if_match is None:
-                    return 428, {"Content-Type": "application/json"}, b'{"error":"if-match required"}'
-                try:
-                    expected_revision = int(if_match)
-                except ValueError:
-                    return 400, {"Content-Type": "application/json"}, b'{"error":"invalid if-match"}'
-                manifest = RunManifest.model_validate_json(body or b"{}")
-                if manifest.logical_run_id != run_id:
-                    return 400, {"Content-Type": "application/json"}, b'{"error":"run mismatch"}'
-                try:
-                    written = self.store.write_next_manifest(manifest, expected_revision)
-                except RevisionConflictError:
-                    return 409, {"Content-Type": "application/json"}, b'{"error":"revision conflict"}'
-                except ValueError:
-                    return 400, {"Content-Type": "application/json"}, b'{"error":"invalid manifest"}'
-                return 200, {"Content-Type": "application/json"}, written.model_dump_json().encode("utf-8")
+                opaque_identifier(segments[2], "run_id")
+                return 403, {"Content-Type": "application/json"}, b'{"error":"controller-only"}'
         except KeyError:
             return 404, {"Content-Type": "application/json"}, b'{"error":"not found"}'
         except ValueError:

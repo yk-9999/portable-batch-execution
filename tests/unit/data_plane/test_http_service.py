@@ -2,7 +2,6 @@ import json
 from datetime import UTC, datetime
 
 from portable_batch_execution.contracts import (
-    Provenance,
     RunManifest,
     ShardAttemptRecord,
 )
@@ -108,36 +107,41 @@ def test_attempts_are_immutable(tmp_path):
     assert conflict == 409
 
 
-def test_manifest_compare_and_swap(tmp_path):
-    service = _service(tmp_path)
-    now = datetime.now(UTC)
-    manifest = RunManifest(
+def test_manifest_put_is_controller_only(tmp_path):
+    from portable_batch_execution.controller.a1_controller import A1Controller
+
+    controller = A1Controller(tmp_path)
+    controller.prepare_private_synthetic_run(
         logical_run_id="opaque-run",
-        revision=0,
-        job_spec_digest="digest",
-        status="planned",
-        expected_shard_ids=("shard",),
-        created_at=now,
-        updated_at=now,
-        provenance=Provenance(producer="test", revision="1", created_at=now),
+        wave_id="opaque-wave",
     )
-    put_status, _, body = service.dispatch(
+    service = _service(tmp_path)
+    get_status, _, body = service.dispatch(
+        "GET",
+        "/v1/runs/opaque-run/manifest",
+        authorization="Bearer plane-token",
+    )
+    assert get_status == 200
+    manifest = RunManifest.model_validate_json(body or b"{}")
+    assert manifest.revision == 0
+
+    put_status, _, put_body = service.dispatch(
         "PUT",
         "/v1/runs/opaque-run/manifest",
         authorization="Bearer plane-token",
-        headers={"if-match": "-1"},
-        body=manifest.model_dump_json().encode("utf-8"),
-    )
-    assert put_status == 200
-    written = RunManifest.model_validate_json(body or b"{}")
-    assert written.revision == 0
-    stale, _, _ = service.dispatch(
-        "PUT",
-        "/v1/runs/opaque-run/manifest",
-        authorization="Bearer plane-token",
-        headers={"if-match": "-1"},
-        body=manifest.model_copy(update={"revision": 1}).model_dump_json().encode(
+        headers={"if-match": "0"},
+        body=manifest.model_copy(update={"revision": 1, "status": "running"}).model_dump_json().encode(
             "utf-8"
         ),
     )
-    assert stale == 409
+    assert put_status == 403
+    assert json.loads(put_body or b"{}") == {"error": "controller-only"}
+
+    again_status, _, again_body = service.dispatch(
+        "GET",
+        "/v1/runs/opaque-run/manifest",
+        authorization="Bearer plane-token",
+    )
+    assert again_status == 200
+    stored = RunManifest.model_validate_json(again_body or b"{}")
+    assert stored.revision == 0
