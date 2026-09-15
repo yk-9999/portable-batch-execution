@@ -48,6 +48,12 @@ def test_prepare_registers_closed_wave_and_manifest(tmp_path):
     assert manifest is not None and manifest.revision == 0
 
 
+def test_dispatch_state_rejects_path_like_run_id(tmp_path):
+    controller = A1Controller(tmp_path)
+    with pytest.raises(ValueError, match="opaque identifier"):
+        controller.inspect_run("../escape")
+
+
 def test_dispatch_persists_exact_backend_execution_id(tmp_path):
     def handler(request):
         return httpx.Response(201, json={"workflow_run_id": 424242, "html_url": "https://run"})

@@ -18,7 +18,10 @@ from portable_batch_execution.contracts import (
     ShardSpec,
     WaveSpec,
 )
-from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
+from portable_batch_execution.controller.closed_wave_registry import (
+    ClosedWaveRegistry,
+    opaque_identifier,
+)
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
 from portable_batch_execution.kernel import RunController
 
@@ -67,6 +70,7 @@ class A1Controller:
         self._dispatch_root.mkdir(parents=True, exist_ok=True)
 
     def _dispatch_path(self, run_id: str) -> Path:
+        run_id = opaque_identifier(run_id, "run_id")
         return self._dispatch_root / f"{run_id}.json"
 
     def _read_dispatch_state(self, run_id: str) -> dict:
@@ -177,6 +181,7 @@ class A1Controller:
         return execution
 
     def inspect_run(self, run_id: str) -> dict:
+        run_id = opaque_identifier(run_id, "run_id")
         manifest = self.data_plane.read_manifest(run_id)
         dispatch = self._read_dispatch_state(run_id)
         backend_status = None
@@ -206,6 +211,7 @@ class A1Controller:
         }
 
     def reconcile_run(self, run_id: str) -> RunManifest:
+        run_id = opaque_identifier(run_id, "run_id")
         manifest = self.data_plane.read_manifest(run_id)
         if manifest is None:
             raise ValueError("run manifest not found")

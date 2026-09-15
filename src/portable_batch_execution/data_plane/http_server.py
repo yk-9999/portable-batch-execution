@@ -7,6 +7,16 @@ from pathlib import Path
 
 from .service import PrivateDataPlaneService
 
+_LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def require_loopback_bind_host(host: str) -> str:
+    """Reject non-loopback bind addresses; external HTTPS terminates before this service."""
+    normalized = host.strip().lower()
+    if normalized not in _LOOPBACK_BIND_HOSTS:
+        raise ValueError("private data plane bind host must be loopback")
+    return host.strip()
+
 
 def _response_bytes(body: bytes | None) -> bytes:
     return body if body is not None else b""
@@ -17,6 +27,13 @@ class _PrivateDataPlaneHandler(BaseHTTPRequestHandler):
         return
 
     def _dispatch(self, method: str) -> None:
+        if not self.service.authorize(self.headers.get("Authorization")):
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if method != "HEAD":
+                self.wfile.write(b'{"error":"unauthorized"}')
+            return
         length = int(self.headers.get("Content-Length", "0") or "0")
         body = self.rfile.read(length) if length else b""
         status, headers, payload = self.service.dispatch(
@@ -56,6 +73,7 @@ def serve_private_data_plane(
     host: str = "127.0.0.1",
     port: int = 0,
 ) -> ThreadingHTTPServer:
+    host = require_loopback_bind_host(host)
     service = PrivateDataPlaneService(state_root, bearer_token)
 
     class Handler(_PrivateDataPlaneHandler):
@@ -76,4 +94,9 @@ def serve_private_data_plane_from_environment() -> ThreadingHTTPServer:
     port = int(os.environ.get("PBE_PRIVATE_DATA_PLANE_BIND_PORT", "8765"))
     if not state_root or not bearer_token:
         raise ValueError("private data plane server environment is not configured")
-    return serve_private_data_plane(Path(state_root), bearer_token, host=host, port=port)
+    return serve_private_data_plane(
+        Path(state_root),
+        bearer_token,
+        host=require_loopback_bind_host(host),
+        port=port,
+    )
