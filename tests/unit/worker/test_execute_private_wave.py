@@ -23,13 +23,20 @@ def _plane(
     appended=None,
     read_raises=None,
     write_raises=False,
+    operation="tabular.rolling",
+    input_ref_overrides=None,
+    write_ref_overrides=None,
 ):
     rows = rows if rows is not None else [{"group": "a", "value": 1}]
-    input_ref = ArtifactRef(
-        object_id="input",
-        uri="pbe://private/input",
-        sha256="sha256:" + sha256(json.dumps(rows).encode()).hexdigest(),
-    )
+    payload = json.dumps(rows).encode()
+    input_ref_fields = {
+        "object_id": "input",
+        "uri": "pbe://private/input",
+        "sha256": "sha256:" + sha256(payload).hexdigest(),
+        "size_bytes": len(payload),
+    }
+    input_ref_fields.update(input_ref_overrides or {})
+    input_ref = ArtifactRef(**input_ref_fields)
     now = datetime.now(UTC).isoformat()
     shard_specs = shards or [
         {
@@ -46,7 +53,7 @@ def _plane(
         "job_id": "job",
         "logical_run_id": "opaque-run",
         "pack": "tabular-batch",
-        "operation": "tabular.rolling",
+        "operation": operation,
         "input_manifest_ref": input_ref.model_dump(mode="json"),
         "sharding": {},
         "execution": {"max_parallel": 1, "max_attempts_per_shard": max_attempts},
@@ -84,11 +91,14 @@ def _plane(
         def write(self, data, media_type):
             if write_raises:
                 raise RuntimeError(_SENTINEL)
-            return ArtifactRef(
-                object_id="output",
-                uri="pbe://private/output",
-                sha256="sha256:" + sha256(data).hexdigest(),
-            )
+            output_ref_fields = {
+                "object_id": "output",
+                "uri": "pbe://private/output",
+                "sha256": "sha256:" + sha256(data).hexdigest(),
+                "size_bytes": len(data),
+            }
+            output_ref_fields.update(write_ref_overrides or {})
+            return ArtifactRef(**output_ref_fields)
 
         def append_attempt(self, record):
             self.appended.append(record)
@@ -215,4 +225,52 @@ def test_successful_shards_continue_when_another_shard_fails():
     by_shard = {item.shard_id: item for item in plane.appended[-2:]}
     assert by_shard["fail-shard"].status == "failed"
     assert by_shard["ok-shard"].status == "succeeded"
+    assert _SENTINEL not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ("tabular.join", "tabular.pit_join", "tabular.format_migration"),
+)
+def test_rejects_multi_input_tabular_operations(operation):
+    plane = _plane(operation=operation)
+    with pytest.raises(ValueError, match="typed multi-input contract"):
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert plane.appended == []
+
+
+def test_input_digest_mismatch_records_sanitized_failure():
+    plane = _plane(
+        input_ref_overrides={
+            "sha256": "sha256:" + ("0" * 64),
+        }
+    )
+    with pytest.raises(PrivateWaveExecutionError) as error:
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    record = plane.appended[0]
+    assert record.status == "failed"
+    assert record.failure == "input_artifact_mismatch"
+    assert _SENTINEL not in json.dumps(record.model_dump(mode="json"))
+    assert _SENTINEL not in str(error.value)
+
+
+def test_input_size_mismatch_records_sanitized_failure():
+    plane = _plane(input_ref_overrides={"size_bytes": 0})
+    with pytest.raises(PrivateWaveExecutionError):
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert plane.appended[0].failure == "input_artifact_mismatch"
+
+
+def test_output_reference_mismatch_records_sanitized_failure():
+    plane = _plane(
+        write_ref_overrides={
+            "sha256": "sha256:" + ("f" * 64),
+        }
+    )
+    with pytest.raises(PrivateWaveExecutionError) as error:
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    record = plane.appended[0]
+    assert record.status == "failed"
+    assert record.failure == "output_artifact_mismatch"
+    assert record.output_refs == ()
     assert _SENTINEL not in str(error.value)

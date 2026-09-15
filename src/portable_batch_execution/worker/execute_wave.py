@@ -12,6 +12,7 @@ from hashlib import sha256
 from pathlib import Path
 
 from portable_batch_execution.contracts import (
+    ArtifactRef,
     JobSpec,
     ShardAttemptRecord,
     ShardSpec,
@@ -22,6 +23,24 @@ from portable_batch_execution.packs import TabularPack
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})
+_PRIVATE_TABULAR_SINGLE_INPUT_OPS = frozenset(
+    {
+        "tabular.normalize",
+        "tabular.cast",
+        "tabular.sort",
+        "tabular.dedup",
+        "tabular.window",
+        "tabular.rolling",
+        "tabular.statistics",
+    }
+)
+_PRIVATE_TABULAR_MULTI_INPUT_OPS = frozenset(
+    {
+        "tabular.join",
+        "tabular.pit_join",
+        "tabular.format_migration",
+    }
+)
 
 
 class PrivateWaveExecutionError(RuntimeError):
@@ -53,6 +72,12 @@ def _matching_current_attempts(
 def _private_attempt_id(wave_id: str, shard_id: str, current_attempt_count: int) -> str:
     ordinal = current_attempt_count + 1
     return f"{wave_id}-{shard_id}-{ordinal}"
+
+
+def _artifact_ref_matches_bytes(data: bytes, ref: ArtifactRef) -> bool:
+    if f"sha256:{sha256(data).hexdigest()}" != ref.sha256:
+        return False
+    return ref.size_bytes is None or len(data) == ref.size_bytes
 
 
 def _execution_failure_code(exc: BaseException, *, stage: str) -> str:
@@ -181,8 +206,11 @@ def execute_private_wave(
         raise ValueError("private data plane resolved a different run or wave")
     if tuple(shard.shard_id for shard in shards) != wave.shard_ids or any(shard.logical_run_id != run_id for shard in shards):
         raise ValueError("private data plane returned mismatched shards")
-    # The public runner is intentionally a fixed registry, never an import hook.
-    if job.pack != "tabular-batch" or job.operation not in {"tabular.normalize", "tabular.cast", "tabular.sort", "tabular.dedup", "tabular.join", "tabular.pit_join", "tabular.window", "tabular.rolling", "tabular.statistics", "tabular.format_migration"}:
+    if job.pack != "tabular-batch":
+        raise ValueError("private wave operation is not available on the public runner")
+    if job.operation in _PRIVATE_TABULAR_MULTI_INPUT_OPS:
+        raise ValueError("private wave operation requires a typed multi-input contract")
+    if job.operation not in _PRIVATE_TABULAR_SINGLE_INPUT_OPS:
         raise ValueError("private wave operation is not available on the public runner")
     prior = plane.read_attempts(run_id)
     attempts: list[ShardAttemptRecord] = []
@@ -198,13 +226,16 @@ def execute_private_wave(
             raise ValueError("private shard has no input artifact")
         started_at = datetime.now(UTC)
         attempt_id = _private_attempt_id(wave_id, shard.shard_id, len(current))
+        input_ref = shard.input_refs[0]
         try:
             try:
-                payload = plane.read(shard.input_refs[0])
+                payload = plane.read(input_ref)
             except Exception as exc:  # noqa: BLE001
                 raise _ShardStageFailure(
                     _execution_failure_code(exc, stage="input_read")
                 ) from None
+            if not _artifact_ref_matches_bytes(payload, input_ref):
+                raise _ShardStageFailure("input_artifact_mismatch")
             try:
                 text = payload.decode("utf-8")
             except UnicodeDecodeError as exc:
@@ -234,6 +265,8 @@ def execute_private_wave(
                 raise _ShardStageFailure(
                     _execution_failure_code(exc, stage="output")
                 ) from None
+            if not _artifact_ref_matches_bytes(output, output_ref):
+                raise _ShardStageFailure("output_artifact_mismatch")
             attempt = ShardAttemptRecord(
                 logical_run_id=run_id,
                 shard_id=shard.shard_id,
