@@ -7,6 +7,35 @@ from pathlib import Path
 
 from .service import PrivateDataPlaneService
 
+_CONFIG_ERROR = "private data plane server environment is not configured"
+
+
+def _read_nonempty_utf8_secret_file(path: str) -> str:
+    try:
+        raw = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        raise ValueError(_CONFIG_ERROR) from None
+    token = raw.strip()
+    if not token:
+        raise ValueError(_CONFIG_ERROR)
+    return token
+
+
+def _resolve_bearer_token_from_environment() -> str:
+    import os
+
+    literal = os.environ.get("PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN")
+    token_file = os.environ.get("PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN_FILE")
+    literal_set = bool(literal and literal.strip())
+    file_set = bool(token_file and token_file.strip())
+    if literal_set and file_set:
+        raise ValueError(_CONFIG_ERROR)
+    if file_set:
+        return _read_nonempty_utf8_secret_file(token_file.strip())
+    if literal_set:
+        return literal.strip()
+    raise ValueError(_CONFIG_ERROR)
+
 
 def _response_bytes(body: bytes | None) -> bytes:
     return body if body is not None else b""
@@ -71,9 +100,9 @@ def serve_private_data_plane_from_environment() -> ThreadingHTTPServer:
     import os
 
     state_root = os.environ.get("PBE_PRIVATE_DATA_PLANE_STATE_ROOT")
-    bearer_token = os.environ.get("PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN")
+    bearer_token = _resolve_bearer_token_from_environment()
     host = os.environ.get("PBE_PRIVATE_DATA_PLANE_BIND_HOST", "127.0.0.1")
     port = int(os.environ.get("PBE_PRIVATE_DATA_PLANE_BIND_PORT", "8765"))
-    if not state_root or not bearer_token:
-        raise ValueError("private data plane server environment is not configured")
+    if not state_root:
+        raise ValueError(_CONFIG_ERROR)
     return serve_private_data_plane(Path(state_root), bearer_token, host=host, port=port)
