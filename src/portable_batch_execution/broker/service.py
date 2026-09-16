@@ -252,21 +252,29 @@ class UnixBrokerService:
                 backend_status = self._backend_status(state)
             except GitHubActionsAPIError:
                 return self._failed(request_id, "backend_transient")
+            backend_terminal = backend_status in {"failed", "cancelled", "succeeded"}
             if backend_status == "running":
                 self._sleep(self.poll_interval_seconds)
                 continue
             if (
                 state.dispatch_count > 0
                 and terminal_count <= state.last_dispatched_failure_count
+                and not backend_terminal
             ):
                 self._sleep(self.poll_interval_seconds)
                 continue
+            if backend_terminal and state.dispatch_count >= max_dispatches:
+                state.status = "exhausted"
+                self._store.save(state)
+                return self._exhausted(state)
             should_dispatch = (
                 state.dispatch_count == 0
                 or (
-                    terminal_count > state.last_dispatched_failure_count
-                    and terminal_count < execution_policy.max_attempts_per_shard
-                    and state.dispatch_count < max_dispatches
+                    state.dispatch_count < max_dispatches
+                    and (
+                        terminal_count > state.last_dispatched_failure_count
+                        or backend_terminal
+                    )
                 )
             )
             if not should_dispatch:
