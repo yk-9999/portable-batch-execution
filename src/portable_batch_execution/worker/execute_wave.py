@@ -19,7 +19,7 @@ from portable_batch_execution.contracts import (
     WaveSpec,
 )
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
-from portable_batch_execution.packs import TabularPack
+from portable_batch_execution.packs import MediaPack, TabularPack
 from portable_batch_execution.packs.ml.char_wb_tfidf_logistic_score import (
     execute_char_wb_tfidf_logistic_score,
 )
@@ -53,6 +53,7 @@ _PRIVATE_ML_SINGLE_INPUT_OPS = frozenset(
         "ml.cosine_similarity_matrix",
     }
 )
+_PRIVATE_MEDIA_SINGLE_INPUT_OPS = frozenset({"media.asr_normalize_flac"})
 
 
 class PrivateWaveExecutionError(RuntimeError):
@@ -245,11 +246,18 @@ def execute_private_wave(
         if job.operation not in _PRIVATE_ML_SINGLE_INPUT_OPS:
             raise ValueError("private wave operation is not available on the public runner")
         private_pack = "ml-batch"
+    elif job.pack == "media-batch":
+        if job.operation not in _PRIVATE_MEDIA_SINGLE_INPUT_OPS:
+            raise ValueError("private wave operation is not available on the public runner")
+        if job.operation_params:
+            raise ValueError("closed operation parameters")
+        private_pack = "media-batch"
     else:
         raise ValueError("private wave operation is not available on the public runner")
     prior = plane.read_attempts(run_id)
     attempts: list[ShardAttemptRecord] = []
     pack = TabularPack()
+    media_pack = MediaPack()
     wave_failures = 0
     for shard in shards:
         current = _matching_current_attempts(prior, shard)
@@ -277,63 +285,97 @@ def execute_private_wave(
                 ) from None
             if not _artifact_ref_matches_bytes(payload, input_ref):
                 raise _ShardStageFailure("input_artifact_mismatch")
-            try:
-                text = payload.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise _ShardStageFailure(
-                    _execution_failure_code(exc, stage="input_decode")
-                ) from None
-            try:
-                parsed_input = json.loads(text)
-            except ValueError as exc:
-                raise _ShardStageFailure(
-                    _execution_failure_code(exc, stage="input_parse")
-                ) from None
-            if private_pack == "tabular-batch":
-                if not isinstance(parsed_input, list):
-                    raise _ShardStageFailure(
-                        _execution_failure_code(TypeError(), stage="input_parse")
-                    )
-                try:
-                    result = pack.execute(
-                        job, shard, job.operation_params, {"data": parsed_input}
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    raise _ShardStageFailure(
-                        _execution_failure_code(exc, stage="pack")
-                    ) from None
-                output = json.dumps(result.to_dicts(), sort_keys=True).encode("utf-8")
-                input_rows = len(parsed_input)
-                output_rows = result.height
+            if private_pack == "media-batch":
+                with tempfile.TemporaryDirectory() as temporary:
+                    input_path = Path(temporary) / "input.bin"
+                    output_path = Path(temporary) / "output.flac"
+                    input_path.write_bytes(payload)
+                    try:
+                        media_pack.execute(
+                            job,
+                            shard,
+                            job.operation_params,
+                            {
+                                "input": str(input_path),
+                                "output": str(output_path),
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="pack")
+                        ) from None
+                    try:
+                        output = output_path.read_bytes()
+                    except OSError as exc:
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="pack")
+                        ) from None
+                media_counts = {
+                    "input_bytes": len(payload),
+                    "output_bytes": len(output),
+                }
+                output_media_type = "audio/flac"
             else:
-                if not isinstance(parsed_input, dict):
-                    raise _ShardStageFailure(
-                        _execution_failure_code(TypeError(), stage="input_parse")
-                    )
                 try:
-                    if job.operation == "ml.cosine_similarity_matrix":
-                        result_payload = execute_cosine_similarity_matrix(
-                            parsed_input
-                        )
-                        input_rows = len(parsed_input["left"]) + len(
-                            parsed_input["right"]
-                        )
-                        output_rows = len(result_payload["scores"]) * len(
-                            result_payload["scores"][0]
-                        )
-                    else:
-                        result_payload = execute_char_wb_tfidf_logistic_score(
-                            parsed_input
-                        )
-                        input_rows = len(parsed_input.get("rows", ()))
-                        output_rows = len(result_payload["rows"])
-                except Exception as exc:  # noqa: BLE001
+                    text = payload.decode("utf-8")
+                except UnicodeDecodeError as exc:
                     raise _ShardStageFailure(
-                        _execution_failure_code(exc, stage="pack")
+                        _execution_failure_code(exc, stage="input_decode")
                     ) from None
-                output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
+                try:
+                    parsed_input = json.loads(text)
+                except ValueError as exc:
+                    raise _ShardStageFailure(
+                        _execution_failure_code(exc, stage="input_parse")
+                    ) from None
+                output_media_type = "application/json"
+                if private_pack == "tabular-batch":
+                    if not isinstance(parsed_input, list):
+                        raise _ShardStageFailure(
+                            _execution_failure_code(TypeError(), stage="input_parse")
+                        )
+                    try:
+                        result = pack.execute(
+                            job, shard, job.operation_params, {"data": parsed_input}
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="pack")
+                        ) from None
+                    output = json.dumps(result.to_dicts(), sort_keys=True).encode(
+                        "utf-8"
+                    )
+                    input_rows = len(parsed_input)
+                    output_rows = result.height
+                else:
+                    if not isinstance(parsed_input, dict):
+                        raise _ShardStageFailure(
+                            _execution_failure_code(TypeError(), stage="input_parse")
+                        )
+                    try:
+                        if job.operation == "ml.cosine_similarity_matrix":
+                            result_payload = execute_cosine_similarity_matrix(
+                                parsed_input
+                            )
+                            input_rows = len(parsed_input["left"]) + len(
+                                parsed_input["right"]
+                            )
+                            output_rows = len(result_payload["scores"]) * len(
+                                result_payload["scores"][0]
+                            )
+                        else:
+                            result_payload = execute_char_wb_tfidf_logistic_score(
+                                parsed_input
+                            )
+                            input_rows = len(parsed_input.get("rows", ()))
+                            output_rows = len(result_payload["rows"])
+                    except Exception as exc:  # noqa: BLE001
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="pack")
+                        ) from None
+                    output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
             try:
-                output_ref = plane.write(output, "application/json")
+                output_ref = plane.write(output, output_media_type)
             except Exception as exc:  # noqa: BLE001
                 raise _ShardStageFailure(
                     _execution_failure_code(exc, stage="output")
@@ -352,7 +394,11 @@ def execute_private_wave(
                 wave_id=wave_id,
                 output_refs=(output_ref,),
                 output_digest=sha256(output).hexdigest(),
-                counts={"input_rows": input_rows, "output_rows": output_rows},
+                counts=(
+                    media_counts
+                    if private_pack == "media-batch"
+                    else {"input_rows": input_rows, "output_rows": output_rows}
+                ),
             )
         except _ShardStageFailure as failed:
             attempt = ShardAttemptRecord(

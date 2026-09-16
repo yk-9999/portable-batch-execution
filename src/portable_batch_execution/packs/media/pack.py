@@ -28,6 +28,7 @@ class MediaPack:
         "media.metadata",
         "media.asr_merge",
         "media.overlap_remove",
+        "media.asr_normalize_flac",
     )
 
     _AUDIO_SUFFIXES: ClassVar[set[str]] = {
@@ -151,6 +152,36 @@ class MediaPack:
             )
         )
         return dst
+
+    def asr_normalize_flac(self, source: str | Path, destination: str | Path) -> Path:
+        """Normalize one media artifact to mono 16 kHz FLAC for ASR preprocessing."""
+        src, dst = self._path(source), self._path(destination, output=True)
+        self._run(
+            self._ffmpeg_args(
+                "-y",
+                "-i",
+                str(src),
+                "-vn",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "flac",
+                "-compression_level",
+                "8",
+                str(dst),
+            )
+        )
+        return dst
+
+    @staticmethod
+    def _worker_io_paths(context: Any) -> tuple[Path, Path]:
+        if not isinstance(context, Mapping):
+            raise TypeError("media worker context must be a mapping")
+        if set(context) != {"input", "output"}:
+            raise ValueError("invalid media worker context")
+        return Path(context["input"]), Path(context["output"])
 
     def segment(
         self, source: str | Path, destination_dir: str | Path, duration_seconds: float
@@ -340,6 +371,7 @@ class MediaPack:
             "media.metadata": {"input"},
             "media.asr_merge": {"transcripts"},
             "media.overlap_remove": {"segments"},
+            "media.asr_normalize_flac": set(),
         }[operation]
         if set(params) != allowed:
             raise ValueError("invalid media operation parameters")
@@ -374,6 +406,9 @@ class MediaPack:
             return self.metadata(checked["input"])
         if operation == "media.asr_merge":
             return self.asr_merge(checked["transcripts"])
+        if operation == "media.asr_normalize_flac":
+            source, destination = self._worker_io_paths(context)
+            return self.asr_normalize_flac(source, destination)
         return self.overlap_remove(checked["segments"])
 
     def finalize(self, job: Any, canonical_attempts: Any, context: Any) -> Any:

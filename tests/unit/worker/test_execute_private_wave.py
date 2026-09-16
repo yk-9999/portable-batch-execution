@@ -1,6 +1,7 @@
 import json
 from datetime import UTC, datetime
 from hashlib import sha256
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -27,10 +28,13 @@ def _plane(
     operation="tabular.rolling",
     pack="tabular-batch",
     ml_payload=None,
+    binary_payload=None,
     input_ref_overrides=None,
     write_ref_overrides=None,
 ):
-    if pack == "ml-batch":
+    if pack == "media-batch":
+        payload = binary_payload if binary_payload is not None else b"\x00\x01private-audio"
+    elif pack == "ml-batch":
         document = ml_payload if ml_payload is not None else {
             "schema_version": "pbe.ml.char-wb-tfidf-logistic-score.v1",
             "model": {
@@ -75,7 +79,7 @@ def _plane(
         "provenance": {"producer": "test", "revision": "1", "created_at": now},
         "operation_params": (
             {}
-            if pack == "ml-batch"
+            if pack in {"ml-batch", "media-batch"}
             else {
                 "column": "value",
                 "window_size": 2,
@@ -454,6 +458,90 @@ def test_rejects_unapproved_ml_operation():
     with pytest.raises(ValueError, match="not available on the public runner"):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)
     assert plane.appended == []
+
+
+def test_media_asr_normalize_flac_success_writes_flac_bytes():
+    flac_bytes = b"fLaC\x00private-output"
+    plane = _plane(
+        pack="media-batch",
+        operation="media.asr_normalize_flac",
+        binary_payload=b"private-input-bytes",
+    )
+
+    def fake_execute(pack, job, shard, params, context):
+        Path(context["output"]).write_bytes(flac_bytes)
+        return Path(context["output"])
+
+    with patch(
+        "portable_batch_execution.worker.execute_wave.MediaPack.execute",
+        fake_execute,
+    ):
+        attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert len(attempts) == 1
+    record = attempts[0]
+    assert record.status == "succeeded"
+    assert record.counts == {
+        "input_bytes": len(b"private-input-bytes"),
+        "output_bytes": len(flac_bytes),
+    }
+    assert plane.last_written == flac_bytes
+    assert _SENTINEL not in json.dumps(record.model_dump(mode="json"))
+
+
+def test_media_pack_failure_records_sanitized_failure():
+    plane = _plane(pack="media-batch", operation="media.asr_normalize_flac")
+    with patch(
+        "portable_batch_execution.worker.execute_wave.MediaPack.execute",
+        side_effect=RuntimeError(_SENTINEL),
+    ), pytest.raises(PrivateWaveExecutionError) as error:
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    record = plane.appended[0]
+    assert record.failure == "shard_pack_execution_failed"
+    assert _SENTINEL not in json.dumps(record.model_dump(mode="json"))
+    assert _SENTINEL not in str(error.value)
+
+
+def test_media_successful_shard_is_skipped_on_rerun():
+    now = datetime.now(UTC)
+    prior = ShardAttemptRecord(
+        logical_run_id="opaque-run",
+        shard_id="opaque-shard",
+        attempt_id="prior-success",
+        status="succeeded",
+        input_digest="current",
+        execution_fingerprint="fixed",
+        started_at=now,
+        finished_at=now,
+        wave_id="opaque-wave",
+        output_refs=(
+            ArtifactRef(
+                object_id="output",
+                uri="pbe://private/output",
+                sha256="sha256:" + ("a" * 64),
+            ),
+        ),
+        output_digest="a" * 64,
+    )
+    plane = _plane(
+        pack="media-batch",
+        operation="media.asr_normalize_flac",
+        appended=[prior],
+    )
+    with patch(
+        "portable_batch_execution.worker.execute_wave.MediaPack.execute",
+        side_effect=RuntimeError(_SENTINEL),
+    ):
+        assert execute_private_wave("opaque-run", "opaque-wave", plane=plane) == ()
+    assert len(plane.appended) == 1
+
+
+def test_rejects_non_empty_media_operation_params():
+    plane = _plane(pack="media-batch", operation="media.asr_normalize_flac")
+    plane.resolve_wave("opaque-run", "opaque-wave")["job"]["operation_params"] = {
+        "codec": "mp3"
+    }
+    with pytest.raises(ValueError, match="closed operation parameters"):
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
 
 
 def test_output_reference_mismatch_records_sanitized_failure():

@@ -63,6 +63,7 @@ PACK_OPS = {
         "media.metadata",
         "media.asr_merge",
         "media.overlap_remove",
+        "media.asr_normalize_flac",
     },
 }
 

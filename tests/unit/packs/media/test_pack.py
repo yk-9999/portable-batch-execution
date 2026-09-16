@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -89,3 +90,70 @@ def test_params_are_closed() -> None:
         )
     with pytest.raises(ValueError, match="unsupported media operation"):
         pack.validate_params("media.other", {})
+
+
+def test_asr_normalize_flac_params_must_be_empty() -> None:
+    pack = MediaPack()
+    assert pack.validate_params("media.asr_normalize_flac", {}) == {}
+    with pytest.raises(ValueError, match="invalid media operation parameters"):
+        pack.validate_params("media.asr_normalize_flac", {"input": "a.bin"})
+
+
+def test_asr_normalize_flac_uses_fixed_ffmpeg_argv(tmp_path: Path) -> None:
+    source = tmp_path / "input.bin"
+    source.write_bytes(b"\x00")
+    destination = tmp_path / "output.flac"
+    pack = MediaPack(ffmpeg="ffmpeg-bin", ffprobe="ffprobe-bin")
+    captured: list[list[str]] = []
+
+    def fake_run(args: list[str]) -> None:
+        captured.append(args)
+        destination.write_bytes(b"flac")
+
+    with patch.object(pack, "_run", side_effect=fake_run):
+        pack.asr_normalize_flac(source, destination)
+
+    assert captured == [
+        [
+            "ffmpeg-bin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(source),
+            "-vn",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "flac",
+            "-compression_level",
+            "8",
+            str(destination),
+        ]
+    ]
+
+
+def test_asr_normalize_flac_execute_validates_worker_context(tmp_path: Path) -> None:
+    pack = MediaPack()
+    source = tmp_path / "input.bin"
+    source.write_bytes(b"\x00")
+    destination = tmp_path / "output.flac"
+    with patch.object(pack, "asr_normalize_flac", return_value=destination) as called:
+        pack.execute(
+            {"operation": "media.asr_normalize_flac"},
+            None,
+            {},
+            {"input": str(source), "output": str(destination)},
+        )
+    called.assert_called_once_with(source, destination)
+    with pytest.raises(ValueError, match="invalid media worker context"):
+        pack.execute(
+            {"operation": "media.asr_normalize_flac"},
+            None,
+            {},
+            {"input": str(source)},
+        )
