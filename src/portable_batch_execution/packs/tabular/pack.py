@@ -260,15 +260,23 @@ class TabularPack:
             event_time = _time(row["event_time"], "event_time").isoformat()
             if not isinstance(row["text"], str):
                 raise TypeError("text must be a string")
-            text = unicodedata.normalize(params.unicode_normalization, row["text"])
+            normalized = unicodedata.normalize(params.unicode_normalization, row["text"])
+            normalized_non_whitespace_length = sum(
+                not character.isspace() for character in normalized
+            )
+            text = normalized
             if params.lowercase:
                 text = text.lower()
-            if params.collapse_whitespace:
+            if params.whitespace_mode == "collapse":
                 text = " ".join(text.split())
+            elif params.whitespace_mode == "remove":
+                text = "".join(character for character in text if not character.isspace())
             base = {"row_id": row_id, "partition_key": partition_key, "segment_key": segment_key,
                     "event_time": event_time, "entity_id": entity_id}
-            contributions = [("message_presence", "present", int(bool(text))),
-                             ("normalized_non_whitespace_length", "value", sum(not char.isspace() for char in text))]
+            contributions = [
+                ("message_presence", "present", 1),
+                ("normalized_non_whitespace_length", "value", normalized_non_whitespace_length),
+            ]
             for ngram_size in sorted(params.ngram_sizes):
                 occurrences: dict[str, int] = {}
                 for index in range(max(0, len(text) - ngram_size + 1)):

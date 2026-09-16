@@ -97,7 +97,7 @@ class TextEventFeaturesParams(TabularParams):
 
     unicode_normalization: Literal["NFC", "NFD", "NFKC", "NFKD"] = "NFC"
     lowercase: bool = False
-    collapse_whitespace: bool = True
+    whitespace_mode: Literal["preserve", "collapse", "remove"] = "collapse"
     ngram_sizes: tuple[Literal[1, 2, 3, 4, 5], ...] = Field(min_length=1)
     max_input_rows: int = Field(default=100_000, ge=1, le=1_000_000)
     max_input_bytes: int = Field(default=64 * 1024 * 1024, ge=1, le=512 * 1024 * 1024)

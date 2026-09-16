@@ -44,11 +44,69 @@ def test_text_event_features_normalizes_unicode_and_counts_overlapping_ngrams():
     assert next(row for row in rows if row["row_id"] == "z" and row["feature_kind"] == "normalized_non_whitespace_length")["weight"] == 2
 
 
-def test_text_event_features_empty_whitespace_caps_and_invalid_parameters():
+def test_text_event_features_empty_and_unicode_whitespace_messages_are_present_without_grams():
     pack = TabularPack()
-    empty = pack.run("tabular.text_event_features.v1", [_text_row(text=" \t\n ")], {"ngram_sizes": [1]})
-    assert empty.filter(empty["feature_kind"] == "message_presence")["weight"].item() == 0
+    empty = pack.run("tabular.text_event_features.v1", [_text_row(text="")], {"ngram_sizes": [2]})
+    assert empty.filter(empty["feature_kind"] == "message_presence")["weight"].item() == 1
     assert empty.filter(empty["feature_kind"] == "normalized_non_whitespace_length")["weight"].item() == 0
+    whitespace = pack.run(
+        "tabular.text_event_features.v1",
+        [_text_row(text="\u00a0\t\u2003\n")],
+        {"ngram_sizes": [2], "whitespace_mode": "remove"},
+    )
+    assert whitespace.filter(whitespace["feature_kind"] == "message_presence")["weight"].item() == 1
+    assert whitespace.filter(whitespace["feature_kind"] == "normalized_non_whitespace_length")["weight"].item() == 0
+    assert whitespace.filter(whitespace["feature_kind"] == "character_ngram").is_empty()
+
+
+def test_text_event_features_normalizes_before_length_and_applies_whitespace_mode():
+    pack = TabularPack()
+    compatibility = pack.run(
+        "tabular.text_event_features.v1",
+        [_text_row(text="ＡＢ")],
+        {"unicode_normalization": "NFKC", "ngram_sizes": [2], "whitespace_mode": "preserve"},
+    )
+    assert next(row for row in compatibility.to_dicts() if row["feature_kind"] == "character_ngram")["feature_key"] == "AB"
+    dotted_i = pack.run(
+        "tabular.text_event_features.v1",
+        [_text_row(text="\u0130")],
+        {"lowercase": True, "ngram_sizes": [2]},
+    )
+    assert next(row for row in dotted_i.to_dicts() if row["feature_kind"] == "normalized_non_whitespace_length")["weight"] == 1
+    text = "a\u00a0b\tc\u2003d\ne"
+    removed = pack.run("tabular.text_event_features.v1", [_text_row(text=text)], {"ngram_sizes": [2], "whitespace_mode": "remove"})
+    assert {row["feature_key"] for row in removed.to_dicts() if row["feature_kind"] == "character_ngram"} == {"ab", "bc", "cd", "de"}
+    modes = {
+        mode: TabularPack().run(
+            "tabular.text_event_features.v1",
+            [_text_row(text="a\t \u2003b")],
+            {"ngram_sizes": [2], "whitespace_mode": mode},
+        )
+        for mode in ("preserve", "collapse", "remove")
+    }
+    assert {row["feature_key"] for row in modes["preserve"].to_dicts() if row["feature_kind"] == "character_ngram"} == {"a\t", "\t ", " \u2003", "\u2003b"}
+    assert {row["feature_key"] for row in modes["collapse"].to_dicts() if row["feature_kind"] == "character_ngram"} == {"a ", " b"}
+    assert {row["feature_key"] for row in modes["remove"].to_dicts() if row["feature_kind"] == "character_ngram"} == {"ab"}
+
+
+def test_text_event_features_ngrams_overlap_per_message_without_cross_message_grams():
+    result = TabularPack().run(
+        "tabular.text_event_features.v1",
+        [_text_row(row_id="first", text="aaaa"), _text_row(row_id="second", text="bbbb")],
+        {"ngram_sizes": [2, 3, 4]},
+    )
+    rows = result.to_dicts()
+    grams_by_row = {
+        row_id: {(row["feature_key"], row["weight"]) for row in rows if row["row_id"] == row_id and row["feature_kind"] == "character_ngram"}
+        for row_id in ("first", "second")
+    }
+    assert grams_by_row["first"] == {("aa", 3), ("aaa", 2), ("aaaa", 1)}
+    assert grams_by_row["second"] == {("bb", 3), ("bbb", 2), ("bbbb", 1)}
+    assert not {row["feature_key"] for row in rows if row["feature_kind"] == "character_ngram"} & {"ab", "aab", "aaab"}
+
+
+def test_text_event_features_caps_and_parameter_validation():
+    pack = TabularPack()
     with pytest.raises(ValueError, match="row cap"):
         pack.run("tabular.text_event_features.v1", [_text_row(), _text_row(row_id="two")], {"ngram_sizes": [1], "max_input_rows": 1})
     with pytest.raises(ValueError, match="output row cap"):
@@ -61,6 +119,14 @@ def test_text_event_features_empty_whitespace_caps_and_invalid_parameters():
         pack.validate_params("tabular.text_event_features.v1", {"ngram_sizes": [6]})
     with pytest.raises(ValidationError):
         pack.validate_params("tabular.text_event_features.v1", {"ngram_sizes": [1], "script": "x"})
+    for whitespace_mode in ("preserve", "collapse", "remove"):
+        assert pack.validate_params(
+            "tabular.text_event_features.v1", {"ngram_sizes": [1], "whitespace_mode": whitespace_mode}
+        )["whitespace_mode"] == whitespace_mode
+    with pytest.raises(ValidationError):
+        pack.validate_params("tabular.text_event_features.v1", {"ngram_sizes": [1], "whitespace_mode": "trim"})
+    with pytest.raises(ValidationError):
+        pack.validate_params("tabular.text_event_features.v1", {"ngram_sizes": [1], "collapse_whitespace": True})
 
 
 def test_trailing_sparse_window_aggregate_is_exact_and_isolated():
