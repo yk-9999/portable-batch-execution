@@ -32,6 +32,10 @@ from .protocol import BrokerExecuteRequest, BrokerExecuteResponse, parse_request
 from .state import BrokerRequestState, BrokerRequestStore, RequestBinding
 
 _TERMINAL_FAILURE_STATUSES = frozenset({"failed", "cancelled"})
+_ALLOWED_BROKER_PACKS = frozenset(
+    {"tabular-batch", "ml-batch", "media-batch", "replay-eval-batch"}
+)
+_BROKER_REPLAY_EVAL_OPERATION = "replay_eval.external_api_evaluation"
 
 
 class UnixBrokerService:
@@ -62,9 +66,12 @@ class UnixBrokerService:
                 status="failed",
                 error_code="request_invalid",
             )
-        if request.pack not in {"tabular-batch", "ml-batch", "media-batch"}:
+        if request.pack not in _ALLOWED_BROKER_PACKS:
             return self._failed(request.request_id, "operation_not_allowed")
-        if request.operation not in PACK_OPS[request.pack]:
+        if request.pack == "replay-eval-batch":
+            if request.operation != _BROKER_REPLAY_EVAL_OPERATION:
+                return self._failed(request.request_id, "operation_not_allowed")
+        elif request.operation not in PACK_OPS[request.pack]:
             return self._failed(request.request_id, "operation_not_allowed")
         if not self.config.authorize(peer_uid, request.pack, request.operation):
             return self._failed(request.request_id, "peer_not_authorized")

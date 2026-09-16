@@ -22,8 +22,13 @@ from portable_batch_execution.controller.closed_wave_registry import ClosedWaveR
 from portable_batch_execution.data_plane.base import RevisionConflictError
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
 from portable_batch_execution.packs import MLPack, TabularPack
+from portable_batch_execution.worker.external_api_evaluation import (
+    validate_closed_operation_params,
+)
 
 _BINDING_CONFLICT = "request_binding_conflict"
+
+_BROKER_REPLAY_EVAL_OPERATION = "replay_eval.external_api_evaluation"
 
 _CLOSED_ML_BATCH_OPERATIONS = frozenset(
     {
@@ -47,6 +52,11 @@ def canonical_operation_params(pack: str, operation: str, params: dict[str, Any]
         if params:
             raise ValueError("closed operation parameters")
         return {}
+    if pack == "replay-eval-batch":
+        if operation != _BROKER_REPLAY_EVAL_OPERATION:
+            raise ValueError("unsupported broker operation")
+        validate_closed_operation_params(params)
+        return {"provider": "nvidia-openai-compatible"}
     raise ValueError("unsupported broker pack")
 
 
@@ -242,6 +252,7 @@ def register_broker_private_run(
         return job, wave, shard, manifest
     input_ref = plane.write(input_bytes, input_media_type)
     now = datetime.now(UTC)
+    security_profile = "external-api" if pack == "replay-eval-batch" else "offline"
     job = JobSpec(
         job_id=job_id,
         logical_run_id=run_id,
@@ -254,7 +265,7 @@ def register_broker_private_run(
             max_attempts_per_shard=4,
             resume_enabled=True,
         ),
-        security_profile="offline",
+        security_profile=security_profile,
         provenance=Provenance(
             producer="a1-unix-broker",
             revision="v1",

@@ -18,10 +18,33 @@ CLOSED_OPERATION_PARAM_KEYS: Final = frozenset({"provider"})
 
 FORBIDDEN_OPERATION_PARAM_KEYS: Final = frozenset(
     {
-        "url", "uri", "endpoint", "host", "path", "scheme", "headers", "header",
-        "authorization", "token", "secret", "api_key", "method", "code", "callback",
-        "shell", "command", "cmd", "python", "python_code", "script", "import_path",
-        "entrypoint", "executable", "callable", "function", "handler",
+        "url",
+        "uri",
+        "endpoint",
+        "host",
+        "path",
+        "scheme",
+        "headers",
+        "header",
+        "authorization",
+        "token",
+        "secret",
+        "api_key",
+        "method",
+        "code",
+        "callback",
+        "shell",
+        "command",
+        "cmd",
+        "python",
+        "python_code",
+        "script",
+        "import_path",
+        "entrypoint",
+        "executable",
+        "callable",
+        "function",
+        "handler",
     }
 )
 
@@ -41,7 +64,8 @@ def validate_closed_operation_params(params: object) -> None:
     keys = frozenset(params)
     if keys != CLOSED_OPERATION_PARAM_KEYS:
         raise ValueError("closed operation parameters")
-    if FORBIDDEN_OPERATION_PARAM_KEYS.intersection(keys):
+    forbidden = FORBIDDEN_OPERATION_PARAM_KEYS.intersection(keys)
+    if forbidden:
         raise ValueError("closed operation parameters")
     if params.get("provider") != CLOSED_PROVIDER_VALUE:
         raise ValueError("closed operation parameters")
