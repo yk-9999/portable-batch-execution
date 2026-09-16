@@ -40,13 +40,13 @@ _PRIVATE_TABULAR_SINGLE_INPUT_OPS = frozenset(
         "tabular.statistics",
     }
 )
-_PRIVATE_TABULAR_MULTI_INPUT_OPS = frozenset(
+_PRIVATE_TABULAR_TWO_TABLE_OPS = frozenset(
     {
         "tabular.join",
         "tabular.pit_join",
-        "tabular.format_migration",
     }
 )
+_PRIVATE_TABULAR_UNAVAILABLE_MULTI_INPUT_OPS = frozenset({"tabular.format_migration"})
 _PRIVATE_ML_SINGLE_INPUT_OPS = frozenset(
     {
         "ml.char_wb_tfidf_logistic_score",
@@ -102,6 +102,24 @@ def _private_attempt_id(
     )
     ordinal = current_attempt_count + 1
     return f"{wave_id}-{shard_id}-{generation}-{ordinal}"
+
+
+def _parse_private_tabular_two_table_envelope(
+    parsed_input: object,
+) -> tuple[list[dict], list[dict]]:
+    if not isinstance(parsed_input, dict):
+        raise TypeError("tabular two-table input must be an object")
+    if frozenset(parsed_input) != frozenset({"left", "right"}):
+        raise TypeError("tabular two-table input must contain only left and right")
+    left = parsed_input["left"]
+    right = parsed_input["right"]
+    if not isinstance(left, list) or not isinstance(right, list):
+        raise TypeError("left and right must be record arrays")
+    if not all(isinstance(row, dict) for row in left) or not all(
+        isinstance(row, dict) for row in right
+    ):
+        raise TypeError("left and right must be arrays of objects")
+    return left, right
 
 
 def _artifact_ref_matches_bytes(data: bytes, ref: ArtifactRef) -> bool:
@@ -237,9 +255,12 @@ def execute_private_wave(
     if tuple(shard.shard_id for shard in shards) != wave.shard_ids or any(shard.logical_run_id != run_id for shard in shards):
         raise ValueError("private data plane returned mismatched shards")
     if job.pack == "tabular-batch":
-        if job.operation in _PRIVATE_TABULAR_MULTI_INPUT_OPS:
+        if job.operation in _PRIVATE_TABULAR_UNAVAILABLE_MULTI_INPUT_OPS:
             raise ValueError("private wave operation requires a typed multi-input contract")
-        if job.operation not in _PRIVATE_TABULAR_SINGLE_INPUT_OPS:
+        if (
+            job.operation not in _PRIVATE_TABULAR_SINGLE_INPUT_OPS
+            and job.operation not in _PRIVATE_TABULAR_TWO_TABLE_OPS
+        ):
             raise ValueError("private wave operation is not available on the public runner")
         private_pack = "tabular-batch"
     elif job.pack == "ml-batch":
@@ -330,22 +351,44 @@ def execute_private_wave(
                     ) from None
                 output_media_type = "application/json"
                 if private_pack == "tabular-batch":
-                    if not isinstance(parsed_input, list):
-                        raise _ShardStageFailure(
-                            _execution_failure_code(TypeError(), stage="input_parse")
-                        )
-                    try:
-                        result = pack.execute(
-                            job, shard, job.operation_params, {"data": parsed_input}
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        raise _ShardStageFailure(
-                            _execution_failure_code(exc, stage="pack")
-                        ) from None
+                    if job.operation in _PRIVATE_TABULAR_TWO_TABLE_OPS:
+                        try:
+                            left, right = _parse_private_tabular_two_table_envelope(
+                                parsed_input
+                            )
+                        except TypeError as exc:
+                            raise _ShardStageFailure(
+                                _execution_failure_code(exc, stage="input_parse")
+                            ) from None
+                        try:
+                            result = pack.execute(
+                                job,
+                                shard,
+                                job.operation_params,
+                                {"data": left, "right": right},
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            raise _ShardStageFailure(
+                                _execution_failure_code(exc, stage="pack")
+                            ) from None
+                        input_rows = len(left) + len(right)
+                    else:
+                        if not isinstance(parsed_input, list):
+                            raise _ShardStageFailure(
+                                _execution_failure_code(TypeError(), stage="input_parse")
+                            )
+                        try:
+                            result = pack.execute(
+                                job, shard, job.operation_params, {"data": parsed_input}
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            raise _ShardStageFailure(
+                                _execution_failure_code(exc, stage="pack")
+                            ) from None
+                        input_rows = len(parsed_input)
                     output = json.dumps(result.to_dicts(), sort_keys=True).encode(
                         "utf-8"
                     )
-                    input_rows = len(parsed_input)
                     output_rows = result.height
                 else:
                     if not isinstance(parsed_input, dict):

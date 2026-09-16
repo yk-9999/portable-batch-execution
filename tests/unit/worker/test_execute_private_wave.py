@@ -29,6 +29,8 @@ def _plane(
     pack="tabular-batch",
     ml_payload=None,
     binary_payload=None,
+    tabular_payload=None,
+    operation_params=None,
     input_ref_overrides=None,
     write_ref_overrides=None,
 ):
@@ -45,8 +47,12 @@ def _plane(
         }
         payload = json.dumps(document).encode()
     else:
-        rows = rows if rows is not None else [{"group": "a", "value": 1}]
-        payload = json.dumps(rows).encode()
+        if tabular_payload is not None:
+            document = tabular_payload
+        else:
+            rows = rows if rows is not None else [{"group": "a", "value": 1}]
+            document = rows
+        payload = json.dumps(document).encode()
     input_ref_fields = {
         "object_id": "input",
         "uri": "pbe://private/input",
@@ -78,13 +84,17 @@ def _plane(
         "security_profile": "offline",
         "provenance": {"producer": "test", "revision": "1", "created_at": now},
         "operation_params": (
-            {}
-            if pack in {"ml-batch", "media-batch"}
-            else {
-                "column": "value",
-                "window_size": 2,
-                "output_column": "rolling",
-            }
+            operation_params
+            if operation_params is not None
+            else (
+                {}
+                if pack in {"ml-batch", "media-batch"}
+                else {
+                    "column": "value",
+                    "window_size": 2,
+                    "output_column": "rolling",
+                }
+            )
         ),
     }
     wave = {
@@ -296,15 +306,95 @@ def test_successful_shards_continue_when_another_shard_fails():
     assert _SENTINEL not in str(error.value)
 
 
-@pytest.mark.parametrize(
-    "operation",
-    ("tabular.join", "tabular.pit_join", "tabular.format_migration"),
-)
-def test_rejects_multi_input_tabular_operations(operation):
-    plane = _plane(operation=operation)
+def test_rejects_format_migration_on_private_runner():
+    plane = _plane(operation="tabular.format_migration")
     with pytest.raises(ValueError, match="typed multi-input contract"):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)
     assert plane.appended == []
+
+
+def test_tabular_join_success_records_row_counts():
+    left = [{"id": "a", "v": 1}, {"id": "b", "v": 2}]
+    right = [{"id": "a", "label": "A"}, {"id": "c", "label": "C"}]
+    plane = _plane(
+        operation="tabular.join",
+        tabular_payload={"left": left, "right": right},
+        operation_params={"on": ["id"], "how": "left"},
+    )
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert len(attempts) == 1
+    record = attempts[0]
+    assert record.status == "succeeded"
+    assert record.counts == {"input_rows": 4, "output_rows": 2}
+    output = json.loads(plane.last_written.decode())
+    assert {row["id"] for row in output} == {"a", "b"}
+    assert next(row for row in output if row["id"] == "a")["label"] == "A"
+
+
+def test_tabular_pit_join_success_includes_exact_boundary_match():
+    left = [
+        {"id": "a", "at": 10, "v": 1},
+        {"id": "a", "at": 20, "v": 2},
+        {"id": "b", "at": 10, "v": 3},
+    ]
+    right = [
+        {"id": "a", "seen": 10, "label": "exact"},
+        {"id": "a", "seen": 15, "label": "past"},
+        {"id": "b", "seen": 9, "label": "early"},
+    ]
+    plane = _plane(
+        operation="tabular.pit_join",
+        tabular_payload={"left": left, "right": right},
+        operation_params={
+            "on": ["id"],
+            "left_time": "at",
+            "right_time": "seen",
+        },
+    )
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert attempts[0].status == "succeeded"
+    assert attempts[0].counts == {"input_rows": 6, "output_rows": 3}
+    output = json.loads(plane.last_written.decode())
+    exact = next(row for row in output if row["id"] == "a" and row["at"] == 10)
+    assert exact["label"] == "exact"
+
+
+@pytest.mark.parametrize(
+    "tabular_payload",
+    (
+        [{"id": "a"}],
+        {"left": [{"id": "a"}], "right": "bad"},
+        {"left": [{"id": "a"}], "right": [{"id": "b"}], "extra": True},
+        {"left": "bad", "right": [{"id": "b"}]},
+    ),
+)
+def test_tabular_two_table_invalid_envelope_records_failed_attempt(
+    tabular_payload,
+):
+    plane = _plane(
+        operation="tabular.join",
+        tabular_payload=tabular_payload,
+        operation_params={"on": ["id"], "how": "left"},
+    )
+    with pytest.raises(PrivateWaveExecutionError):
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    record = plane.appended[0]
+    assert record.status == "failed"
+    assert record.failure == "input_artifact_invalid"
+
+
+def test_tabular_join_invalid_envelope_does_not_consume_success_skip():
+    left = [{"id": "a", "v": 1}]
+    right = [{"id": "a", "label": "A"}]
+    valid_payload = {"left": left, "right": right}
+    plane = _plane(
+        operation="tabular.join",
+        tabular_payload=valid_payload,
+        operation_params={"on": ["id"], "how": "left"},
+    )
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert attempts[0].status == "succeeded"
+    assert execute_private_wave("opaque-run", "opaque-wave", plane=plane) == ()
 
 
 def test_input_digest_mismatch_records_sanitized_failure():
