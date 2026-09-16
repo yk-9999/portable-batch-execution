@@ -381,6 +381,28 @@ def test_ml_cosine_similarity_matrix_success_records_counts():
     assert len(output["scores"][0]) == 2
 
 
+def test_ml_cosine_similarity_matrix_serializes_null_for_zero_norm_pairs():
+    plane = _plane(
+        pack="ml-batch",
+        operation="ml.cosine_similarity_matrix",
+        ml_payload={
+            "left": [
+                {"row_id": "a", "vector": [1.0, 0.0]},
+                {"row_id": "z", "vector": [0.0, 0.0]},
+            ],
+            "right": [
+                {"row_id": "x", "vector": [0.0, 1.0]},
+                {"row_id": "y", "vector": [0.0, 0.0]},
+            ],
+        },
+    )
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert attempts[0].status == "succeeded"
+    output = json.loads(plane.last_written.decode())
+    assert output["scores"][0] == [0.0, None]
+    assert output["scores"][1] == [None, None]
+
+
 def test_ml_cosine_malformed_contract_records_sanitized_failure():
     plane = _plane(
         pack="ml-batch",

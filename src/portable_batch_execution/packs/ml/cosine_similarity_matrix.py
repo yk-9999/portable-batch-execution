@@ -69,17 +69,30 @@ def validate_cosine_similarity_matrix_input(payload: Any) -> dict[str, Any]:
     return {"left_ids": left_ids, "right_ids": right_ids, "left": left, "right": right}
 
 
+def _vector_norms(vectors: np.ndarray) -> np.ndarray:
+    return np.linalg.norm(vectors, axis=1)
+
+
 def execute_cosine_similarity_matrix(payload: Any) -> dict[str, Any]:
     validated = validate_cosine_similarity_matrix_input(payload)
-    matrix = cosine_similarity(validated["left"], validated["right"])
-    scores = [
-        [float(value) for value in row]
-        for row in matrix.tolist()
-    ]
-    for row in scores:
-        for value in row:
-            if not math.isfinite(value):
+    left = validated["left"]
+    right = validated["right"]
+    matrix = cosine_similarity(left, right)
+    left_norms = _vector_norms(left)
+    right_norms = _vector_norms(right)
+    scores: list[list[float | None]] = []
+    for row_index, row in enumerate(matrix.tolist()):
+        score_row: list[float | None] = []
+        left_zero = left_norms[row_index] <= 0
+        for column_index, value in enumerate(row):
+            if left_zero or right_norms[column_index] <= 0:
+                score_row.append(None)
+                continue
+            score = float(value)
+            if not math.isfinite(score):
                 raise ValueError("similarity score is not finite")
+            score_row.append(score)
+        scores.append(score_row)
     return {
         "left_ids": validated["left_ids"],
         "right_ids": validated["right_ids"],
