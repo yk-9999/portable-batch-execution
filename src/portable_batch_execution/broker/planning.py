@@ -24,11 +24,22 @@ from portable_batch_execution.packs import MLPack, TabularPack
 
 _BINDING_CONFLICT = "request_binding_conflict"
 
+_CLOSED_ML_BATCH_OPERATIONS = frozenset(
+    {
+        "ml.char_wb_tfidf_logistic_score",
+        "ml.cosine_similarity_matrix",
+    }
+)
+
 
 def canonical_operation_params(pack: str, operation: str, params: dict[str, Any]) -> dict[str, Any]:
     if pack == "tabular-batch":
         return TabularPack().validate_params(operation, params)
     if pack == "ml-batch":
+        if operation in _CLOSED_ML_BATCH_OPERATIONS:
+            if params:
+                raise ValueError("closed operation parameters")
+            return {}
         return MLPack().validate_params(operation, params)
     if pack == "media-batch":
         if params:
