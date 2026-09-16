@@ -41,6 +41,7 @@ _PRIVATE_TABULAR_SINGLE_INPUT_OPS = frozenset(
         "tabular.window",
         "tabular.rolling",
         "tabular.statistics",
+        "tabular.text_event_features.v1",
     }
 )
 _PRIVATE_TABULAR_TWO_TABLE_OPS = frozenset(
@@ -48,6 +49,9 @@ _PRIVATE_TABULAR_TWO_TABLE_OPS = frozenset(
         "tabular.join",
         "tabular.pit_join",
     }
+)
+_PRIVATE_TABULAR_FEATURE_REQUEST_OPS = frozenset(
+    {"tabular.trailing_sparse_window_aggregate.v1"}
 )
 _PRIVATE_TABULAR_UNAVAILABLE_MULTI_INPUT_OPS = frozenset({"tabular.format_migration"})
 _PRIVATE_ML_SINGLE_INPUT_OPS = frozenset(
@@ -124,6 +128,16 @@ def _parse_private_tabular_two_table_envelope(
     ):
         raise TypeError("left and right must be arrays of objects")
     return left, right
+
+
+def _parse_private_tabular_feature_request_envelope(
+    parsed_input: object,
+) -> dict[str, list[dict]]:
+    if not isinstance(parsed_input, dict) or frozenset(parsed_input) != frozenset({"features", "requests"}):
+        raise TypeError("feature request input must contain only features and requests")
+    if not all(isinstance(parsed_input[key], list) and all(isinstance(row, dict) for row in parsed_input[key]) for key in ("features", "requests")):
+        raise TypeError("features and requests must be arrays of objects")
+    return parsed_input
 
 
 def _artifact_ref_matches_bytes(data: bytes, ref: ArtifactRef) -> bool:
@@ -276,6 +290,7 @@ def execute_private_wave(
         if (
             job.operation not in _PRIVATE_TABULAR_SINGLE_INPUT_OPS
             and job.operation not in _PRIVATE_TABULAR_TWO_TABLE_OPS
+            and job.operation not in _PRIVATE_TABULAR_FEATURE_REQUEST_OPS
         ):
             raise ValueError("private wave operation is not available on the public runner")
         private_pack = "tabular-batch"
@@ -407,7 +422,14 @@ def execute_private_wave(
                     ) from None
                 output_media_type = "application/json"
                 if private_pack == "tabular-batch":
-                    if job.operation in _PRIVATE_TABULAR_TWO_TABLE_OPS:
+                    if job.operation in _PRIVATE_TABULAR_FEATURE_REQUEST_OPS:
+                        try:
+                            feature_request_input = _parse_private_tabular_feature_request_envelope(parsed_input)
+                            result = pack.execute(job, shard, job.operation_params, {"data": feature_request_input})
+                        except Exception as exc:  # noqa: BLE001
+                            raise _ShardStageFailure(_execution_failure_code(exc, stage="pack")) from None
+                        input_rows = len(feature_request_input["features"]) + len(feature_request_input["requests"])
+                    elif job.operation in _PRIVATE_TABULAR_TWO_TABLE_OPS:
                         try:
                             left, right = _parse_private_tabular_two_table_envelope(
                                 parsed_input

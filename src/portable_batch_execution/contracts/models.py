@@ -17,6 +17,8 @@ PACK_OPS = {
         "tabular.rolling",
         "tabular.statistics",
         "tabular.format_migration",
+        "tabular.text_event_features.v1",
+        "tabular.trailing_sparse_window_aggregate.v1",
     },
     "acquisition-batch": {
         "acquisition.rest",

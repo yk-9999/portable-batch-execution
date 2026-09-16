@@ -92,10 +92,40 @@ class FormatMigrationParams(TabularParams):
     output_format: Literal["csv", "json", "jsonl", "parquet"]
 
 
+class TextEventFeaturesParams(TabularParams):
+    """Bounded, deterministic parameters for character feature expansion."""
+
+    unicode_normalization: Literal["NFC", "NFD", "NFKC", "NFKD"] = "NFC"
+    lowercase: bool = False
+    collapse_whitespace: bool = True
+    ngram_sizes: tuple[Literal[1, 2, 3, 4, 5], ...] = Field(min_length=1)
+    max_input_rows: int = Field(default=100_000, ge=1, le=1_000_000)
+    max_input_bytes: int = Field(default=64 * 1024 * 1024, ge=1, le=512 * 1024 * 1024)
+    max_unique_keys: int = Field(default=100_000, ge=1, le=1_000_000)
+    max_output_rows: int = Field(default=1_000_000, ge=1, le=10_000_000)
+
+    @model_validator(mode="after")
+    def unique_ngram_sizes(self):
+        if len(set(self.ngram_sizes)) != len(self.ngram_sizes):
+            raise ValueError("ngram_sizes must be unique")
+        return self
+
+
+class TrailingSparseWindowAggregateParams(TabularParams):
+    """Bounded parameters for exact trailing contribution aggregation."""
+
+    max_window_seconds: int = Field(default=604_800, ge=1, le=31_536_000)
+    max_input_rows: int = Field(default=500_000, ge=1, le=2_000_000)
+    max_input_bytes: int = Field(default=128 * 1024 * 1024, ge=1, le=512 * 1024 * 1024)
+    max_unique_keys: int = Field(default=250_000, ge=1, le=2_000_000)
+    max_output_rows: int = Field(default=1_000_000, ge=1, le=10_000_000)
+
+
 OperationParams = (
     NormalizeParams | CastParams | SortParams | DedupParams | JoinParams |
     PitJoinParams | WindowParams | RollingParams | StatisticsParams |
-    FormatMigrationParams
+    FormatMigrationParams | TextEventFeaturesParams |
+    TrailingSparseWindowAggregateParams
 )
 
 PARAM_MODELS = {
@@ -109,4 +139,6 @@ PARAM_MODELS = {
     "tabular.rolling": RollingParams,
     "tabular.statistics": StatisticsParams,
     "tabular.format_migration": FormatMigrationParams,
+    "tabular.text_event_features.v1": TextEventFeaturesParams,
+    "tabular.trailing_sparse_window_aggregate.v1": TrailingSparseWindowAggregateParams,
 }

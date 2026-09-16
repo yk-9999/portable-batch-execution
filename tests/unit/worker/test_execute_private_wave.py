@@ -359,6 +359,25 @@ def test_tabular_pit_join_success_includes_exact_boundary_match():
     assert exact["label"] == "exact"
 
 
+def test_tabular_trailing_sparse_window_aggregate_is_available_to_closed_worker():
+    envelope = {
+        "features": [
+            {"row_id": "r", "partition_key": "p", "segment_key": "s", "event_time": "2026-01-01T00:00:01+00:00", "entity_id": "e", "feature_kind": "k", "feature_key": "x", "weight": 2}
+        ],
+        "requests": [
+            {"request_id": "q", "partition_key": "p", "segment_key": "s", "endpoint_time": "2026-01-01T00:00:02+00:00", "window_seconds": 2, "window_valid": True}
+        ],
+    }
+    plane = _plane(
+        operation="tabular.trailing_sparse_window_aggregate.v1",
+        tabular_payload=envelope,
+        operation_params={},
+    )
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert attempts[0].counts == {"input_rows": 2, "output_rows": 1}
+    assert json.loads(plane.last_written.decode())[0]["sum_weight"] == 2
+
+
 @pytest.mark.parametrize(
     "tabular_payload",
     (

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import unicodedata
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +17,8 @@ from .models import (
     RollingParams,
     SortKey,
     StatisticsParams,
+    TextEventFeaturesParams,
+    TrailingSparseWindowAggregateParams,
     WindowParams,
 )
 
@@ -75,6 +80,54 @@ def _read(value: Any) -> pl.DataFrame:
     raise ValueError("supported tabular formats are CSV, JSON, JSONL, and Parquet")
 
 
+def _bounded_json_bytes(value: object, maximum: int) -> int:
+    try:
+        size = len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("input must be JSON-compatible") from exc
+    if size > maximum:
+        raise ValueError("input byte cap exceeded")
+    return size
+
+
+def _records(value: Any, required: frozenset[str], name: str, maximum: int) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > maximum:
+        raise ValueError(f"{name} row cap exceeded")
+    if not all(isinstance(row, dict) and frozenset(row) == required for row in value):
+        raise ValueError(f"{name} rows must have exactly the required fields")
+    return value
+
+
+def _time(value: object, name: str) -> datetime:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be an ISO 8601 string")
+    try:
+        result = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an ISO 8601 string") from exc
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return result
+
+
+def _opaque_string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} must be a non-empty opaque string")
+    return value
+
+
+def _halo_seconds(shard) -> int | None:
+    if getattr(shard, "primary_range", None) is None:
+        return None
+    primary_range = shard.primary_range
+    if primary_range.kind != "time":
+        raise ValueError("trailing window shards require time primary ranges")
+    halo = shard.correctness.halo_before
+    if halo is None or halo.unit == "records":
+        raise ValueError("trailing window shard is missing a time halo")
+    return halo.value * {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}[halo.unit]
+
+
 def _write(df: pl.DataFrame, destination: str | Path, output_format: str) -> Path:
     path = Path(destination)
     if output_format == "csv": df.write_csv(path)
@@ -101,6 +154,10 @@ class TabularPack:
         if operation not in PARAM_MODELS:
             raise ValueError(f"unsupported tabular operation: {operation}")
         model = _validated(PARAM_MODELS[operation], params)
+        if operation == "tabular.text_event_features.v1":
+            return self._text_event_features(data, model)
+        if operation == "tabular.trailing_sparse_window_aggregate.v1":
+            return self._trailing_sparse_window_aggregate(data, model)
         df = _read(data)
         if operation == "tabular.normalize":
             result = self._normalize(df, model)
@@ -130,6 +187,12 @@ class TabularPack:
     def execute(self, job, shard, params, context):
         """DomainPack entry point; context supplies ``data``, optional ``right`` and destination."""
         operation = getattr(job, "operation", None) or context["operation"]
+        if operation == "tabular.trailing_sparse_window_aggregate.v1":
+            return self._trailing_sparse_window_aggregate(
+                context["data"],
+                _validated(TrailingSparseWindowAggregateParams, params),
+                shard=shard,
+            )
         return self.run(operation, context["data"], params, right=context.get("right"), destination=context.get("destination"))
 
     def finalize(self, job, canonical_attempts, context):
@@ -181,3 +244,115 @@ class TabularPack:
                 fn = getattr(pl.col(column), aggregation)
                 expressions.append(fn().alias(f"{column}_{aggregation}"))
         return df.group_by(list(params.group_by)).agg(expressions) if params.group_by else df.select(expressions)
+
+    @staticmethod
+    def _text_event_features(data: Any, params: TextEventFeaturesParams) -> pl.DataFrame:
+        required = frozenset({"row_id", "partition_key", "segment_key", "event_time", "entity_id", "text"})
+        rows = _records(data, required, "text event", params.max_input_rows)
+        _bounded_json_bytes(rows, params.max_input_bytes)
+        output: list[dict[str, Any]] = []
+        unique_keys: set[tuple[str, str]] = set()
+        for row in rows:
+            row_id = _opaque_string(row["row_id"], "row_id")
+            partition_key = _opaque_string(row["partition_key"], "partition_key")
+            segment_key = _opaque_string(row["segment_key"], "segment_key")
+            entity_id = _opaque_string(row["entity_id"], "entity_id")
+            event_time = _time(row["event_time"], "event_time").isoformat()
+            if not isinstance(row["text"], str):
+                raise TypeError("text must be a string")
+            text = unicodedata.normalize(params.unicode_normalization, row["text"])
+            if params.lowercase:
+                text = text.lower()
+            if params.collapse_whitespace:
+                text = " ".join(text.split())
+            base = {"row_id": row_id, "partition_key": partition_key, "segment_key": segment_key,
+                    "event_time": event_time, "entity_id": entity_id}
+            contributions = [("message_presence", "present", int(bool(text))),
+                             ("normalized_non_whitespace_length", "value", sum(not char.isspace() for char in text))]
+            for ngram_size in sorted(params.ngram_sizes):
+                occurrences: dict[str, int] = {}
+                for index in range(max(0, len(text) - ngram_size + 1)):
+                    gram = text[index:index + ngram_size]
+                    occurrences[gram] = occurrences.get(gram, 0) + 1
+                contributions.extend(("character_ngram", gram, count) for gram, count in occurrences.items())
+            for feature_kind, feature_key, weight in contributions:
+                unique_keys.add((feature_kind, feature_key))
+                if len(unique_keys) > params.max_unique_keys:
+                    raise ValueError("unique key cap exceeded")
+                output.append({**base, "feature_kind": feature_kind, "feature_key": feature_key, "weight": weight})
+                if len(output) > params.max_output_rows:
+                    raise ValueError("output row cap exceeded")
+        return pl.DataFrame(sorted(output, key=lambda item: (
+            item["partition_key"], item["segment_key"], item["event_time"], item["row_id"],
+            item["entity_id"], item["feature_kind"], item["feature_key"])), schema={
+                "row_id": pl.String, "partition_key": pl.String, "segment_key": pl.String,
+                "event_time": pl.String, "entity_id": pl.String, "feature_kind": pl.String,
+                "feature_key": pl.String, "weight": pl.Int64,
+            })
+
+    @staticmethod
+    def _trailing_sparse_window_aggregate(
+        data: Any, params: TrailingSparseWindowAggregateParams, *, shard=None
+    ) -> pl.DataFrame:
+        if not isinstance(data, dict) or frozenset(data) != frozenset({"features", "requests"}):
+            raise ValueError("trailing window input must contain only features and requests")
+        feature_fields = frozenset({"row_id", "partition_key", "segment_key", "event_time", "entity_id", "feature_kind", "feature_key", "weight"})
+        request_fields = frozenset({"request_id", "partition_key", "segment_key", "endpoint_time", "window_seconds", "window_valid"})
+        features = _records(data["features"], feature_fields, "feature", params.max_input_rows)
+        requests = _records(data["requests"], request_fields, "request", params.max_input_rows)
+        _bounded_json_bytes(data, params.max_input_bytes)
+        parsed_requests: list[tuple[dict[str, Any], datetime, int]] = []
+        maximum_window = 0
+        for request in requests:
+            _opaque_string(request["request_id"], "request_id")
+            _opaque_string(request["partition_key"], "partition_key")
+            _opaque_string(request["segment_key"], "segment_key")
+            endpoint = _time(request["endpoint_time"], "endpoint_time")
+            seconds = request["window_seconds"]
+            if isinstance(seconds, bool) or not isinstance(seconds, int) or not 0 < seconds <= params.max_window_seconds:
+                raise ValueError("window_seconds is outside the permitted range")
+            if request["window_valid"] is not True:
+                raise ValueError("window request is not valid")
+            maximum_window = max(maximum_window, seconds)
+            parsed_requests.append((request, endpoint, seconds))
+        available_halo = _halo_seconds(shard) if shard is not None else None
+        if available_halo is not None and available_halo < maximum_window:
+            raise ValueError("trailing window shard halo is insufficient")
+        parsed_features: list[tuple[dict[str, Any], datetime]] = []
+        unique_keys: set[tuple[str, str]] = set()
+        for feature in features:
+            for name in ("row_id", "partition_key", "segment_key", "entity_id", "feature_kind", "feature_key"):
+                _opaque_string(feature[name], name)
+            event_time = _time(feature["event_time"], "event_time")
+            weight = feature["weight"]
+            if isinstance(weight, bool) or not isinstance(weight, int):
+                raise TypeError("weight must be an integer")
+            unique_keys.add((feature["feature_kind"], feature["feature_key"]))
+            if len(unique_keys) > params.max_unique_keys:
+                raise ValueError("unique key cap exceeded")
+            parsed_features.append((feature, event_time))
+        output: list[dict[str, Any]] = []
+        for request, endpoint, seconds in parsed_requests:
+            start = endpoint - timedelta(seconds=seconds)
+            groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            for feature, event_time in parsed_features:
+                if (feature["partition_key"] == request["partition_key"] and feature["segment_key"] == request["segment_key"]
+                        and start <= event_time < endpoint):
+                    groups.setdefault((feature["feature_kind"], feature["feature_key"]), []).append(feature)
+            for (feature_kind, feature_key), matches in groups.items():
+                output.append({"request_id": request["request_id"], "partition_key": request["partition_key"],
+                               "segment_key": request["segment_key"], "endpoint_time": endpoint.isoformat(),
+                               "window_seconds": seconds, "feature_kind": feature_kind, "feature_key": feature_key,
+                               "sum_weight": sum(item["weight"] for item in matches),
+                               "distinct_row_count": len({item["row_id"] for item in matches}),
+                               "distinct_entity_count": len({item["entity_id"] for item in matches})})
+                if len(output) > params.max_output_rows:
+                    raise ValueError("output row cap exceeded")
+        return pl.DataFrame(sorted(output, key=lambda item: (
+            item["partition_key"], item["segment_key"], item["endpoint_time"], item["request_id"],
+            item["window_seconds"], item["feature_kind"], item["feature_key"])), schema={
+                "request_id": pl.String, "partition_key": pl.String, "segment_key": pl.String,
+                "endpoint_time": pl.String, "window_seconds": pl.Int64, "feature_kind": pl.String,
+                "feature_key": pl.String, "sum_weight": pl.Int64, "distinct_row_count": pl.Int64,
+                "distinct_entity_count": pl.Int64,
+            })
