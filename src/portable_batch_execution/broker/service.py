@@ -21,7 +21,7 @@ from portable_batch_execution.kernel import completeness, exhausted_shards
 from .config import BrokerConfig
 from .planning import (
     broker_execution_fingerprint,
-    broker_input_digest,
+    broker_shard_input_digest,
     canonical_operation_params,
     opaque_run_id,
     opaque_wave_id,
@@ -78,7 +78,10 @@ class UnixBrokerService:
             )
         except ValueError:
             return self._failed(request.request_id, "operation_params_invalid")
-        input_digest = broker_input_digest(input_bytes)
+        static_input_refs = self.config.static_input_refs_for(
+            request.pack, request.operation
+        )
+        input_digest = broker_shard_input_digest(input_bytes, static_input_refs)
         binding = RequestBinding(
             input_digest=input_digest,
             pack=request.pack,
@@ -101,7 +104,12 @@ class UnixBrokerService:
             try:
                 self.controller.registry.resolve_wave(run_id, wave_id)
             except KeyError:
-                state = self._register_request(request, binding, input_bytes)
+                try:
+                    state = self._register_request(
+                        request, binding, input_bytes, static_input_refs
+                    )
+                except ValueError:
+                    return self._failed(request.request_id, "broker_internal_error")
             else:
                 try:
                     state = self.recover_request_state(request, binding)
@@ -122,6 +130,7 @@ class UnixBrokerService:
         request: BrokerExecuteRequest,
         binding: RequestBinding,
         input_bytes: bytes,
+        static_input_refs,
     ) -> BrokerRequestState:
         _, wave, shard, _ = register_broker_private_run(
             state_root=self.state_root,
@@ -132,6 +141,7 @@ class UnixBrokerService:
             input_bytes=input_bytes,
             input_media_type=request.input_media_type,
             public_sha=self.config.public_sha,
+            static_input_refs=static_input_refs,
         )
         state = BrokerRequestState(
             request_id=request.request_id,
@@ -349,6 +359,9 @@ class UnixBrokerService:
         payload = self.controller.registry.resolve_wave(run_id, wave_id)
         job = JobSpec.model_validate(payload["job"])
         shard = ShardSpec.model_validate(payload["shards"][0])
+        static_input_refs = self.config.static_input_refs_for(
+            binding.pack, binding.operation
+        )
         try:
             validate_registered_wave_binding(
                 request_id=request.request_id,
@@ -359,6 +372,7 @@ class UnixBrokerService:
                 binding_execution_fingerprint=binding.execution_fingerprint,
                 job=job,
                 shard=shard,
+                expected_static_input_refs=static_input_refs,
             )
         except ValueError as exc:
             if str(exc) == "request_binding_conflict":

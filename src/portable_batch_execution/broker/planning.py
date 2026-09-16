@@ -8,6 +8,7 @@ from hashlib import sha256
 from typing import Any
 
 from portable_batch_execution.contracts import (
+    ArtifactRef,
     ExecutionPolicy,
     JobSpec,
     Provenance,
@@ -51,6 +52,55 @@ def canonical_operation_params(pack: str, operation: str, params: dict[str, Any]
 
 def broker_input_digest(input_bytes: bytes) -> str:
     return sha256(input_bytes).hexdigest()
+
+
+def _static_ref_projection(ref: ArtifactRef) -> dict[str, object]:
+    return {
+        "object_id": ref.object_id,
+        "sha256": ref.sha256,
+        "size_bytes": ref.size_bytes,
+        "media_type": ref.media_type,
+    }
+
+
+def broker_composite_input_digest(
+    raw_client_digest: str, static_input_refs: tuple[ArtifactRef, ...]
+) -> str:
+    material = json.dumps(
+        {
+            "client_input_digest": raw_client_digest,
+            "static_input_refs": [_static_ref_projection(ref) for ref in static_input_refs],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return sha256(material.encode("utf-8")).hexdigest()
+
+
+def broker_shard_input_digest(
+    input_bytes: bytes, static_input_refs: tuple[ArtifactRef, ...] = ()
+) -> str:
+    raw_digest = broker_input_digest(input_bytes)
+    if not static_input_refs:
+        return raw_digest
+    return broker_composite_input_digest(raw_digest, static_input_refs)
+
+
+def _validate_static_input_refs(
+    plane: LocalFilesystemDataPlane, static_input_refs: tuple[ArtifactRef, ...]
+) -> None:
+    seen_object_ids: set[str] = set()
+    seen_sha256: set[str] = set()
+    for ref in static_input_refs:
+        if ref.object_id in seen_object_ids:
+            raise ValueError("duplicate static input reference object_id")
+        seen_object_ids.add(ref.object_id)
+        identity = f"{ref.object_id}\x1f{ref.sha256}"
+        if identity in seen_sha256:
+            raise ValueError("duplicate static input reference identity")
+        seen_sha256.add(identity)
+        if not plane.verify(ref):
+            raise ValueError("static input reference is missing or invalid")
 
 
 def broker_execution_fingerprint(
@@ -100,6 +150,7 @@ def validate_registered_wave_binding(
     binding_execution_fingerprint: str,
     job: JobSpec,
     shard: ShardSpec,
+    expected_static_input_refs: tuple[ArtifactRef, ...] = (),
 ) -> None:
     expected_job_id = broker_job_id(request_id, binding_execution_fingerprint)
     if job.job_id != expected_job_id:
@@ -111,6 +162,9 @@ def validate_registered_wave_binding(
     if shard.input_digest != binding_input_digest:
         raise ValueError(_BINDING_CONFLICT)
     if shard.execution_fingerprint != binding_execution_fingerprint:
+        raise ValueError(_BINDING_CONFLICT)
+    expected_refs = (job.input_manifest_ref, *expected_static_input_refs)
+    if tuple(shard.input_refs) != expected_refs:
         raise ValueError(_BINDING_CONFLICT)
 
 
@@ -139,10 +193,12 @@ def register_broker_private_run(
     input_bytes: bytes,
     input_media_type: str,
     public_sha: str,
+    static_input_refs: tuple[ArtifactRef, ...] = (),
 ) -> tuple[JobSpec, WaveSpec, ShardSpec, RunManifest]:
     plane = LocalFilesystemDataPlane(state_root)
     registry = ClosedWaveRegistry(state_root / "controller")
-    input_digest = broker_input_digest(input_bytes)
+    _validate_static_input_refs(plane, static_input_refs)
+    input_digest = broker_shard_input_digest(input_bytes, static_input_refs)
     validated_params = canonical_operation_params(pack, operation, operation_params)
     execution_fingerprint = broker_execution_fingerprint(
         request_id=request_id,
@@ -172,6 +228,7 @@ def register_broker_private_run(
             binding_execution_fingerprint=execution_fingerprint,
             job=job,
             shard=shard,
+            expected_static_input_refs=static_input_refs,
         )
         manifest = plane.read_manifest(run_id)
         if manifest is None:
@@ -210,7 +267,7 @@ def register_broker_private_run(
         shard_id="shard-000000",
         ordinal=0,
         correctness=job.sharding,
-        input_refs=(input_ref,),
+        input_refs=(input_ref, *static_input_refs),
         input_digest=input_digest,
         execution_fingerprint=execution_fingerprint,
     )
