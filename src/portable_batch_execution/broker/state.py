@@ -46,6 +46,7 @@ class BrokerRequestState:
     output_media_type: str | None = None
     dispatch_count: int = 0
     last_dispatched_failure_count: int = 0
+    last_reconciled_attempt_marker: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -68,6 +69,7 @@ class BrokerRequestState:
             "output_media_type": self.output_media_type,
             "dispatch_count": self.dispatch_count,
             "last_dispatched_failure_count": self.last_dispatched_failure_count,
+            "last_reconciled_attempt_marker": self.last_reconciled_attempt_marker,
         }
 
     @classmethod
@@ -99,6 +101,7 @@ class BrokerRequestState:
             last_dispatched_failure_count=int(
                 payload.get("last_dispatched_failure_count", 0)
             ),
+            last_reconciled_attempt_marker=payload.get("last_reconciled_attempt_marker"),
         )
 
 

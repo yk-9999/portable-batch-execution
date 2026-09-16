@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 from collections.abc import Callable
 from hashlib import sha256
@@ -13,7 +14,7 @@ from portable_batch_execution.backends.github_actions import (
     GitHubActionsAPIError,
     GitHubActionsBackend,
 )
-from portable_batch_execution.contracts import PACK_OPS, ShardAttemptRecord
+from portable_batch_execution.contracts import PACK_OPS, ShardAttemptRecord, ShardSpec
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.kernel import completeness, exhausted_shards
 
@@ -25,6 +26,7 @@ from .planning import (
     opaque_run_id,
     opaque_wave_id,
     register_broker_private_run,
+    validate_registered_wave_binding,
 )
 from .protocol import BrokerExecuteRequest, BrokerExecuteResponse, parse_request
 from .state import BrokerRequestState, BrokerRequestStore, RequestBinding
@@ -101,7 +103,12 @@ class UnixBrokerService:
             except KeyError:
                 state = self._register_request(request, binding, input_bytes)
             else:
-                state = self.recover_request_state(request, binding)
+                try:
+                    state = self.recover_request_state(request, binding)
+                except ValueError as exc:
+                    if str(exc) == "request_binding_conflict":
+                        return self._failed(request.request_id, "request_id_conflict")
+                    raise
         elif not state.binding.matches(binding):
             return self._failed(request.request_id, "request_id_conflict")
         if state.status == "succeeded":
@@ -137,14 +144,46 @@ class UnixBrokerService:
         self._store.save(state)
         return state
 
-    def _reconcile(self, logical_run_id: str) -> None:
-        manifest = self.controller.data_plane.read_manifest(logical_run_id)
+    def _reconcile_if_attempts_changed(
+        self, state: BrokerRequestState, shard: ShardSpec, attempts: list[ShardAttemptRecord]
+    ) -> None:
+        marker = _attempt_marker(shard, attempts)
+        if marker == state.last_reconciled_attempt_marker:
+            return
+        if not _matching_attempts(shard, attempts):
+            state.last_reconciled_attempt_marker = marker
+            self._store.save(state)
+            return
+        manifest = self.controller.data_plane.read_manifest(state.logical_run_id)
         if manifest is None:
             return
-        shards = self.controller.registry.load_shards_for_run(logical_run_id)
+        shards = self.controller.registry.load_shards_for_run(state.logical_run_id)
         if not shards:
             return
-        self.controller.reconcile_run(logical_run_id)
+        self.controller.reconcile_run(state.logical_run_id)
+        state.last_reconciled_attempt_marker = marker
+        self._store.save(state)
+
+    def _sync_dispatch_from_controller(
+        self, state: BrokerRequestState, shard: ShardSpec
+    ) -> None:
+        history = self.controller.read_wave_dispatch_history(
+            state.logical_run_id, state.wave_id
+        )
+        if not history:
+            return
+        recorded_count = len(history)
+        if recorded_count <= state.dispatch_count:
+            return
+        attempts = list(self.controller.data_plane.read_attempts(state.logical_run_id))
+        terminal_count = len(_matching_terminal_attempts(shard, attempts))
+        state.dispatch_count = recorded_count
+        state.execution_id = history[-1]["execution_id"]
+        state.last_dispatched_failure_count = max(
+            state.last_dispatched_failure_count,
+            min(terminal_count, recorded_count),
+        )
+        self._store.save(state)
 
     def _drive_to_terminal(
         self, request_id: str, state: BrokerRequestState
@@ -162,9 +201,10 @@ class UnixBrokerService:
 
         execution_policy = JobSpec.model_validate(job_payload["job"]).execution
         max_dispatches = execution_policy.max_attempts_per_shard
+        self._sync_dispatch_from_controller(state, shard)
         while True:
-            self._reconcile(state.logical_run_id)
             attempts = list(self.controller.data_plane.read_attempts(state.logical_run_id))
+            self._reconcile_if_attempts_changed(state, shard, attempts)
             terminal_count = len(_matching_terminal_attempts(shard, attempts))
             if terminal_count >= execution_policy.max_attempts_per_shard:
                 state.status = "exhausted"
@@ -185,7 +225,7 @@ class UnixBrokerService:
                 state.output_sha256 = digest
                 state.output_media_type = media_type
                 self._store.save(state)
-                self._reconcile(state.logical_run_id)
+                self._reconcile_if_attempts_changed(state, shard, attempts)
                 return BrokerExecuteResponse(
                     request_id=state.request_id,
                     status="succeeded",
@@ -256,9 +296,10 @@ class UnixBrokerService:
         return payload, media_type, f"sha256:{digest}"
 
     def _success_from_state(self, state: BrokerRequestState) -> BrokerExecuteResponse:
-        self._reconcile(state.logical_run_id)
-        attempts = self.controller.data_plane.read_attempts(state.logical_run_id)
         shards = self.controller.registry.load_shards_for_run(state.logical_run_id)
+        attempts = list(self.controller.data_plane.read_attempts(state.logical_run_id))
+        if len(shards) == 1:
+            self._reconcile_if_attempts_changed(state, shards[0], attempts)
         canonical, missing, duplicate = completeness(
             {state.shard_id}, list(attempts), shards
         )
@@ -301,20 +342,66 @@ class UnixBrokerService:
 
     def recover_request_state(self, request: BrokerExecuteRequest, binding: RequestBinding) -> BrokerRequestState:
         """Rebuild durable broker state when registration exists but state file is missing."""
+        from portable_batch_execution.contracts import JobSpec
+
         run_id = opaque_run_id(request.request_id)
         wave_id = opaque_wave_id(request.request_id)
         payload = self.controller.registry.resolve_wave(run_id, wave_id)
-        shard = payload["shards"][0]
+        job = JobSpec.model_validate(payload["job"])
+        shard = ShardSpec.model_validate(payload["shards"][0])
+        try:
+            validate_registered_wave_binding(
+                request_id=request.request_id,
+                binding_input_digest=binding.input_digest,
+                binding_pack=binding.pack,
+                binding_operation=binding.operation,
+                binding_operation_params=binding.operation_params,
+                binding_execution_fingerprint=binding.execution_fingerprint,
+                job=job,
+                shard=shard,
+            )
+        except ValueError as exc:
+            if str(exc) == "request_binding_conflict":
+                raise
+            raise ValueError("request_binding_conflict") from exc
         state = BrokerRequestState(
             request_id=request.request_id,
             binding=binding,
             logical_run_id=run_id,
             wave_id=wave_id,
-            shard_id=shard["shard_id"],
+            shard_id=shard.shard_id,
             status="active",
         )
+        self._sync_dispatch_from_controller(state, shard)
         self._store.save(state)
         return state
+
+
+def _matching_attempts(
+    shard: ShardSpec, attempts: list[ShardAttemptRecord]
+) -> list[ShardAttemptRecord]:
+    return [
+        item
+        for item in attempts
+        if item.shard_id == shard.shard_id
+        and item.input_digest == shard.input_digest
+        and item.execution_fingerprint == shard.execution_fingerprint
+    ]
+
+
+def _attempt_marker(shard: ShardSpec, attempts: list[ShardAttemptRecord]) -> str:
+    material = [
+        (
+            item.attempt_id,
+            item.status,
+            item.input_digest,
+            item.execution_fingerprint,
+            item.shard_id,
+        )
+        for item in _matching_attempts(shard, attempts)
+    ]
+    material.sort()
+    return sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _matching_terminal_attempts(shard, attempts) -> list[ShardAttemptRecord]:

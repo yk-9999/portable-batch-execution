@@ -18,8 +18,11 @@ from portable_batch_execution.contracts import (
 )
 from portable_batch_execution.controller.a1_controller import job_spec_digest
 from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
+from portable_batch_execution.data_plane.base import RevisionConflictError
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
 from portable_batch_execution.packs import MLPack, TabularPack
+
+_BINDING_CONFLICT = "request_binding_conflict"
 
 
 def canonical_operation_params(pack: str, operation: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -75,6 +78,45 @@ def broker_job_id(request_id: str, execution_fingerprint: str) -> str:
     return f"broker-{sha256(material).hexdigest()[:16]}"
 
 
+def validate_registered_wave_binding(
+    *,
+    request_id: str,
+    binding_input_digest: str,
+    binding_pack: str,
+    binding_operation: str,
+    binding_operation_params: dict[str, Any],
+    binding_execution_fingerprint: str,
+    job: JobSpec,
+    shard: ShardSpec,
+) -> None:
+    expected_job_id = broker_job_id(request_id, binding_execution_fingerprint)
+    if job.job_id != expected_job_id:
+        raise ValueError(_BINDING_CONFLICT)
+    if job.pack != binding_pack or job.operation != binding_operation:
+        raise ValueError(_BINDING_CONFLICT)
+    if job.operation_params != binding_operation_params:
+        raise ValueError(_BINDING_CONFLICT)
+    if shard.input_digest != binding_input_digest:
+        raise ValueError(_BINDING_CONFLICT)
+    if shard.execution_fingerprint != binding_execution_fingerprint:
+        raise ValueError(_BINDING_CONFLICT)
+
+
+def _initial_manifest(job: JobSpec, wave: WaveSpec, shard: ShardSpec) -> RunManifest:
+    created_at = job.provenance.created_at
+    return RunManifest(
+        logical_run_id=job.logical_run_id,
+        revision=0,
+        job_spec_digest=job_spec_digest(job),
+        status="planned",
+        expected_shard_ids=(shard.shard_id,),
+        created_at=created_at,
+        updated_at=created_at,
+        provenance=job.provenance,
+        waves=(wave,),
+    )
+
+
 def register_broker_private_run(
     *,
     state_root,
@@ -107,13 +149,27 @@ def register_broker_private_run(
         existing = None
     if existing is not None:
         job = JobSpec.model_validate(existing["job"])
-        if job.job_id != job_id:
-            raise ValueError("run already registered with a different job")
         wave = WaveSpec.model_validate(existing["wave"])
         shard = ShardSpec.model_validate(existing["shards"][0])
+        validate_registered_wave_binding(
+            request_id=request_id,
+            binding_input_digest=input_digest,
+            binding_pack=pack,
+            binding_operation=operation,
+            binding_operation_params=validated_params,
+            binding_execution_fingerprint=execution_fingerprint,
+            job=job,
+            shard=shard,
+        )
         manifest = plane.read_manifest(run_id)
         if manifest is None:
-            raise ValueError("registered run missing manifest")
+            manifest = _initial_manifest(job, wave, shard)
+            try:
+                plane.write_next_manifest(manifest, -1)
+            except RevisionConflictError:
+                manifest = plane.read_manifest(run_id)
+            if manifest is None:
+                raise ValueError("registered run missing manifest")
         return job, wave, shard, manifest
     input_ref = plane.write(input_bytes, input_media_type)
     now = datetime.now(UTC)
@@ -154,20 +210,6 @@ def register_broker_private_run(
         max_parallel=1,
     )
     registry.register_closed_wave(job, wave, (shard,))
-    manifest = RunManifest(
-        logical_run_id=run_id,
-        revision=0,
-        job_spec_digest=job_spec_digest(job),
-        status="planned",
-        expected_shard_ids=(shard.shard_id,),
-        created_at=now,
-        updated_at=now,
-        provenance=Provenance(
-            producer="a1-unix-broker",
-            revision="v1",
-            created_at=now,
-        ),
-        waves=(wave,),
-    )
+    manifest = _initial_manifest(job, wave, shard)
     plane.write_next_manifest(manifest, -1)
     return job, wave, shard, manifest

@@ -257,6 +257,19 @@ class A1Controller:
             manifest=manifest,
         )
 
+    def read_wave_dispatch_history(self, run_id: str, wave_id: str) -> tuple[dict, ...]:
+        """Return durable dispatch records for one wave without backend credentials."""
+        run_id = opaque_identifier(run_id, "run_id")
+        wave_id = opaque_identifier(wave_id, "wave_id")
+        state = self._read_dispatch_state(run_id)
+        waves = state.get("waves", {})
+        if not isinstance(waves, dict):
+            return ()
+        entry = waves.get(wave_id, {})
+        if not isinstance(entry, dict):
+            return ()
+        return tuple(_normalize_wave_dispatch_history(entry))
+
     def dispatch_private_wave(self, run_id: str, wave_id: str) -> BackendExecutionRef:
         if self.backend is None:
             raise ValueError("GitHub backend is not configured")

@@ -676,6 +676,200 @@ def test_socket_mode_set_after_bind(tmp_path):  # pragma: no cover - posix only
     chmod.assert_called_with(socket_path.resolve(), config.socket_mode)
 
 
+def test_reconcile_skips_unchanged_attempts_during_polling(tmp_path):
+    config = _config(tmp_path)
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(201, json={"workflow_run_id": 20, "html_url": "https://run"})
+        return httpx.Response(
+            200,
+            json={"status": "in_progress", "conclusion": None, "updated_at": "t"},
+        )
+
+    class _PollLimit(RuntimeError):
+        pass
+
+    polls = 0
+
+    def sleeper(_seconds: float) -> None:
+        nonlocal polls
+        polls += 1
+        if polls >= 12:
+            raise _PollLimit()
+
+    service = _service(tmp_path, config, handler, sleeper=sleeper)
+    rows = json.dumps([{"id": 1}]).encode()
+    params = canonical_operation_params(
+        "tabular-batch", "tabular.sort", {"by": [{"column": "id"}]}
+    )
+    register_broker_private_run(
+        state_root=tmp_path,
+        request_id="req-rev",
+        pack="tabular-batch",
+        operation="tabular.sort",
+        operation_params={"by": [{"column": "id"}]},
+        input_bytes=rows,
+        input_media_type="application/json",
+        public_sha=_PUBLIC_SHA,
+    )
+    run_id = opaque_run_id("req-rev")
+    wave_id = f"wave-{sha256(b'req-rev').hexdigest()[:12]}"
+    service.controller.dispatch_private_wave(run_id, wave_id)
+    binding = RequestBinding(
+        input_digest=broker_input_digest(rows),
+        pack="tabular-batch",
+        operation="tabular.sort",
+        operation_params=params,
+        execution_fingerprint=broker_execution_fingerprint(
+            request_id="req-rev",
+            input_digest=broker_input_digest(rows),
+            pack="tabular-batch",
+            operation="tabular.sort",
+            operation_params=params,
+            public_sha=_PUBLIC_SHA,
+        ),
+        public_sha=_PUBLIC_SHA,
+    )
+    BrokerRequestStore(service.state_root / "controller").save(
+        BrokerRequestState(
+            request_id="req-rev",
+            binding=binding,
+            logical_run_id=run_id,
+            wave_id=wave_id,
+            shard_id="shard-000000",
+            status="active",
+            execution_id="20",
+            dispatch_count=1,
+        )
+    )
+    revision_before = service.controller.data_plane.read_manifest(run_id).revision
+    with (
+        patch.object(service.controller, "reconcile_run") as reconcile,
+        pytest.raises(_PollLimit),
+    ):
+        service.handle_payload(_UID, _request(request_id="req-rev", payload=rows))
+    reconcile.assert_not_called()
+    assert service.controller.data_plane.read_manifest(run_id).revision == revision_before
+    _append_success_attempt(service.controller, "req-rev", b"[{\"id\":1}]")
+    with patch.object(service.controller, "reconcile_run", wraps=service.controller.reconcile_run) as reconcile:
+        response = service.handle_payload(_UID, _request(request_id="req-rev", payload=rows))
+    assert response.status == "succeeded"
+    revision_after = service.controller.data_plane.read_manifest(run_id).revision
+    assert revision_after == revision_before + 1
+    assert reconcile.call_count == 1
+    again = service.handle_payload(_UID, _request(request_id="req-rev", payload=rows))
+    assert again.status == "succeeded"
+    assert service.controller.data_plane.read_manifest(run_id).revision == revision_after
+
+
+def test_dispatch_history_sync_prevents_duplicate_submit_after_crash(tmp_path):
+    config = _config(tmp_path)
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(201, json={"workflow_run_id": 21, "html_url": "https://run"})
+        return httpx.Response(
+            200,
+            json={"status": "completed", "conclusion": "success", "updated_at": "t"},
+        )
+
+    class _PollLimit(RuntimeError):
+        pass
+
+    polls = 0
+
+    def sleeper(_seconds: float) -> None:
+        nonlocal polls
+        polls += 1
+        if polls >= 6:
+            raise _PollLimit()
+
+    service = _service(tmp_path, config, handler, sleeper=sleeper)
+    register_broker_private_run(
+        state_root=tmp_path,
+        request_id="req-dispatch-sync",
+        pack="tabular-batch",
+        operation="tabular.sort",
+        operation_params={"by": [{"column": "id"}]},
+        input_bytes=json.dumps([{"id": 1}]).encode(),
+        input_media_type="application/json",
+        public_sha=_PUBLIC_SHA,
+    )
+    run_id = opaque_run_id("req-dispatch-sync")
+    wave_id = f"wave-{sha256(b'req-dispatch-sync').hexdigest()[:12]}"
+    service.controller.dispatch_private_wave(run_id, wave_id)
+    rows = json.dumps([{"id": 1}]).encode()
+    with patch.object(
+        service.controller,
+        "dispatch_private_wave",
+        side_effect=AssertionError("must not duplicate dispatch"),
+    ), pytest.raises(_PollLimit):
+        service.handle_payload(
+            _UID, _request(request_id="req-dispatch-sync", payload=rows)
+        )
+    assert dispatch_calls == 1
+
+
+def test_recovery_rejects_conflicting_binding(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    register_broker_private_run(
+        state_root=tmp_path,
+        request_id="req-conflict-recover",
+        pack="tabular-batch",
+        operation="tabular.sort",
+        operation_params={"by": [{"column": "id"}]},
+        input_bytes=json.dumps([{"id": 1}]).encode(),
+        input_media_type="application/json",
+        public_sha=_PUBLIC_SHA,
+    )
+    conflict = _request(
+        request_id="req-conflict-recover",
+        operation_params={"by": [{"column": "value"}]},
+    )
+    response = service.handle_payload(_UID, conflict)
+    assert response.status == "failed"
+    assert response.error_code == "request_id_conflict"
+
+
+def test_registry_without_manifest_self_heals_on_exact_retry(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    register_broker_private_run(
+        state_root=tmp_path,
+        request_id="req-manifest-heal",
+        pack="tabular-batch",
+        operation="tabular.sort",
+        operation_params={"by": [{"column": "id"}]},
+        input_bytes=json.dumps([{"id": 1}]).encode(),
+        input_media_type="application/json",
+        public_sha=_PUBLIC_SHA,
+    )
+    run_id = opaque_run_id("req-manifest-heal")
+    run_manifest_dir = tmp_path / "runs" / run_id
+    for path in run_manifest_dir.glob("**/*"):
+        if path.is_file():
+            path.unlink()
+    register_broker_private_run(
+        state_root=tmp_path,
+        request_id="req-manifest-heal",
+        pack="tabular-batch",
+        operation="tabular.sort",
+        operation_params={"by": [{"column": "id"}]},
+        input_bytes=json.dumps([{"id": 1}]).encode(),
+        input_media_type="application/json",
+        public_sha=_PUBLIC_SHA,
+    )
+    assert service.controller.data_plane.read_manifest(run_id) is not None
+
+
 def test_execution_fingerprint_binds_public_sha(tmp_path):
     rows = json.dumps([{"id": 1}]).encode()
     params = canonical_operation_params(
