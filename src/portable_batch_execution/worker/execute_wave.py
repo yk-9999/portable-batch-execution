@@ -130,14 +130,15 @@ def _parse_private_tabular_two_table_envelope(
     return left, right
 
 
-def _parse_private_tabular_feature_request_envelope(
-    parsed_input: object,
+def _parse_private_tabular_feature_request_inputs(
+    feature_rows: object, request_rows: object,
 ) -> dict[str, list[dict]]:
-    if not isinstance(parsed_input, dict) or frozenset(parsed_input) != frozenset({"features", "requests"}):
-        raise TypeError("feature request input must contain only features and requests")
-    if not all(isinstance(parsed_input[key], list) and all(isinstance(row, dict) for row in parsed_input[key]) for key in ("features", "requests")):
-        raise TypeError("features and requests must be arrays of objects")
-    return parsed_input
+    if not all(
+        isinstance(rows, list) and all(isinstance(row, dict) for row in rows)
+        for rows in (feature_rows, request_rows)
+    ):
+        raise TypeError("feature rows and request rows must be arrays of objects")
+    return {"features": feature_rows, "requests": request_rows}
 
 
 def _artifact_ref_matches_bytes(data: bytes, ref: ArtifactRef) -> bool:
@@ -424,7 +425,15 @@ def execute_private_wave(
                 if private_pack == "tabular-batch":
                     if job.operation in _PRIVATE_TABULAR_FEATURE_REQUEST_OPS:
                         try:
-                            feature_request_input = _parse_private_tabular_feature_request_envelope(parsed_input)
+                            if len(shard.input_refs) != 2:
+                                raise TypeError("trailing sparse window aggregate requires exactly two input artifacts")
+                            request_payload = _read_verified_artifact_bytes(
+                                plane, shard.input_refs[1]
+                            )
+                            request_rows = json.loads(request_payload.decode("utf-8"))
+                            feature_request_input = _parse_private_tabular_feature_request_inputs(
+                                parsed_input, request_rows
+                            )
                             result = pack.execute(job, shard, job.operation_params, {"data": feature_request_input})
                         except Exception as exc:  # noqa: BLE001
                             raise _ShardStageFailure(_execution_failure_code(exc, stage="pack")) from None
@@ -451,6 +460,8 @@ def execute_private_wave(
                             ) from None
                         input_rows = len(left) + len(right)
                     else:
+                        if job.operation == "tabular.text_event_features.v1" and len(shard.input_refs) != 1:
+                            raise _ShardStageFailure("input_artifact_invalid")
                         if not isinstance(parsed_input, list):
                             raise _ShardStageFailure(
                                 _execution_failure_code(TypeError(), stage="input_parse")

@@ -30,6 +30,7 @@ def _plane(
     ml_payload=None,
     binary_payload=None,
     tabular_payload=None,
+    additional_tabular_payload=None,
     operation_params=None,
     input_ref_overrides=None,
     write_ref_overrides=None,
@@ -61,6 +62,16 @@ def _plane(
     }
     input_ref_fields.update(input_ref_overrides or {})
     input_ref = ArtifactRef(**input_ref_fields)
+    additional_payload = None
+    additional_input_ref = None
+    if additional_tabular_payload is not None:
+        additional_payload = json.dumps(additional_tabular_payload).encode()
+        additional_input_ref = ArtifactRef(
+            object_id="input-2",
+            uri="pbe://private/input-2",
+            sha256="sha256:" + sha256(additional_payload).hexdigest(),
+            size_bytes=len(additional_payload),
+        )
     now = datetime.now(UTC).isoformat()
     shard_specs = shards or [
         {
@@ -68,7 +79,14 @@ def _plane(
             "shard_id": "opaque-shard",
             "ordinal": 0,
             "correctness": {},
-            "input_refs": [input_ref.model_dump(mode="json")],
+            "input_refs": [
+                input_ref.model_dump(mode="json"),
+                *(
+                    [additional_input_ref.model_dump(mode="json")]
+                    if additional_input_ref is not None
+                    else []
+                ),
+            ],
             "input_digest": "current",
             "execution_fingerprint": "fixed",
         }
@@ -118,6 +136,8 @@ def _plane(
         def read(self, ref):
             if read_raises:
                 raise read_raises
+            if ref.object_id == "input-2":
+                return additional_payload
             return payload
 
         def write(self, data, media_type):
@@ -360,22 +380,42 @@ def test_tabular_pit_join_success_includes_exact_boundary_match():
 
 
 def test_tabular_trailing_sparse_window_aggregate_is_available_to_closed_worker():
-    envelope = {
-        "features": [
-            {"row_id": "r", "partition_key": "p", "segment_key": "s", "event_time": "2026-01-01T00:00:01+00:00", "entity_id": "e", "feature_kind": "k", "feature_key": "x", "weight": 2}
-        ],
-        "requests": [
-            {"request_id": "q", "partition_key": "p", "segment_key": "s", "endpoint_time": "2026-01-01T00:00:02+00:00", "window_seconds": 2, "window_valid": True}
-        ],
-    }
+    feature_rows = [
+        {"row_id": "r", "partition_key": "p", "segment_key": "s", "event_time": "2026-01-01T00:00:01+00:00", "entity_id": "e", "feature_kind": "k", "feature_key": "x", "weight": 2}
+    ]
+    request_rows = [
+        {"request_id": "q", "partition_key": "p", "segment_key": "s", "endpoint_time": "2026-01-01T00:00:02+00:00", "window_seconds": 2, "window_valid": True}
+    ]
     plane = _plane(
         operation="tabular.trailing_sparse_window_aggregate.v1",
-        tabular_payload=envelope,
+        tabular_payload=feature_rows,
+        additional_tabular_payload=request_rows,
         operation_params={},
     )
     attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
     assert attempts[0].counts == {"input_rows": 2, "output_rows": 1}
     assert json.loads(plane.last_written.decode())[0]["sum_weight"] == 2
+
+
+def test_new_tabular_operations_reject_wrong_input_artifact_counts():
+    aggregate = _plane(
+        operation="tabular.trailing_sparse_window_aggregate.v1",
+        tabular_payload=[],
+        operation_params={},
+    )
+    with pytest.raises(PrivateWaveExecutionError):
+        execute_private_wave("opaque-run", "opaque-wave", plane=aggregate)
+    assert aggregate.appended[0].failure == "shard_pack_execution_failed"
+
+    text = _plane(
+        operation="tabular.text_event_features.v1",
+        tabular_payload=[],
+        additional_tabular_payload=[],
+        operation_params={"ngram_sizes": [2]},
+    )
+    with pytest.raises(PrivateWaveExecutionError):
+        execute_private_wave("opaque-run", "opaque-wave", plane=text)
+    assert text.appended[0].failure == "input_artifact_invalid"
 
 
 @pytest.mark.parametrize(
