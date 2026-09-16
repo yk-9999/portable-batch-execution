@@ -28,6 +28,7 @@ _CLOSED_ML_BATCH_OPERATIONS = frozenset(
     {
         "ml.char_wb_tfidf_logistic_score",
         "ml.cosine_similarity_matrix",
+        "ml.distilbert_pair_binary_scores",
     }
 )
 

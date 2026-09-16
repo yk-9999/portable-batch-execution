@@ -52,6 +52,7 @@ PACK_OPS = {
         "ml.clustering",
         "ml.char_wb_tfidf_logistic_score",
         "ml.cosine_similarity_matrix",
+        "ml.distilbert_pair_binary_scores",
     },
     "media-batch": {
         "media.decode",

@@ -26,6 +26,9 @@ from portable_batch_execution.packs.ml.char_wb_tfidf_logistic_score import (
 from portable_batch_execution.packs.ml.cosine_similarity_matrix import (
     execute_cosine_similarity_matrix,
 )
+from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
+    execute_distilbert_pair_binary_scores,
+)
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})
@@ -53,6 +56,7 @@ _PRIVATE_ML_SINGLE_INPUT_OPS = frozenset(
         "ml.cosine_similarity_matrix",
     }
 )
+_PRIVATE_ML_FIVE_INPUT_OPS = frozenset({"ml.distilbert_pair_binary_scores"})
 _PRIVATE_MEDIA_SINGLE_INPUT_OPS = frozenset({"media.asr_normalize_flac"})
 
 
@@ -126,6 +130,18 @@ def _artifact_ref_matches_bytes(data: bytes, ref: ArtifactRef) -> bool:
     if f"sha256:{sha256(data).hexdigest()}" != ref.sha256:
         return False
     return ref.size_bytes is None or len(data) == ref.size_bytes
+
+
+def _read_verified_artifact_bytes(plane, ref: ArtifactRef) -> bytes:
+    try:
+        payload = plane.read(ref)
+    except Exception as exc:  # noqa: BLE001
+        raise _ShardStageFailure(
+            _execution_failure_code(exc, stage="input_read")
+        ) from None
+    if not _artifact_ref_matches_bytes(payload, ref):
+        raise _ShardStageFailure("input_artifact_mismatch")
+    return payload
 
 
 def _execution_failure_code(exc: BaseException, *, stage: str) -> str:
@@ -264,8 +280,13 @@ def execute_private_wave(
             raise ValueError("private wave operation is not available on the public runner")
         private_pack = "tabular-batch"
     elif job.pack == "ml-batch":
-        if job.operation not in _PRIVATE_ML_SINGLE_INPUT_OPS:
+        if (
+            job.operation not in _PRIVATE_ML_SINGLE_INPUT_OPS
+            and job.operation not in _PRIVATE_ML_FIVE_INPUT_OPS
+        ):
             raise ValueError("private wave operation is not available on the public runner")
+        if job.operation in _PRIVATE_ML_FIVE_INPUT_OPS and job.operation_params:
+            raise ValueError("closed operation parameters")
         private_pack = "ml-batch"
     elif job.pack == "media-batch":
         if job.operation not in _PRIVATE_MEDIA_SINGLE_INPUT_OPS:
@@ -296,17 +317,50 @@ def execute_private_wave(
             execution_fingerprint=shard.execution_fingerprint,
             current_attempt_count=len(current),
         )
-        input_ref = shard.input_refs[0]
         try:
-            try:
-                payload = plane.read(input_ref)
-            except Exception as exc:  # noqa: BLE001
-                raise _ShardStageFailure(
-                    _execution_failure_code(exc, stage="input_read")
-                ) from None
-            if not _artifact_ref_matches_bytes(payload, input_ref):
-                raise _ShardStageFailure("input_artifact_mismatch")
-            if private_pack == "media-batch":
+            if (
+                private_pack == "ml-batch"
+                and job.operation == "ml.distilbert_pair_binary_scores"
+            ):
+                if len(shard.input_refs) != 5:
+                    raise _ShardStageFailure("input_artifact_invalid")
+                refs = shard.input_refs
+                tensor_bytes = _read_verified_artifact_bytes(plane, refs[0])
+                model_a_config = _read_verified_artifact_bytes(plane, refs[1])
+                model_a_weights = _read_verified_artifact_bytes(plane, refs[2])
+                model_b_config = _read_verified_artifact_bytes(plane, refs[3])
+                model_b_weights = _read_verified_artifact_bytes(plane, refs[4])
+                try:
+                    text = tensor_bytes.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise _ShardStageFailure(
+                        _execution_failure_code(exc, stage="input_decode")
+                    ) from None
+                try:
+                    parsed_input = json.loads(text)
+                except ValueError as exc:
+                    raise _ShardStageFailure(
+                        _execution_failure_code(exc, stage="input_parse")
+                    ) from None
+                try:
+                    result_payload = execute_distilbert_pair_binary_scores(
+                        parsed_input,
+                        model_a_config=model_a_config,
+                        model_a_weights=model_a_weights,
+                        model_b_config=model_b_config,
+                        model_b_weights=model_b_weights,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    raise _ShardStageFailure(
+                        _execution_failure_code(exc, stage="pack")
+                    ) from None
+                input_rows = len(result_payload["row_ids"])
+                output_rows = input_rows
+                output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
+                output_media_type = "application/json"
+            elif private_pack == "media-batch":
+                input_ref = shard.input_refs[0]
+                payload = _read_verified_artifact_bytes(plane, input_ref)
                 with tempfile.TemporaryDirectory() as temporary:
                     input_path = Path(temporary) / "input.bin"
                     output_path = Path(temporary) / "output.flac"
@@ -337,6 +391,8 @@ def execute_private_wave(
                 }
                 output_media_type = "audio/flac"
             else:
+                input_ref = shard.input_refs[0]
+                payload = _read_verified_artifact_bytes(plane, input_ref)
                 try:
                     text = payload.decode("utf-8")
                 except UnicodeDecodeError as exc:
@@ -406,12 +462,16 @@ def execute_private_wave(
                             output_rows = len(result_payload["scores"]) * len(
                                 result_payload["scores"][0]
                             )
-                        else:
+                        elif job.operation == "ml.char_wb_tfidf_logistic_score":
                             result_payload = execute_char_wb_tfidf_logistic_score(
                                 parsed_input
                             )
                             input_rows = len(parsed_input.get("rows", ()))
                             output_rows = len(result_payload["rows"])
+                        else:
+                            raise _ShardStageFailure(
+                                _execution_failure_code(ValueError(), stage="pack")
+                            )
                     except Exception as exc:  # noqa: BLE001
                         raise _ShardStageFailure(
                             _execution_failure_code(exc, stage="pack")

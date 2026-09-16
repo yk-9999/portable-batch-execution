@@ -29,7 +29,7 @@ jobs:
         with:
           python-version: "3.11"
       - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
-      - run: uv sync --dev
+      - run: uv sync --dev --extra distilbert
       - name: Install FFmpeg
         run: |
           sudo apt-get update
