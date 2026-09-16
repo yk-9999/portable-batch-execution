@@ -41,3 +41,4 @@ jobs:
           PBE_MODE: ${{ inputs.private && 'private' || 'public' }}
           PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}
           PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}
+          PBE_EXTERNAL_API_NVIDIA_API_KEY: ${{ inputs.private && secrets.PBE_EXTERNAL_API_NVIDIA_API_KEY || '' }}

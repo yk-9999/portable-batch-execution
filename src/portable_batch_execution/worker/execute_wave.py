@@ -29,6 +29,11 @@ from portable_batch_execution.packs.ml.cosine_similarity_matrix import (
 from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
     execute_distilbert_pair_binary_scores,
 )
+from portable_batch_execution.worker.external_api_evaluation import (
+    ExternalApiEvaluationError,
+    execute_nvidia_openai_compatible_request,
+    validate_closed_operation_params,
+)
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})
@@ -294,6 +299,16 @@ def execute_private_wave(
         if job.operation_params:
             raise ValueError("closed operation parameters")
         private_pack = "media-batch"
+    elif job.pack == "replay-eval-batch":
+        if job.operation != "replay_eval.external_api_evaluation":
+            raise ValueError("private wave operation is not available on the public runner")
+        if job.security_profile != "external-api":
+            raise ValueError("external API evaluation requires external-api security")
+        try:
+            validate_closed_operation_params(job.operation_params)
+        except ValueError as exc:
+            raise ValueError("closed operation parameters") from exc
+        private_pack = "replay-eval-batch"
     else:
         raise ValueError("private wave operation is not available on the public runner")
     prior = plane.read_attempts(run_id)
@@ -318,7 +333,43 @@ def execute_private_wave(
             current_attempt_count=len(current),
         )
         try:
-            if (
+            if private_pack == "replay-eval-batch":
+                if len(shard.input_refs) != 1:
+                    raise _ShardStageFailure("input_artifact_invalid")
+                input_ref = shard.input_refs[0]
+                payload = _read_verified_artifact_bytes(plane, input_ref)
+                try:
+                    text = payload.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise _ShardStageFailure(
+                        _execution_failure_code(exc, stage="input_decode")
+                    ) from None
+                try:
+                    parsed_input = json.loads(text)
+                except ValueError as exc:
+                    raise _ShardStageFailure(
+                        _execution_failure_code(exc, stage="input_parse")
+                    ) from None
+                if not isinstance(parsed_input, dict):
+                    raise _ShardStageFailure(
+                        _execution_failure_code(TypeError(), stage="input_parse")
+                    )
+                try:
+                    output = execute_nvidia_openai_compatible_request(payload)
+                except ExternalApiEvaluationError as exc:
+                    raise _ShardStageFailure(exc.code) from None
+                try:
+                    parsed_response = json.loads(output.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError):
+                    raise _ShardStageFailure("external_api_response_invalid") from None
+                if not isinstance(parsed_response, dict):
+                    raise _ShardStageFailure("external_api_response_invalid")
+                output_media_type = "application/json"
+                media_counts = {
+                    "input_bytes": len(payload),
+                    "output_bytes": len(output),
+                }
+            elif (
                 private_pack == "ml-batch"
                 and job.operation == "ml.distilbert_pair_binary_scores"
             ):
@@ -499,7 +550,7 @@ def execute_private_wave(
                 output_digest=sha256(output).hexdigest(),
                 counts=(
                     media_counts
-                    if private_pack == "media-batch"
+                    if private_pack in {"media-batch", "replay-eval-batch"}
                     else {"input_rows": input_rows, "output_rows": output_rows}
                 ),
             )
