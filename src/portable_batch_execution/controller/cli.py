@@ -169,7 +169,11 @@ def main(argv: list[str] | None = None) -> int:
             backend=backend,
             poll_interval_seconds=args.poll_interval_seconds,
         )
-        serve_unix_broker(socket_path=Path(args.socket_path), service=service)
+        serve_unix_broker(
+            socket_path=Path(args.socket_path),
+            service=service,
+            socket_mode=service.config.socket_mode,
+        )
         return 0
 
     parser.error("unknown command")

@@ -1,20 +1,34 @@
 import base64
 import json
+import os
+import socket
+import threading
 from datetime import UTC, datetime
 from hashlib import sha256
 from unittest.mock import patch
 
 import httpx
+import pytest
 
-from portable_batch_execution.backends.github_actions import GitHubActionsBackend
-from portable_batch_execution.broker.config import BrokerConfig
+from portable_batch_execution.backends.github_actions import (
+    GitHubActionsAPIError,
+    GitHubActionsBackend,
+)
+from portable_batch_execution.broker.config import BrokerConfig, max_request_frame_bytes
 from portable_batch_execution.broker.planning import (
     broker_execution_fingerprint,
     broker_input_digest,
     canonical_operation_params,
     opaque_run_id,
+    register_broker_private_run,
 )
+from portable_batch_execution.broker.server import _handle_connection, serve_unix_broker
 from portable_batch_execution.broker.service import UnixBrokerService
+from portable_batch_execution.broker.state import (
+    BrokerRequestState,
+    BrokerRequestStore,
+    RequestBinding,
+)
 from portable_batch_execution.contracts import ShardAttemptRecord
 from portable_batch_execution.controller.a1_controller import A1Controller
 
@@ -77,15 +91,47 @@ def _request(
     }
 
 
-def _service(tmp_path, config: BrokerConfig, handler) -> UnixBrokerService:
+def _service(
+    tmp_path,
+    config: BrokerConfig,
+    handler,
+    *,
+    sleeper=None,
+) -> UnixBrokerService:
     controller = A1Controller(tmp_path, backend=_mock_backend(handler))
     return UnixBrokerService(
         state_root=tmp_path,
         config=config,
         controller=controller,
         poll_interval_seconds=0.0,
-        sleeper=lambda _seconds: None,
+        sleeper=sleeper or (lambda _seconds: None),
     )
+
+
+def _failure_progress_sleeper(service: UnixBrokerService, request_id: str):
+    store = BrokerRequestStore(service.state_root / "controller")
+
+    def sleeper(_seconds: float) -> None:
+        state = store.load(request_id)
+        if state is None:
+            return
+        payload = service.controller.registry.resolve_wave(
+            state.logical_run_id, state.wave_id
+        )
+        shard = payload["shards"][0]
+        attempts = service.controller.data_plane.read_attempts(state.logical_run_id)
+        terminal = [
+            item
+            for item in attempts
+            if item.shard_id == shard["shard_id"]
+            and item.input_digest == shard["input_digest"]
+            and item.execution_fingerprint == shard["execution_fingerprint"]
+            and item.status in {"failed", "cancelled"}
+        ]
+        if state.dispatch_count > len(terminal) and len(terminal) < 4:
+            _append_failed_attempt(service.controller, request_id, f"fail-{len(terminal)}")
+
+    return sleeper
 
 
 def _append_success_attempt(controller: A1Controller, request_id: str, output: bytes):
@@ -308,7 +354,7 @@ def test_stale_attempts_do_not_consume_budget(tmp_path):
     assert dispatch_calls == 1
 
 
-def test_exactly_four_failures_exhausted_without_fifth_dispatch(tmp_path):
+def test_sequential_four_dispatches_then_exhausted_without_fifth(tmp_path):
     config = _config(tmp_path)
     dispatch_calls = 0
 
@@ -322,19 +368,18 @@ def test_exactly_four_failures_exhausted_without_fifth_dispatch(tmp_path):
             json={"status": "completed", "conclusion": "success", "updated_at": "t"},
         )
 
-    service = _service(tmp_path, config, handler)
-    real_dispatch = service.controller.dispatch_private_wave
-
-    def dispatch_fail_four(run_id, wave_id):
-        for index in range(4):
-            _append_failed_attempt(service.controller, "req-exhaust", f"fail-{index}")
-        return real_dispatch(run_id, wave_id)
-
-    with patch.object(service.controller, "dispatch_private_wave", dispatch_fail_four):
-        response = service.handle_payload(_UID, _request(request_id="req-exhaust"))
+    service = UnixBrokerService(
+        state_root=tmp_path,
+        config=config,
+        controller=A1Controller(tmp_path, backend=_mock_backend(handler)),
+        poll_interval_seconds=0.0,
+        sleeper=lambda _seconds: None,
+    )
+    service._sleep = _failure_progress_sleeper(service, "req-exhaust")
+    response = service.handle_payload(_UID, _request(request_id="req-exhaust"))
     assert response.status == "exhausted"
     assert response.error_code == "attempt_budget_exhausted"
-    assert dispatch_calls == 1
+    assert dispatch_calls == 4
     with patch.object(
         service.controller,
         "dispatch_private_wave",
@@ -342,6 +387,36 @@ def test_exactly_four_failures_exhausted_without_fifth_dispatch(tmp_path):
     ):
         again = service.handle_payload(_UID, _request(request_id="req-exhaust"))
     assert again.status == "exhausted"
+    assert dispatch_calls == 4
+
+
+def test_terminal_backend_before_attempt_record_does_not_redispatch(tmp_path):
+    config = _config(tmp_path)
+    dispatch_calls = 0
+    polls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(201, json={"workflow_run_id": 5, "html_url": "https://run"})
+        return httpx.Response(
+            200,
+            json={"status": "completed", "conclusion": "success", "updated_at": "t"},
+        )
+
+    class _PollLimit(RuntimeError):
+        pass
+
+    def sleeper(_seconds: float) -> None:
+        nonlocal polls
+        polls += 1
+        if polls >= 8:
+            raise _PollLimit()
+
+    service = _service(tmp_path, config, handler, sleeper=sleeper)
+    with pytest.raises(_PollLimit):
+        service.handle_payload(_UID, _request(request_id="req-wait"))
     assert dispatch_calls == 1
 
 
@@ -372,6 +447,233 @@ def test_response_does_not_leak_private_payload_or_secrets(tmp_path):
     blob = json.dumps(response.model_dump(mode="json"))
     assert _SENTINEL not in blob
     assert "plane-token" not in blob
+
+
+def test_backend_transient_error_preserves_durable_state(tmp_path):
+    config = _config(tmp_path)
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(201, json={"workflow_run_id": 6, "html_url": "https://run"})
+        return httpx.Response(500, json={"message": "rate limited"})
+
+    service = _service(tmp_path, config, handler)
+    response = service.handle_payload(_UID, _request(request_id="req-transient"))
+    assert response.status == "failed"
+    assert response.error_code == "backend_transient"
+    assert dispatch_calls == 1
+    state = BrokerRequestStore(service.state_root / "controller").load("req-transient")
+    assert state is not None and state.dispatch_count == 1
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair required")
+def test_server_survives_transient_backend_lookup(tmp_path):
+    config = _config(tmp_path)
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(201, json={"workflow_run_id": 6, "html_url": "https://run"})
+        return httpx.Response(500, json={"message": "rate limited"})
+
+    service = _service(tmp_path, config, handler)
+    client_sock, server_sock = socket.socketpair()
+    request = (json.dumps(_request(request_id="req-srv")) + "\n").encode()
+    client_sock.sendall(request)
+    with (
+        patch(
+            "portable_batch_execution.broker.server.read_peer_credentials",
+            return_value=(1, _UID, 1),
+        ),
+        patch.object(
+            service.controller.backend,
+            "get_run",
+            side_effect=GitHubActionsAPIError(
+                "get run",
+                httpx.Response(500, request=httpx.Request("GET", "https://api.github.com")),
+            ),
+        ),
+    ):
+        _handle_connection(server_sock, service)
+    response_line = client_sock.recv(65536)
+    client_sock.close()
+    server_sock.close()
+    payload = json.loads(response_line.decode())
+    assert payload["error_code"] == "backend_transient"
+
+
+def test_reconcile_updates_manifest_on_success(tmp_path):
+    config = _config(tmp_path)
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(201, json={"workflow_run_id": 8, "html_url": "https://run"})
+        return httpx.Response(
+            200,
+            json={"status": "completed", "conclusion": "success", "updated_at": "t"},
+        )
+
+    service = _service(tmp_path, config, handler)
+    real_dispatch = service.controller.dispatch_private_wave
+
+    def dispatch_with_success(run_id, wave_id):
+        ref = real_dispatch(run_id, wave_id)
+        _append_success_attempt(service.controller, "req-reconcile", b"[{\"id\":1}]")
+        return ref
+
+    with (
+        patch.object(service.controller, "dispatch_private_wave", dispatch_with_success),
+        patch.object(
+            service.controller, "reconcile_run", wraps=service.controller.reconcile_run
+        ) as reconcile,
+    ):
+        response = service.handle_payload(_UID, _request(request_id="req-reconcile"))
+    assert response.status == "succeeded"
+    assert reconcile.call_count >= 1
+    manifest = service.controller.data_plane.read_manifest(opaque_run_id("req-reconcile"))
+    assert manifest is not None and manifest.revision >= 1
+
+
+def test_registration_recovery_after_state_file_loss(tmp_path):
+    config = _config(tmp_path)
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(201, json={"workflow_run_id": 12, "html_url": "https://run"})
+        return httpx.Response(
+            200,
+            json={"status": "completed", "conclusion": "success", "updated_at": "t"},
+        )
+
+    service = _service(tmp_path, config, handler)
+    real_dispatch = service.controller.dispatch_private_wave
+
+    def dispatch_with_success(run_id, wave_id):
+        ref = real_dispatch(run_id, wave_id)
+        _append_success_attempt(service.controller, "req-recover", b"[{\"id\":1}]")
+        return ref
+
+    with patch.object(service.controller, "dispatch_private_wave", dispatch_with_success):
+        first = service.handle_payload(_UID, _request(request_id="req-recover"))
+    assert first.status == "succeeded"
+    state_path = BrokerRequestStore(service.state_root / "controller")._path("req-recover")
+    state_path.unlink()
+    second = service.handle_payload(_UID, _request(request_id="req-recover"))
+    assert second.status == "succeeded"
+
+
+def test_cancelled_attempts_count_toward_exhaustion(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    request = _request(request_id="req-cancel")
+    body = base64.b64decode(request["input_b64"])
+    params = canonical_operation_params("tabular-batch", "tabular.sort", request["operation_params"])
+    binding = RequestBinding(
+        input_digest=broker_input_digest(body),
+        pack="tabular-batch",
+        operation="tabular.sort",
+        operation_params=params,
+        execution_fingerprint=broker_execution_fingerprint(
+            request_id="req-cancel",
+            input_digest=broker_input_digest(body),
+            pack="tabular-batch",
+            operation="tabular.sort",
+            operation_params=params,
+            public_sha=_PUBLIC_SHA,
+        ),
+        public_sha=_PUBLIC_SHA,
+    )
+    register_broker_private_run(
+        state_root=tmp_path,
+        request_id="req-cancel",
+        pack="tabular-batch",
+        operation="tabular.sort",
+        operation_params=request["operation_params"],
+        input_bytes=body,
+        input_media_type="application/json",
+        public_sha=_PUBLIC_SHA,
+    )
+    BrokerRequestStore(service.state_root / "controller").save(
+        BrokerRequestState(
+            request_id="req-cancel",
+            binding=binding,
+            logical_run_id=opaque_run_id("req-cancel"),
+            wave_id=f"wave-{sha256(b'req-cancel').hexdigest()[:12]}",
+            shard_id="shard-000000",
+            status="active",
+        )
+    )
+    run_id = opaque_run_id("req-cancel")
+    wave_id = f"wave-{sha256(b'req-cancel').hexdigest()[:12]}"
+    payload = service.controller.registry.resolve_wave(run_id, wave_id)
+    shard = payload["shards"][0]
+    now = datetime.now(UTC)
+    for index in range(4):
+        service.controller.data_plane.append_attempt(
+            ShardAttemptRecord(
+                logical_run_id=run_id,
+                shard_id=shard["shard_id"],
+                attempt_id=f"cancel-{index}",
+                status="cancelled",
+                input_digest=shard["input_digest"],
+                execution_fingerprint=shard["execution_fingerprint"],
+                started_at=now,
+                finished_at=now,
+                failure="cancelled",
+            )
+        )
+    response = service.handle_payload(_UID, _request(request_id="req-cancel"))
+    assert response.status == "exhausted"
+
+
+def test_large_input_within_config_frame_bound(tmp_path):
+    max_bytes = 12 * 1024 * 1024
+    config = _config(tmp_path, max_input_bytes=max_bytes)
+    assert max_request_frame_bytes(max_bytes) > 8 * 1024 * 1024
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    payload = b"x" * (9 * 1024 * 1024)
+    assert (
+        service.handle_payload(_UID, _request(payload=payload)).error_code
+        != "input_invalid"
+    )
+    over = _request(payload=b"x" * (max_bytes + 1))
+    assert service.handle_payload(_UID, over).error_code == "input_invalid"
+
+
+def test_unauthorized_uid_rejected_before_registration(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    response = service.handle_payload(917, _request(request_id="req-deny"))
+    assert response.error_code == "peer_not_authorized"
+    run_dir = tmp_path / "controller" / "closed_waves" / opaque_run_id("req-deny")
+    assert not run_dir.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="AF_UNIX chmod test requires posix")
+def test_socket_mode_set_after_bind(tmp_path):  # pragma: no cover - posix only
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    socket_path = tmp_path / "broker.sock"
+    with patch("portable_batch_execution.broker.server.os.chmod") as chmod:
+        thread = threading.Thread(
+            target=serve_unix_broker,
+            kwargs={"socket_path": socket_path, "service": service},
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=0.5)
+    chmod.assert_called_with(socket_path.resolve(), config.socket_mode)
 
 
 def test_execution_fingerprint_binds_public_sha(tmp_path):

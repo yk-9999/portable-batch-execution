@@ -8,6 +8,17 @@ from pathlib import Path
 
 _FORBIDDEN_ID_CHARS = "/\\?#"
 _MAX_ID_LEN = 128
+_DEFAULT_MAX_INPUT_BYTES = 1_048_576
+_ABSOLUTE_MAX_INPUT_BYTES = 33_554_432
+_DEFAULT_SOCKET_MODE = 0o666
+_JSON_FRAME_OVERHEAD_BYTES = 65_536
+
+
+def max_request_frame_bytes(max_input_bytes: int) -> int:
+    if max_input_bytes <= 0 or max_input_bytes > _ABSOLUTE_MAX_INPUT_BYTES:
+        raise ValueError("max_input_bytes exceeds broker absolute bound")
+    encoded = ((max_input_bytes + 2) // 3) * 4
+    return encoded + _JSON_FRAME_OVERHEAD_BYTES
 
 
 def _opaque_identifier(value: str, name: str) -> str:
@@ -26,7 +37,12 @@ class BrokerConfig:
     schema_version: str
     public_sha: str
     max_input_bytes: int
+    socket_mode: int
     allowed_operations_by_uid: dict[int, frozenset[tuple[str, str]]]
+
+    @property
+    def max_request_frame_bytes(self) -> int:
+        return max_request_frame_bytes(self.max_input_bytes)
 
     @classmethod
     def load(cls, path: Path) -> BrokerConfig:
@@ -39,9 +55,14 @@ class BrokerConfig:
         public_sha = payload.get("public_sha")
         if not isinstance(public_sha, str) or not public_sha:
             raise ValueError("public_sha is required")
-        max_input_bytes = payload.get("max_input_bytes", 1_048_576)
+        max_input_bytes = payload.get("max_input_bytes", _DEFAULT_MAX_INPUT_BYTES)
         if not isinstance(max_input_bytes, int) or max_input_bytes <= 0:
             raise ValueError("max_input_bytes must be a positive integer")
+        if max_input_bytes > _ABSOLUTE_MAX_INPUT_BYTES:
+            raise ValueError("max_input_bytes exceeds broker absolute bound")
+        socket_mode = payload.get("socket_mode", _DEFAULT_SOCKET_MODE)
+        if not isinstance(socket_mode, int) or socket_mode < 0 or socket_mode > 0o777:
+            raise ValueError("socket_mode must be a unix permission mask")
         raw_allowlist = payload.get("allowed_operations_by_uid")
         if not isinstance(raw_allowlist, dict):
             raise TypeError("allowed_operations_by_uid is required")
@@ -67,6 +88,7 @@ class BrokerConfig:
             schema_version=version,
             public_sha=public_sha,
             max_input_bytes=max_input_bytes,
+            socket_mode=socket_mode,
             allowed_operations_by_uid=allowed,
         )
 

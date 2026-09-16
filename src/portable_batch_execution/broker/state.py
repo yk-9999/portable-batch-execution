@@ -45,6 +45,7 @@ class BrokerRequestState:
     output_sha256: str | None = None
     output_media_type: str | None = None
     dispatch_count: int = 0
+    last_dispatched_failure_count: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -66,6 +67,7 @@ class BrokerRequestState:
             "output_sha256": self.output_sha256,
             "output_media_type": self.output_media_type,
             "dispatch_count": self.dispatch_count,
+            "last_dispatched_failure_count": self.last_dispatched_failure_count,
         }
 
     @classmethod
@@ -94,6 +96,9 @@ class BrokerRequestState:
             output_sha256=payload.get("output_sha256"),
             output_media_type=payload.get("output_media_type"),
             dispatch_count=int(payload.get("dispatch_count", 0)),
+            last_dispatched_failure_count=int(
+                payload.get("last_dispatched_failure_count", 0)
+            ),
         )
 
 

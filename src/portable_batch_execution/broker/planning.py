@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import secrets
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
@@ -71,6 +70,11 @@ def opaque_wave_id(request_id: str) -> str:
     return f"wave-{sha256(request_id.encode('utf-8')).hexdigest()[:12]}"
 
 
+def broker_job_id(request_id: str, execution_fingerprint: str) -> str:
+    material = f"{request_id}\x1f{execution_fingerprint}".encode()
+    return f"broker-{sha256(material).hexdigest()[:16]}"
+
+
 def register_broker_private_run(
     *,
     state_root,
@@ -96,10 +100,25 @@ def register_broker_private_run(
     )
     run_id = opaque_run_id(request_id)
     wave_id = opaque_wave_id(request_id)
+    job_id = broker_job_id(request_id, execution_fingerprint)
+    try:
+        existing = registry.resolve_wave(run_id, wave_id)
+    except KeyError:
+        existing = None
+    if existing is not None:
+        job = JobSpec.model_validate(existing["job"])
+        if job.job_id != job_id:
+            raise ValueError("run already registered with a different job")
+        wave = WaveSpec.model_validate(existing["wave"])
+        shard = ShardSpec.model_validate(existing["shards"][0])
+        manifest = plane.read_manifest(run_id)
+        if manifest is None:
+            raise ValueError("registered run missing manifest")
+        return job, wave, shard, manifest
     input_ref = plane.write(input_bytes, input_media_type)
     now = datetime.now(UTC)
     job = JobSpec(
-        job_id=f"broker-{secrets.token_hex(8)}",
+        job_id=job_id,
         logical_run_id=run_id,
         pack=pack,
         operation=operation,

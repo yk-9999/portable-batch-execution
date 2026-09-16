@@ -22,10 +22,14 @@ from .planning import (
     broker_execution_fingerprint,
     broker_input_digest,
     canonical_operation_params,
+    opaque_run_id,
+    opaque_wave_id,
     register_broker_private_run,
 )
 from .protocol import BrokerExecuteRequest, BrokerExecuteResponse, parse_request
 from .state import BrokerRequestState, BrokerRequestStore, RequestBinding
+
+_TERMINAL_FAILURE_STATUSES = frozenset({"failed", "cancelled"})
 
 
 class UnixBrokerService:
@@ -72,14 +76,15 @@ class UnixBrokerService:
             )
         except ValueError:
             return self._failed(request.request_id, "operation_params_invalid")
+        input_digest = broker_input_digest(input_bytes)
         binding = RequestBinding(
-            input_digest=broker_input_digest(input_bytes),
+            input_digest=input_digest,
             pack=request.pack,
             operation=request.operation,
             operation_params=validated_params,
             execution_fingerprint=broker_execution_fingerprint(
                 request_id=request.request_id,
-                input_digest=broker_input_digest(input_bytes),
+                input_digest=input_digest,
                 pack=request.pack,
                 operation=request.operation,
                 operation_params=validated_params,
@@ -89,7 +94,14 @@ class UnixBrokerService:
         )
         state = self._store.load(request.request_id)
         if state is None:
-            state = self._register_request(request, binding, input_bytes)
+            run_id = opaque_run_id(request.request_id)
+            wave_id = opaque_wave_id(request.request_id)
+            try:
+                self.controller.registry.resolve_wave(run_id, wave_id)
+            except KeyError:
+                state = self._register_request(request, binding, input_bytes)
+            else:
+                state = self.recover_request_state(request, binding)
         elif not state.binding.matches(binding):
             return self._failed(request.request_id, "request_id_conflict")
         if state.status == "succeeded":
@@ -125,6 +137,15 @@ class UnixBrokerService:
         self._store.save(state)
         return state
 
+    def _reconcile(self, logical_run_id: str) -> None:
+        manifest = self.controller.data_plane.read_manifest(logical_run_id)
+        if manifest is None:
+            return
+        shards = self.controller.registry.load_shards_for_run(logical_run_id)
+        if not shards:
+            return
+        self.controller.reconcile_run(logical_run_id)
+
     def _drive_to_terminal(
         self, request_id: str, state: BrokerRequestState
     ) -> BrokerExecuteResponse:
@@ -140,8 +161,15 @@ class UnixBrokerService:
         from portable_batch_execution.contracts import JobSpec
 
         execution_policy = JobSpec.model_validate(job_payload["job"]).execution
+        max_dispatches = execution_policy.max_attempts_per_shard
         while True:
+            self._reconcile(state.logical_run_id)
             attempts = list(self.controller.data_plane.read_attempts(state.logical_run_id))
+            terminal_count = len(_matching_terminal_attempts(shard, attempts))
+            if terminal_count >= execution_policy.max_attempts_per_shard:
+                state.status = "exhausted"
+                self._store.save(state)
+                return self._exhausted(state)
             exhausted = exhausted_shards((shard,), attempts, execution_policy)
             if exhausted:
                 state.status = "exhausted"
@@ -157,6 +185,7 @@ class UnixBrokerService:
                 state.output_sha256 = digest
                 state.output_media_type = media_type
                 self._store.save(state)
+                self._reconcile(state.logical_run_id)
                 return BrokerExecuteResponse(
                     request_id=state.request_id,
                     status="succeeded",
@@ -169,27 +198,42 @@ class UnixBrokerService:
                     output_sha256=digest,
                     output_b64=base64.b64encode(output_bytes).decode("ascii"),
                 )
-            matching_failures = _matching_failed_attempts(shard, attempts)
-            if len(matching_failures) >= execution_policy.max_attempts_per_shard:
-                state.status = "exhausted"
-                self._store.save(state)
-                return self._exhausted(state)
-            backend_status = self._backend_status(state)
-            if state.dispatch_count == 0:
-                try:
-                    execution = self.controller.dispatch_private_wave(
-                        state.logical_run_id, state.wave_id
-                    )
-                except (ValueError, GitHubActionsAPIError):
-                    return self._failed(request_id, "dispatch_failed")
-                state.execution_id = execution.execution_id
-                state.dispatch_count = 1
-                self._store.save(state)
-                self._sleep(self.poll_interval_seconds)
-                continue
+            try:
+                backend_status = self._backend_status(state)
+            except GitHubActionsAPIError:
+                return self._failed(request_id, "backend_transient")
             if backend_status == "running":
                 self._sleep(self.poll_interval_seconds)
                 continue
+            if (
+                state.dispatch_count > 0
+                and terminal_count <= state.last_dispatched_failure_count
+            ):
+                self._sleep(self.poll_interval_seconds)
+                continue
+            should_dispatch = (
+                state.dispatch_count == 0
+                or (
+                    terminal_count > state.last_dispatched_failure_count
+                    and terminal_count < execution_policy.max_attempts_per_shard
+                    and state.dispatch_count < max_dispatches
+                )
+            )
+            if not should_dispatch:
+                self._sleep(self.poll_interval_seconds)
+                continue
+            try:
+                execution = self.controller.dispatch_private_wave(
+                    state.logical_run_id, state.wave_id
+                )
+            except GitHubActionsAPIError:
+                return self._failed(request_id, "backend_transient")
+            except ValueError:
+                return self._failed(request_id, "dispatch_failed")
+            state.execution_id = execution.execution_id
+            state.last_dispatched_failure_count = terminal_count
+            state.dispatch_count += 1
+            self._store.save(state)
             self._sleep(self.poll_interval_seconds)
 
     def _backend_status(self, state: BrokerRequestState) -> str | None:
@@ -212,6 +256,7 @@ class UnixBrokerService:
         return payload, media_type, f"sha256:{digest}"
 
     def _success_from_state(self, state: BrokerRequestState) -> BrokerExecuteResponse:
+        self._reconcile(state.logical_run_id)
         attempts = self.controller.data_plane.read_attempts(state.logical_run_id)
         shards = self.controller.registry.load_shards_for_run(state.logical_run_id)
         canonical, missing, duplicate = completeness(
@@ -254,15 +299,32 @@ class UnixBrokerService:
             error_code=error_code,
         )
 
+    def recover_request_state(self, request: BrokerExecuteRequest, binding: RequestBinding) -> BrokerRequestState:
+        """Rebuild durable broker state when registration exists but state file is missing."""
+        run_id = opaque_run_id(request.request_id)
+        wave_id = opaque_wave_id(request.request_id)
+        payload = self.controller.registry.resolve_wave(run_id, wave_id)
+        shard = payload["shards"][0]
+        state = BrokerRequestState(
+            request_id=request.request_id,
+            binding=binding,
+            logical_run_id=run_id,
+            wave_id=wave_id,
+            shard_id=shard["shard_id"],
+            status="active",
+        )
+        self._store.save(state)
+        return state
 
-def _matching_failed_attempts(shard, attempts) -> list[ShardAttemptRecord]:
+
+def _matching_terminal_attempts(shard, attempts) -> list[ShardAttemptRecord]:
     return [
         item
         for item in attempts
         if item.shard_id == shard.shard_id
         and item.input_digest == shard.input_digest
         and item.execution_fingerprint == shard.execution_fingerprint
-        and item.status == "failed"
+        and item.status in _TERMINAL_FAILURE_STATUSES
     ]
 
 
