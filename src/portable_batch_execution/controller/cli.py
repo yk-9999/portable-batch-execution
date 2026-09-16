@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 
 from portable_batch_execution.backends.github_actions import GitHubActionsBackend
+from portable_batch_execution.broker.server import serve_unix_broker
+from portable_batch_execution.broker.service import build_service_from_environment
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.data_plane.http_server import (
     serve_private_data_plane_from_environment,
@@ -94,6 +96,20 @@ def main(argv: list[str] | None = None) -> int:
     reconcile.add_argument("--run-id", required=True)
     reconcile.set_defaults(command="reconcile")
 
+    broker = sub.add_parser(
+        "serve-unix-broker",
+        help="Run the A1-local Unix-domain execution broker",
+    )
+    broker.add_argument("--state-root", required=True)
+    broker.add_argument("--socket-path", required=True)
+    broker.add_argument("--poll-interval-seconds", type=float, default=1.0)
+    broker.add_argument("--github-owner", required=True)
+    broker.add_argument("--github-repo", required=True)
+    broker.add_argument("--github-workflow", required=True)
+    broker.add_argument("--github-ref", default="main")
+    broker.add_argument("--github-token-file")
+    broker.set_defaults(command="serve-unix-broker")
+
     args = parser.parse_args(argv)
 
     if args.command == "serve-data-plane":
@@ -139,6 +155,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "reconcile":
         manifest = _controller(args).reconcile_run(args.run_id)
         print(json.dumps({"revision": manifest.revision, "status": manifest.status}))
+        return 0
+
+    if args.command == "serve-unix-broker":
+        import os
+
+        os.environ.setdefault("PBE_BROKER_CONFIG", os.environ.get("PBE_BROKER_CONFIG", ""))
+        if not os.environ.get("PBE_BROKER_CONFIG"):
+            parser.error("serve-unix-broker requires PBE_BROKER_CONFIG")
+        backend = _controller(args).backend
+        service = build_service_from_environment(
+            state_root=Path(args.state_root),
+            backend=backend,
+            poll_interval_seconds=args.poll_interval_seconds,
+        )
+        serve_unix_broker(socket_path=Path(args.socket_path), service=service)
         return 0
 
     parser.error("unknown command")

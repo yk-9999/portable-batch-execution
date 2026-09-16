@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pbe.a1-unix-broker.request.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "request_id",
+    "pack",
+    "operation",
+    "operation_params",
+    "input_media_type",
+    "input_b64"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "pbe.a1-unix-broker.request.v1"
+    },
+    "request_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "pack": {
+      "enum": ["tabular-batch", "ml-batch", "media-batch"]
+    },
+    "operation": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "operation_params": { "type": "object" },
+    "input_media_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "input_b64": { "type": "string", "minLength": 1 }
+  }
+}
