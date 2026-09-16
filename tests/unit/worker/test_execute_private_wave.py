@@ -354,6 +354,54 @@ def test_ml_char_wb_success_records_row_counts():
     assert [item["row_id"] for item in output["rows"]] == ["a", "b"]
 
 
+def test_ml_cosine_similarity_matrix_success_records_counts():
+    plane = _plane(
+        pack="ml-batch",
+        operation="ml.cosine_similarity_matrix",
+        ml_payload={
+            "left": [
+                {"row_id": "a", "vector": [1.0, 0.0]},
+                {"row_id": "b", "vector": [0.0, 1.0]},
+            ],
+            "right": [
+                {"row_id": "x", "vector": [1.0, 1.0]},
+                {"row_id": "y", "vector": [1.0, -1.0]},
+            ],
+        },
+    )
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert len(attempts) == 1
+    record = attempts[0]
+    assert record.status == "succeeded"
+    assert record.counts == {"input_rows": 4, "output_rows": 4}
+    output = json.loads(plane.last_written.decode())
+    assert output["left_ids"] == ["a", "b"]
+    assert output["right_ids"] == ["x", "y"]
+    assert len(output["scores"]) == 2
+    assert len(output["scores"][0]) == 2
+
+
+def test_ml_cosine_malformed_contract_records_sanitized_failure():
+    plane = _plane(
+        pack="ml-batch",
+        operation="ml.cosine_similarity_matrix",
+        ml_payload={
+            "left": [
+                {"row_id": "a", "vector": [1.0]},
+                {"row_id": "a", "vector": [_SENTINEL]},
+            ],
+            "right": [{"row_id": "x", "vector": [1.0]}],
+        },
+    )
+    with pytest.raises(PrivateWaveExecutionError) as error:
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    record = plane.appended[0]
+    assert record.status == "failed"
+    assert record.failure == "shard_pack_execution_failed"
+    assert _SENTINEL not in json.dumps(record.model_dump(mode="json"))
+    assert _SENTINEL not in str(error.value)
+
+
 def test_ml_malformed_contract_records_sanitized_failure():
     plane = _plane(
         pack="ml-batch",

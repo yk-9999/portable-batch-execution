@@ -23,6 +23,9 @@ from portable_batch_execution.packs import TabularPack
 from portable_batch_execution.packs.ml.char_wb_tfidf_logistic_score import (
     execute_char_wb_tfidf_logistic_score,
 )
+from portable_batch_execution.packs.ml.cosine_similarity_matrix import (
+    execute_cosine_similarity_matrix,
+)
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})
@@ -44,7 +47,12 @@ _PRIVATE_TABULAR_MULTI_INPUT_OPS = frozenset(
         "tabular.format_migration",
     }
 )
-_PRIVATE_ML_SINGLE_INPUT_OPS = frozenset({"ml.char_wb_tfidf_logistic_score"})
+_PRIVATE_ML_SINGLE_INPUT_OPS = frozenset(
+    {
+        "ml.char_wb_tfidf_logistic_score",
+        "ml.cosine_similarity_matrix",
+    }
+)
 
 
 class PrivateWaveExecutionError(RuntimeError):
@@ -303,14 +311,27 @@ def execute_private_wave(
                         _execution_failure_code(TypeError(), stage="input_parse")
                     )
                 try:
-                    result_payload = execute_char_wb_tfidf_logistic_score(parsed_input)
+                    if job.operation == "ml.cosine_similarity_matrix":
+                        result_payload = execute_cosine_similarity_matrix(
+                            parsed_input
+                        )
+                        input_rows = len(parsed_input["left"]) + len(
+                            parsed_input["right"]
+                        )
+                        output_rows = len(result_payload["scores"]) * len(
+                            result_payload["scores"][0]
+                        )
+                    else:
+                        result_payload = execute_char_wb_tfidf_logistic_score(
+                            parsed_input
+                        )
+                        input_rows = len(parsed_input.get("rows", ()))
+                        output_rows = len(result_payload["rows"])
                 except Exception as exc:  # noqa: BLE001
                     raise _ShardStageFailure(
                         _execution_failure_code(exc, stage="pack")
                     ) from None
                 output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
-                input_rows = len(parsed_input.get("rows", ()))
-                output_rows = len(result_payload["rows"])
             try:
                 output_ref = plane.write(output, "application/json")
             except Exception as exc:  # noqa: BLE001
