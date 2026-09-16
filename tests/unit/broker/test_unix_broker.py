@@ -390,34 +390,105 @@ def test_sequential_four_dispatches_then_exhausted_without_fifth(tmp_path):
     assert dispatch_calls == 4
 
 
-def test_terminal_backend_before_attempt_record_does_not_redispatch(tmp_path):
+def test_terminal_backend_without_attempt_triggers_retry(tmp_path):
     config = _config(tmp_path)
     dispatch_calls = 0
-    polls = 0
 
     def handler(request):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 5, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": dispatch_calls, "html_url": "https://run"}
+            )
         return httpx.Response(
             200,
-            json={"status": "completed", "conclusion": "success", "updated_at": "t"},
+            json={"status": "completed", "conclusion": "failure", "updated_at": "t"},
         )
 
     class _PollLimit(RuntimeError):
         pass
 
     def sleeper(_seconds: float) -> None:
-        nonlocal polls
-        polls += 1
-        if polls >= 8:
+        if dispatch_calls >= 2:
             raise _PollLimit()
 
     service = _service(tmp_path, config, handler, sleeper=sleeper)
     with pytest.raises(_PollLimit):
-        service.handle_payload(_UID, _request(request_id="req-wait"))
-    assert dispatch_calls == 1
+        service.handle_payload(_UID, _request(request_id="req-zero-attempt-retry"))
+    assert dispatch_calls == 2
+
+
+def test_four_terminal_zero_attempt_executions_exhaust_without_fifth_dispatch(tmp_path):
+    config = _config(tmp_path)
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(
+                201, json={"workflow_run_id": dispatch_calls, "html_url": "https://run"}
+            )
+        return httpx.Response(
+            200,
+            json={"status": "completed", "conclusion": "cancelled", "updated_at": "t"},
+        )
+
+    service = _service(
+        tmp_path,
+        config,
+        handler,
+        sleeper=lambda _seconds: None,
+    )
+    response = service.handle_payload(
+        _UID, _request(request_id="req-zero-attempt-exhaust")
+    )
+    assert response.status == "exhausted"
+    assert response.error_code == "attempt_budget_exhausted"
+    assert dispatch_calls == 4
+    with patch.object(
+        service.controller,
+        "dispatch_private_wave",
+        side_effect=AssertionError("must not dispatch after exhaustion"),
+    ):
+        again = service.handle_payload(
+            _UID, _request(request_id="req-zero-attempt-exhaust")
+        )
+    assert again.status == "exhausted"
+    assert dispatch_calls == 4
+
+
+def test_mixed_zero_attempt_then_failure_attempt_still_retries(tmp_path):
+    config = _config(tmp_path)
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(
+                201, json={"workflow_run_id": dispatch_calls, "html_url": "https://run"}
+            )
+        return httpx.Response(
+            200,
+            json={"status": "completed", "conclusion": "failure", "updated_at": "t"},
+        )
+
+    service = _service(tmp_path, config, handler, sleeper=lambda _seconds: None)
+    store = BrokerRequestStore(service.state_root / "controller")
+
+    def sleeper(_seconds: float) -> None:
+        state = store.load("req-mixed")
+        if state is None or state.dispatch_count < 2:
+            return
+        if state.dispatch_count == 2:
+            _append_failed_attempt(service.controller, "req-mixed", "fail-1")
+
+    service._sleep = sleeper
+    response = service.handle_payload(_UID, _request(request_id="req-mixed"))
+    assert response.status == "exhausted"
+    assert dispatch_calls == 4
 
 
 def test_response_does_not_leak_private_payload_or_secrets(tmp_path):
@@ -777,7 +848,7 @@ def test_dispatch_history_sync_prevents_duplicate_submit_after_crash(tmp_path):
             return httpx.Response(201, json={"workflow_run_id": 21, "html_url": "https://run"})
         return httpx.Response(
             200,
-            json={"status": "completed", "conclusion": "success", "updated_at": "t"},
+            json={"status": "in_progress", "conclusion": None, "updated_at": "t"},
         )
 
     class _PollLimit(RuntimeError):
