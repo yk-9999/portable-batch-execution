@@ -81,11 +81,43 @@ class HttpPrivateDataPlane:
         return self._request("read artifact", "GET", f"/v1/artifacts/{self._part(ref.object_id, 'artifact object_id')}/content").content
 
     @staticmethod
+    def _resolve_bounded_stream_size(
+        ref: ArtifactRef, response: httpx.Response
+    ) -> int:
+        header_value = response.headers.get("content-length")
+        header_size: int | None = None
+        if header_value is not None:
+            try:
+                header_size = int(header_value)
+            except ValueError as exc:
+                raise PrivateDataPlaneError(
+                    "private data plane read artifact failed"
+                ) from exc
+            if header_size < 0:
+                raise PrivateDataPlaneError("private data plane read artifact failed")
+        if (
+            header_size is not None
+            and ref.size_bytes is not None
+            and header_size != ref.size_bytes
+        ):
+            raise PrivateDataPlaneError("private data plane read artifact failed")
+        if header_size is not None:
+            return header_size
+        if ref.size_bytes is not None:
+            return ref.size_bytes
+        raise PrivateDataPlaneError("private data plane read artifact failed")
+
+    @staticmethod
     def _iter_response_chunks(response: httpx.Response) -> Iterator[bytes]:
         try:
-            for chunk in response.iter_bytes(_ARTIFACT_CHUNK_BYTES):
-                if chunk:
-                    yield chunk
+            try:
+                for chunk in response.iter_bytes(_ARTIFACT_CHUNK_BYTES):
+                    if chunk:
+                        yield chunk
+            except httpx.HTTPError as exc:
+                raise PrivateDataPlaneError(
+                    "private data plane read artifact failed"
+                ) from exc
         finally:
             response.close()
 
@@ -102,20 +134,11 @@ class HttpPrivateDataPlane:
             raise PrivateDataPlaneError(
                 f"private data plane read artifact failed with HTTP {response.status_code}"
             )
-        content_length = response.headers.get("content-length")
-        if content_length is None:
-            response.close()
-            raise PrivateDataPlaneError("private data plane read artifact failed")
         try:
-            size_bytes = int(content_length)
-        except ValueError as exc:
+            size_bytes = self._resolve_bounded_stream_size(ref, response)
+        except PrivateDataPlaneError:
             response.close()
-            raise PrivateDataPlaneError("private data plane read artifact failed") from exc
-        if size_bytes < 0 or (
-            ref.size_bytes is not None and size_bytes != ref.size_bytes
-        ):
-            response.close()
-            raise PrivateDataPlaneError("private data plane read artifact failed")
+            raise
         return ArtifactContentStream(
             size_bytes=size_bytes,
             chunks=self._iter_response_chunks(response),

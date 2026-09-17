@@ -736,3 +736,49 @@ def test_private_wave_json_record_array_input_remains_compatible():
     assert len(attempts) == 1
     assert attempts[0].status == "succeeded"
     assert attempts[0].counts == {"input_rows": 2, "output_rows": 2}
+
+def test_private_wave_parquet_oversize_stream_fails_before_pack_execution():
+    import io
+
+    import polars as pl
+
+    buffer = io.BytesIO()
+    pl.DataFrame({"group": ["a"], "value": [1]}).write_parquet(buffer)
+    payload = buffer.getvalue()
+    plane = _plane(
+        binary_payload=payload,
+        input_ref_overrides={
+            "media_type": "application/vnd.apache.parquet",
+            "size_bytes": 10,
+        },
+    )
+
+    def open_content(ref):
+        return ArtifactContentStream(size_bytes=10, chunks=iter([payload[:11]]))
+
+    plane.open_content = open_content
+    with patch(
+        "portable_batch_execution.worker.execute_wave.TabularPack.execute"
+    ) as execute:
+        with pytest.raises(PrivateWaveExecutionError):
+            execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+        execute.assert_not_called()
+    assert plane.appended[0].failure == "input_artifact_mismatch"
+
+def test_parquet_row_count_uses_scan_not_eager_read_parquet(tmp_path):
+    import io
+
+    import polars as pl
+
+    from portable_batch_execution.worker.execute_wave import _parquet_row_count
+
+    buffer = io.BytesIO()
+    pl.DataFrame({"group": ["a", "a"], "value": [1, 2]}).write_parquet(buffer)
+    path = tmp_path / "input.parquet"
+    path.write_bytes(buffer.getvalue())
+
+    with patch.object(
+        pl, "read_parquet", side_effect=AssertionError("read_parquet must not be used")
+    ), patch.object(pl, "scan_parquet", wraps=pl.scan_parquet) as scan:
+        assert _parquet_row_count(path) == 2
+        scan.assert_called_once()

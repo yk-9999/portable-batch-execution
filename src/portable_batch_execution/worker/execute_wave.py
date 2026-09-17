@@ -167,25 +167,41 @@ def _materialize_verified_artifact(
     plane, ref: ArtifactRef, destination: Path
 ) -> None:
     stream = _open_artifact_content_stream(plane, ref)
+    expected_size = stream.size_bytes
     digest = sha256()
     total = 0
     try:
         with destination.open("wb") as handle:
             for chunk in stream.chunks:
+                chunk_len = len(chunk)
+                if total + chunk_len > expected_size:
+                    raise _ShardStageFailure("input_artifact_mismatch")
                 digest.update(chunk)
-                total += len(chunk)
+                total += chunk_len
                 handle.write(chunk)
+    except _ShardStageFailure:
+        destination.unlink(missing_ok=True)
+        raise
     except Exception as exc:  # noqa: BLE001
         destination.unlink(missing_ok=True)
         raise _ShardStageFailure(
             _execution_failure_code(exc, stage="input_read")
         ) from None
+    if total != expected_size:
+        destination.unlink(missing_ok=True)
+        raise _ShardStageFailure("input_artifact_mismatch")
     if ref.size_bytes is not None and total != ref.size_bytes:
         destination.unlink(missing_ok=True)
         raise _ShardStageFailure("input_artifact_mismatch")
     if f"sha256:{digest.hexdigest()}" != ref.sha256:
         destination.unlink(missing_ok=True)
         raise _ShardStageFailure("input_artifact_mismatch")
+
+
+def _parquet_row_count(path: Path) -> int:
+    import polars as pl
+
+    return int(pl.scan_parquet(str(path)).select(pl.len()).collect().item())
 
 
 def _private_tabular_single_input_is_parquet(
@@ -450,9 +466,7 @@ def execute_private_wave(
                         input_path = Path(temporary) / "input.parquet"
                         _materialize_verified_artifact(plane, input_ref, input_path)
                         try:
-                            import polars as pl
-
-                            input_rows = pl.read_parquet(input_path).height
+                            input_rows = _parquet_row_count(input_path)
                             result = pack.execute(
                                 job,
                                 shard,

@@ -179,3 +179,70 @@ def test_http_plane_open_content_maps_timeouts_to_sanitized_error():
     assert str(error.value) == "private data plane read artifact failed"
     assert "secret" not in str(error.value)
 
+
+def test_http_plane_open_content_falls_back_to_ref_size_without_content_length():
+    data = b"bounded-by-ref"
+    ref = ArtifactRef(
+        object_id="opaque-object",
+        uri="pbe://private/opaque-object",
+        sha256="sha256:" + sha256(data).hexdigest(),
+        size_bytes=len(data),
+    )
+
+    def handler(request):
+        return httpx.Response(200, content=data)
+
+    plane = HttpPrivateDataPlane(
+        "https://plane.example",
+        "token",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    stream = plane.open_content(ref)
+    assert stream.size_bytes == len(data)
+    assert b"".join(stream.chunks) == data
+
+
+def test_http_plane_open_content_fails_closed_without_finite_size_identity():
+    ref = ArtifactRef(
+        object_id="opaque-object",
+        uri="pbe://private/opaque-object",
+        sha256="sha256:" + sha256(b"x").hexdigest(),
+    )
+
+    def handler(request):
+        return httpx.Response(200, stream=httpx.ByteStream(b"x"))
+
+    plane = HttpPrivateDataPlane(
+        "https://plane.example",
+        "token",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(PrivateDataPlaneError) as error:
+        plane.open_content(ref)
+    assert str(error.value) == "private data plane read artifact failed"
+
+
+def test_http_plane_open_content_rejects_conflicting_header_and_ref_size():
+    data = b"0123456789"
+    ref = ArtifactRef(
+        object_id="opaque-object",
+        uri="pbe://private/opaque-object",
+        sha256="sha256:" + sha256(data).hexdigest(),
+        size_bytes=len(data),
+    )
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"Content-Length": str(len(data) + 1)},
+            content=data,
+        )
+
+    plane = HttpPrivateDataPlane(
+        "https://plane.example",
+        "token",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(PrivateDataPlaneError):
+        plane.open_content(ref)
+
