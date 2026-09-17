@@ -426,3 +426,106 @@ def test_multi_shard_deterministic_equivalence(tmp_path):
         ),
     )["rows"]
     assert combined == single
+
+
+def test_non_contiguous_same_file_duplicate_identity_fail_closed(tmp_path):
+    path = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000),
+            _trade_row(identity=2, identity_norm="2", block=91, timestamp_ms=8_100),
+            _trade_row(identity=1, identity_norm="1", block=92, timestamp_ms=8_200),
+        ],
+    )
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_causal_grid_extract([path], _request())
+
+
+def test_cross_shard_duplicate_identity_fail_closed(tmp_path):
+    path_a = _write(
+        tmp_path / "a.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000),
+            _trade_row(identity=2, identity_norm="2", block=91, timestamp_ms=8_050),
+        ],
+    )
+    path_b = _write(
+        tmp_path / "b.parquet",
+        [_trade_row(identity=1, identity_norm="1", block=92, timestamp_ms=8_100)],
+    )
+    witness = _write(tmp_path / "w.parquet", [_witness_row(block=90, timestamp_ms=8_000)])
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_causal_grid_extract(
+            [path_a, path_b, witness],
+            _request(
+                input_roles=(
+                    {"input_index": 0, "role": "canonical_trade"},
+                    {"input_index": 1, "role": "canonical_trade"},
+                    {"input_index": 2, "role": "causal_witness"},
+                ),
+            ),
+        )
+
+
+def test_conflicting_duplicate_core_fail_closed(tmp_path):
+    path = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, price=10.0),
+            _trade_row(identity=1, identity_norm="1", block=91, timestamp_ms=8_100, price=11.0),
+        ],
+    )
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_causal_grid_extract([path], _request())
+
+
+def test_output_row_bound_fail_closed(tmp_path):
+    path = _write(tmp_path / "trades.parquet", [_trade_row(timestamp_ms=9_000)])
+    request = _request(
+        target_symbols=("AAA", "BBB", "CCC"),
+        emit_grid={
+            "start_timestamp_ms": 10_000,
+            "end_timestamp_ms": 10_000,
+            "step_ms": 5_000,
+        },
+        max_output_rows=2,
+    )
+    with pytest.raises(ValueError, match="output row count exceeds limit"):
+        execute_causal_grid_extract([path], request)
+
+
+def test_rolling_window_eviction_at_carry_boundary(tmp_path):
+    trades = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=40_000, notional=1.0),
+            _trade_row(identity=2, identity_norm="2", block=95, timestamp_ms=80_000, notional=2.0),
+            _trade_row(identity=3, identity_norm="3", block=100, timestamp_ms=120_000, notional=4.0),
+        ],
+    )
+    witness = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=10, timestamp_ms=30_000),
+            _witness_row(block=20, timestamp_ms=50_000),
+            _witness_row(block=30, timestamp_ms=90_000),
+            _witness_row(block=40, timestamp_ms=130_000),
+        ],
+    )
+    first = _request(
+        input_roles=(
+            {"input_index": 0, "role": "canonical_trade"},
+            {"input_index": 1, "role": "causal_witness"},
+        ),
+        emit_grid={"start_timestamp_ms": 50_000, "end_timestamp_ms": 80_000, "step_ms": 10_000},
+        partition={
+            "emit_start_ms": 50_000,
+            "emit_end_ms": 80_000,
+            "overlap_ms": 70_000,
+            "hard_gap_missing_dates": (),
+        },
+    )
+    first_result = execute_causal_grid_extract([trades, witness], first)
+    carry = first_result["outgoing_carry"]
+    assert carry["schema_version"] == "pbe.replay.causal-grid-carry.v2"
+    assert all(row["exchange_time_ms"] >= 10_000 for row in carry["trade_rows"])

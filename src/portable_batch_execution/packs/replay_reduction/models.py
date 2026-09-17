@@ -128,7 +128,7 @@ class EmitGridSpec(Frozen):
 
 
 class CausalGridCarryState(Frozen):
-    schema_version: Literal["pbe.replay.causal-grid-carry.v1"]
+    schema_version: Literal["pbe.replay.causal-grid-carry.v1", "pbe.replay.causal-grid-carry.v2"]
     causal_observations: tuple[tuple[int, int, int], ...] = ()
     trade_rows: tuple[dict[str, Any], ...] = ()
 
@@ -164,6 +164,7 @@ class CausalGridExtractRequest(Frozen):
     as_of_offsets_ms: tuple[int, ...] = (0, 5000)
     trailing_windows: tuple[TrailingWindowSpec, ...] = ()
     tie_break_columns: tuple[str, ...] = ("timestamp_ms",)
+    max_output_rows: int = Field(default=500_000, ge=1, le=10_000_000)
 
     @model_validator(mode="after")
     def _roles_cover_inputs(self) -> CausalGridExtractRequest:
