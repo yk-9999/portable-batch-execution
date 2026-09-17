@@ -426,6 +426,43 @@ def test_sentinel_and_positive_rows_still_pass_after_identity_core_guards(tmp_pa
     assert result.positive_group_count == 1
 
 
+@pytest.mark.parametrize(
+    "identity_value,schema",
+    [
+        (1.5, {"identity": pl.Float64}),
+        (True, {"identity": pl.Boolean}),
+        (float("nan"), {"identity": pl.Float64}),
+        (float("inf"), {"identity": pl.Float64}),
+    ],
+)
+def test_rejects_lossy_or_non_integer_source_identity_singleton(
+    tmp_path, identity_value, schema
+):
+    path = tmp_path / "part.parquet"
+    pl.DataFrame(
+        [{"identity": identity_value, "identity_norm": "1", "price": 1.0}],
+        schema={
+            **schema,
+            "identity_norm": pl.Utf8,
+            "price": pl.Float64,
+        },
+    ).write_parquet(path)
+    with pytest.raises(StructuralCanonicalizeError, match="identity is missing or not positive"):
+        execute_structural_canonicalize([path], _PARAMS)
+
+
+def test_multi_shard_rejects_lossy_source_identity(tmp_path):
+    good = tmp_path / "good.parquet"
+    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(good)
+    bad = tmp_path / "bad.parquet"
+    pl.DataFrame(
+        [{"identity": 2.5, "identity_norm": "2", "price": 2.0}],
+        schema={"identity": pl.Float64, "identity_norm": pl.Utf8, "price": pl.Float64},
+    ).write_parquet(bad)
+    with pytest.raises(StructuralCanonicalizeError, match="identity is missing or not positive"):
+        execute_structural_canonicalize([good, bad], _PARAMS)
+
+
 def test_roundtrip_preserves_state_across_binary_buckets(tmp_path):
     state = _state(
         tmp_path,

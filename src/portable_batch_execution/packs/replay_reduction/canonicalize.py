@@ -131,6 +131,21 @@ def _positive_null_core_expr(core_fields: list[str]) -> pl.Expr:
     return pl.any_horizontal([pl.col(field).is_null() for field in core_fields])
 
 
+def _source_identity_malformed_expr(identity_col: str, identity_dtype: pl.DataType) -> pl.Expr:
+    if identity_dtype == pl.Boolean:
+        return pl.lit(True)
+    source = pl.col(identity_col)
+    cast_int = source.cast(pl.Int64, strict=False)
+    cast_float = source.cast(pl.Float64, strict=False)
+    return (
+        source.is_null()
+        | cast_int.is_null()
+        | cast_float.is_null()
+        | ~cast_float.is_finite()
+        | (cast_float != cast_float.floor())
+    )
+
+
 def _boundary_profile(row: dict[str, Any], core_fields: list[str]) -> dict[str, Any]:
     return {
         "identity": int(row["_identity_int"]),
@@ -391,7 +406,19 @@ def _single_input_state(
     if sentinel is not None:
         required = required + tuple(sentinel.exact_match_fields)
     _require_columns(lazy.collect_schema(), required)
-    lazy = lazy.with_row_index("_row_index").with_columns(
+    identity_dtype = lazy.collect_schema()[identity_col]
+    lazy = lazy.with_row_index("_row_index")
+    if (
+        int(
+            lazy.filter(_source_identity_malformed_expr(identity_col, identity_dtype))
+            .select(pl.len())
+            .collect()
+            .item()
+        )
+        > 0
+    ):
+        raise StructuralCanonicalizeError("identity is missing or not positive")
+    lazy = lazy.with_columns(
         pl.col(identity_col).cast(pl.Int64, strict=False).alias("_identity_int"),
     )
 
