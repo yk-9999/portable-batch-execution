@@ -556,7 +556,9 @@ def test_rolling_window_eviction_at_carry_boundary(tmp_path):
     )
     first_result = execute_causal_grid_extract([trades, witness], first)
     carry = first_result["outgoing_carry"]
-    assert carry["schema_version"] == "pbe.replay.causal-grid-carry.v3"
+    assert carry["schema_version"] == "pbe.replay.causal-grid-carry.v4"
+    assert len(carry["causal_segment_frontiers"]) <= 2
+    assert carry["causal_block_first_ms"] == ()
     assert all(row["exchange_time_ms"] >= 10_000 for row in carry["trade_rows"])
 
 
@@ -595,7 +597,25 @@ def test_unsorted_witness_matches_sorted_equivalent(tmp_path):
     assert sorted_rows == unsorted_rows
 
 
-def test_large_observation_count_does_not_hit_history_cap(tmp_path):
+def _frozen_causal_cutoff(
+    observations: list[tuple[int, int]],
+    *,
+    decision_time_ms: int,
+    monotone_ok: bool = True,
+) -> int | None:
+    if not monotone_ok:
+        return None
+    eligible = {block for time_ms, block in observations if time_ms <= decision_time_ms}
+    if len(eligible) < 2:
+        return None
+    witness = max(eligible)
+    lower = [block for block in eligible if block < witness]
+    if not lower:
+        return None
+    return max(lower)
+
+
+def test_large_observation_count_compact_carry_and_cutoff(tmp_path):
     witness_rows = [
         _witness_row(block=100 + index, timestamp_ms=8_000 + index)
         for index in range(80_000)
@@ -605,6 +625,41 @@ def test_large_observation_count_does_not_hit_history_cap(tmp_path):
         [_trade_row(identity=1, identity_norm="1", block=200_000, timestamp_ms=100_000)],
     )
     witness = _write(tmp_path / "w.parquet", witness_rows)
+    result = execute_causal_grid_extract(
+        [trades, witness],
+        _request(
+            input_roles=(
+                {"input_index": 0, "role": "canonical_trade"},
+                {"input_index": 1, "role": "causal_witness"},
+            ),
+        ),
+    )
+    row = result["rows"][0]
+    carry = result["outgoing_carry"]
+    observations = [(8_000 + index, 100 + index) for index in range(80_000)]
+    assert row["causal_cutoff_block"] == _frozen_causal_cutoff(
+        observations,
+        decision_time_ms=10_000,
+    )
+    assert carry["schema_version"] == "pbe.replay.causal-grid-carry.v4"
+    assert len(carry["causal_segment_frontiers"]) == 1
+    assert carry["causal_block_first_ms"] == ()
+
+
+def test_causal_frontier_block_transitions_and_repeated_block(tmp_path):
+    witness = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=100, timestamp_ms=8_000),
+            _witness_row(block=100, timestamp_ms=8_500),
+            _witness_row(block=150, timestamp_ms=9_000),
+            _witness_row(block=200, timestamp_ms=9_500),
+        ],
+    )
+    trades = _write(
+        tmp_path / "trades.parquet",
+        [_trade_row(identity=1, identity_norm="1", block=200, timestamp_ms=100_000)],
+    )
     row = execute_causal_grid_extract(
         [trades, witness],
         _request(
@@ -614,4 +669,47 @@ def test_large_observation_count_does_not_hit_history_cap(tmp_path):
             ),
         ),
     )["rows"][0]
-    assert row["causal_cutoff_block"] is not None
+    expected = _frozen_causal_cutoff(
+        [(8_000, 100), (8_500, 100), (9_000, 150), (9_500, 200)],
+        decision_time_ms=10_000,
+    )
+    assert row["causal_cutoff_block"] == expected == 150
+
+
+def test_same_timestamp_witness_block_excluded_from_cutoff(tmp_path):
+    trades = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=100, timestamp_ms=10_000, price=1.0),
+            _trade_row(
+                identity=2,
+                identity_norm="2",
+                block=110,
+                timestamp_ms=10_000,
+                price=2.0,
+                seq=1,
+            ),
+        ],
+    )
+    witness = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=90, timestamp_ms=8_000),
+            _witness_row(block=110, timestamp_ms=10_000),
+        ],
+    )
+    row = execute_causal_grid_extract(
+        [trades, witness],
+        _request(
+            input_roles=(
+                {"input_index": 0, "role": "canonical_trade"},
+                {"input_index": 1, "role": "causal_witness"},
+            ),
+            emit_grid={
+                "start_timestamp_ms": 10_000,
+                "end_timestamp_ms": 10_000,
+                "step_ms": 5_000,
+            },
+        ),
+    )["rows"][0]
+    assert row["causal_cutoff_block"] == 100

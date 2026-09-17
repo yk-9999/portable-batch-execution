@@ -132,9 +132,11 @@ class CausalGridCarryState(Frozen):
         "pbe.replay.causal-grid-carry.v1",
         "pbe.replay.causal-grid-carry.v2",
         "pbe.replay.causal-grid-carry.v3",
+        "pbe.replay.causal-grid-carry.v4",
     ]
     causal_observations: tuple[tuple[int, int, int], ...] = ()
     causal_block_first_ms: tuple[tuple[int, int, int], ...] = ()
+    causal_segment_frontiers: tuple[tuple[int, int, int, int, int, bool], ...] = ()
     trade_rows: tuple[dict[str, Any], ...] = ()
 
 

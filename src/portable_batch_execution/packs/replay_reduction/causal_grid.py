@@ -30,7 +30,8 @@ from .spill_sort import (
 )
 
 RESULT_SCHEMA_VERSION = "pbe.replay.causal-grid-extract-result.v1"
-CARRY_SCHEMA_VERSION = "pbe.replay.causal-grid-carry.v3"
+CARRY_SCHEMA_VERSION = "pbe.replay.causal-grid-carry.v4"
+_CARRY_ABSENT_INT = -1
 _BUCKET_SPILL_BATCH = 65_536
 _COLLAPSED_RUN_BATCH = 65_536
 
@@ -60,15 +61,38 @@ def _segment_id(ms: int, missing_dates: frozenset[str]) -> int:
     return segment
 
 
+def _carry_int(value: int | None) -> int:
+    return _CARRY_ABSENT_INT if value is None else int(value)
+
+
+def _carry_int_or_none(value: int) -> int | None:
+    return None if value == _CARRY_ABSENT_INT else int(value)
+
+
 @dataclass
 class _CausalSegmentFrontier:
-    """Compact per-segment block frontier for frozen causal cutoff semantics."""
+    """O(1) completed-block frontier matching frozen CausalBlockState on monotone streams."""
 
     segment_id: int
     monotone_ok: bool = True
     last_time: int | None = None
     last_block: int | None = None
-    block_first_ms: dict[int, int] = field(default_factory=dict)
+    primary_block: int | None = None
+    secondary_block: int | None = None
+
+    def _register_block(self, block_number: int) -> None:
+        block = int(block_number)
+        if self.primary_block is None:
+            self.primary_block = block
+            return
+        if block > self.primary_block:
+            self.secondary_block = self.primary_block
+            self.primary_block = block
+            return
+        if block < self.primary_block and (
+            self.secondary_block is None or block > self.secondary_block
+        ):
+            self.secondary_block = block
 
     def observe(self, *, exchange_time_ms: int, block_number: int) -> None:
         if (
@@ -83,41 +107,39 @@ class _CausalSegmentFrontier:
             )
         ):
             self.monotone_ok = False
-        prior = self.block_first_ms.get(block_number)
-        if prior is None or exchange_time_ms < prior:
-            self.block_first_ms[block_number] = exchange_time_ms
+        self._register_block(block_number)
         self.last_time = exchange_time_ms
         self.last_block = block_number
 
     def causal_cutoff_block(self, decision_time_ms: int) -> int | None:
+        del decision_time_ms
         if not self.monotone_ok:
             return None
-        eligible = [
-            block
-            for block, first_ms in self.block_first_ms.items()
-            if first_ms <= decision_time_ms
-        ]
-        if len(eligible) < 2:
+        if self.primary_block is None or self.secondary_block is None:
             return None
-        witness = max(eligible)
-        lower = [block for block in eligible if block < witness]
-        if not lower:
-            return None
-        return max(lower)
+        return self.secondary_block
 
-    def export_block_first_ms(self) -> tuple[tuple[int, int, int], ...]:
-        return tuple(
-            (self.segment_id, block, first_ms)
-            for block, first_ms in sorted(self.block_first_ms.items())
+    def export_compact(self) -> tuple[int, int, int, int, int, bool]:
+        return (
+            self.segment_id,
+            _carry_int(self.primary_block),
+            _carry_int(self.secondary_block),
+            _carry_int(self.last_time),
+            _carry_int(self.last_block),
+            self.monotone_ok,
         )
 
-    def load_block_first_ms(self, entries: tuple[tuple[int, int, int], ...]) -> None:
-        for segment_id, block_number, first_ms in entries:
-            if segment_id != self.segment_id:
-                continue
-            prior = self.block_first_ms.get(block_number)
-            if prior is None or first_ms < prior:
-                self.block_first_ms[block_number] = first_ms
+    @classmethod
+    def from_compact(cls, row: tuple[int, int, int, int, int, bool]) -> _CausalSegmentFrontier:
+        segment_id, primary, secondary, last_time, last_block, monotone_ok = row
+        return cls(
+            segment_id=int(segment_id),
+            monotone_ok=bool(monotone_ok),
+            last_time=_carry_int_or_none(int(last_time)),
+            last_block=_carry_int_or_none(int(last_block)),
+            primary_block=_carry_int_or_none(int(primary)),
+            secondary_block=_carry_int_or_none(int(secondary)),
+        )
 
 
 @dataclass
@@ -130,19 +152,34 @@ class _CausalIndex:
         cls,
         missing_dates: frozenset[str],
         carry_observations: tuple[tuple[int, int, int], ...],
+        *,
         carry_block_first_ms: tuple[tuple[int, int, int], ...] = (),
+        carry_segment_frontiers: tuple[tuple[int, int, int, int, int, bool], ...] = (),
     ) -> _CausalIndex:
         index = cls(missing_dates=missing_dates)
+        if carry_segment_frontiers:
+            for row in carry_segment_frontiers:
+                state = _CausalSegmentFrontier.from_compact(row)
+                index.segments[state.segment_id] = state
+            return index
         if carry_block_first_ms:
+            by_segment: dict[int, list[tuple[int, int, int]]] = {}
             for segment_id, block_number, first_ms in carry_block_first_ms:
-                state = index._state_for_segment(segment_id)
-                state.load_block_first_ms(((segment_id, block_number, first_ms),))
-        else:
-            for segment_id, exchange_time_ms, block_number in carry_observations:
-                index._state_for_segment(segment_id).observe(
-                    exchange_time_ms=exchange_time_ms,
-                    block_number=block_number,
+                by_segment.setdefault(int(segment_id), []).append(
+                    (int(first_ms), int(block_number), int(segment_id))
                 )
+            for segment_id, entries in by_segment.items():
+                for first_ms, block_number, _ in sorted(entries):
+                    index._state_for_segment(segment_id).observe(
+                        exchange_time_ms=first_ms,
+                        block_number=block_number,
+                    )
+            return index
+        for segment_id, exchange_time_ms, block_number in carry_observations:
+            index._state_for_segment(segment_id).observe(
+                exchange_time_ms=exchange_time_ms,
+                block_number=block_number,
+            )
         return index
 
     def _state_for_time(self, exchange_ms: int) -> _CausalSegmentFrontier:
@@ -167,11 +204,11 @@ class _CausalIndex:
             return None
         return state.causal_cutoff_block(decision_time_ms)
 
-    def export_carry(self) -> tuple[tuple[int, int, int], ...]:
-        exported: list[tuple[int, int, int]] = []
-        for segment_id in sorted(self.segments):
-            exported.extend(self.segments[segment_id].export_block_first_ms())
-        return tuple(exported)
+    def export_carry(self) -> tuple[tuple[int, int, int, int, int, bool], ...]:
+        return tuple(
+            self.segments[segment_id].export_compact()
+            for segment_id in sorted(self.segments)
+        )
 
 
 @dataclass(frozen=True)
@@ -741,6 +778,9 @@ def execute_causal_grid_extract(
             missing,
             carry_in.causal_observations if carry_in is not None else (),
             carry_block_first_ms=carry_in.causal_block_first_ms if carry_in is not None else (),
+            carry_segment_frontiers=(
+                carry_in.causal_segment_frontiers if carry_in is not None else ()
+            ),
         )
         lookback = _max_lookback_ms(model)
         scan_start = model.partition.emit_start_ms - lookback
@@ -831,7 +871,8 @@ def execute_causal_grid_extract(
         outgoing_carry = {
             "schema_version": CARRY_SCHEMA_VERSION,
             "causal_observations": (),
-            "causal_block_first_ms": causal.export_carry(),
+            "causal_block_first_ms": (),
+            "causal_segment_frontiers": causal.export_carry(),
             "trade_rows": _trade_carry_rows(
                 rolling,
                 carry_start_ms=model.partition.emit_end_ms - model.partition.overlap_ms,
