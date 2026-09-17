@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -102,6 +102,79 @@ class EventWindowExtractRequest(Frozen):
     tie_break_columns: tuple[str, ...] = ("timestamp_ms",)
 
 
+class CausalWitnessMapping(Frozen):
+    block_column: str
+    timestamp_column: str
+
+
+class CanonicalTradeInputMapping(Frozen):
+    canonical_trade_profile: CanonicalTradeProfile
+    symbol_column: str
+    block_column: str
+    timestamp_column: str
+    price_field: str
+    notional_field: str
+
+
+class InputRoleBinding(Frozen):
+    input_index: int = Field(ge=0)
+    role: Literal["canonical_trade", "causal_witness"]
+
+
+class EmitGridSpec(Frozen):
+    start_timestamp_ms: int
+    end_timestamp_ms: int
+    step_ms: int = Field(ge=1)
+
+
+class CausalGridCarryState(Frozen):
+    schema_version: Literal["pbe.replay.causal-grid-carry.v1"]
+    causal_observations: tuple[tuple[int, int, int], ...] = ()
+    trade_rows: tuple[dict[str, Any], ...] = ()
+
+
+class PartitionSpec(Frozen):
+    emit_start_ms: int
+    emit_end_ms: int
+    overlap_ms: int = Field(ge=0)
+    hard_gap_missing_dates: tuple[str, ...] = ()
+    incoming_carry: CausalGridCarryState | None = None
+
+    @model_validator(mode="after")
+    def _emit_window_valid(self) -> PartitionSpec:
+        if self.emit_end_ms < self.emit_start_ms:
+            raise ValueError("partition emit_end_ms must be >= emit_start_ms")
+        return self
+
+
+class CausalGridExtractJobParams(Frozen):
+    schema_version: Literal["pbe.replay.causal-grid-extract-job.v1"]
+
+
+class CausalGridExtractRequest(Frozen):
+    schema_version: Literal["pbe.replay.causal-grid-extract.v1"]
+    request_id: str
+    target_symbols: tuple[str, ...] = Field(min_length=1)
+    input_roles: tuple[InputRoleBinding, ...] = Field(min_length=1)
+    causal_witness_mapping: CausalWitnessMapping
+    canonical_trade_mapping: CanonicalTradeInputMapping
+    emit_grid: EmitGridSpec
+    partition: PartitionSpec
+    as_of_measurement_field: str
+    as_of_offsets_ms: tuple[int, ...] = (0, 5000)
+    trailing_windows: tuple[TrailingWindowSpec, ...] = ()
+    tie_break_columns: tuple[str, ...] = ("timestamp_ms",)
+
+    @model_validator(mode="after")
+    def _roles_cover_inputs(self) -> CausalGridExtractRequest:
+        indices = [binding.input_index for binding in self.input_roles]
+        if len(indices) != len(set(indices)):
+            raise ValueError("duplicate input_index in input_roles")
+        if not any(binding.role == "canonical_trade" for binding in self.input_roles):
+            raise ValueError("at least one canonical_trade input role is required")
+        return self
+
+
 class StructuralCanonicalizeMergeParams(Frozen):
     schema_version: Literal["pbe.replay.structural-canonicalize-merge.v1"]
 
@@ -109,5 +182,6 @@ class StructuralCanonicalizeMergeParams(Frozen):
 PARAM_MODELS = {
     "replay.structural_canonicalize": StructuralCanonicalizeParams,
     "replay.event_window_extract": EventWindowExtractJobParams,
+    "replay.causal_grid_extract": CausalGridExtractJobParams,
     "replay.structural_canonicalize_merge": StructuralCanonicalizeMergeParams,
 }

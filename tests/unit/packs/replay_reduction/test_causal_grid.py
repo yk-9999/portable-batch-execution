@@ -1,0 +1,428 @@
+import polars as pl
+import pytest
+
+from portable_batch_execution.packs.replay_reduction.canonicalize import (
+    StructuralCanonicalizeError,
+)
+from portable_batch_execution.packs.replay_reduction.causal_grid import (
+    execute_causal_grid_extract,
+)
+
+_PROFILE = {
+    "schema_version": "pbe.replay.canonical-trade-profile.v1",
+    "identity_source_column": "identity",
+    "identity_normalized_column": "identity_norm",
+    "measurement_core_fields": ["price"],
+}
+
+_SENTINEL = {
+    "identity_equals": 0,
+    "exact_match_fields": {"identity_norm": None},
+}
+
+
+def _write(path, rows):
+    pl.DataFrame(rows).write_parquet(path)
+    return path
+
+
+def _request(**overrides):
+    base = {
+        "schema_version": "pbe.replay.causal-grid-extract.v1",
+        "request_id": "grid-1",
+        "target_symbols": ("AAA",),
+        "input_roles": (
+            {"input_index": 0, "role": "canonical_trade"},
+        ),
+        "causal_witness_mapping": {
+            "block_column": "block",
+            "timestamp_column": "timestamp_ms",
+        },
+        "canonical_trade_mapping": {
+            "canonical_trade_profile": _PROFILE,
+            "symbol_column": "symbol",
+            "block_column": "block",
+            "timestamp_column": "timestamp_ms",
+            "price_field": "price",
+            "notional_field": "notional",
+        },
+        "emit_grid": {
+            "start_timestamp_ms": 10_000,
+            "end_timestamp_ms": 10_000,
+            "step_ms": 5_000,
+        },
+        "partition": {
+            "emit_start_ms": 10_000,
+            "emit_end_ms": 10_000,
+            "overlap_ms": 60_000,
+            "hard_gap_missing_dates": (),
+        },
+        "as_of_measurement_field": "price",
+        "as_of_offsets_ms": (0, 5_000),
+        "trailing_windows": (
+            {
+                "fact_id": "trade_notional_60s",
+                "measurement_field": "notional",
+                "trailing_width_ms": 60_000,
+            },
+        ),
+        "tie_break_columns": ("timestamp_ms", "seq"),
+    }
+    base.update(overrides)
+    return base
+
+
+def _trade_row(**fields):
+    base = {
+        "identity": 1,
+        "identity_norm": "1",
+        "symbol": "AAA",
+        "block": 100,
+        "timestamp_ms": 9_000,
+        "price": 10.0,
+        "notional": 100.0,
+        "seq": 0,
+    }
+    base.update(fields)
+    return base
+
+
+def _witness_row(**fields):
+    base = {"block": 100, "timestamp_ms": 9_000}
+    base.update(fields)
+    return base
+
+
+def _facts_by_id(row):
+    return {item["fact_id"]: item["value"] for item in row["facts"]}
+
+
+def test_positive_identity_duplicate_collapse(tmp_path):
+    path = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, price=10.0, notional=50.0),
+            _trade_row(identity=1, identity_norm="1", block=91, timestamp_ms=8_100, price=10.0, notional=50.0),
+            _trade_row(identity=2, identity_norm="2", block=100, timestamp_ms=9_500, notional=25.0),
+        ],
+    )
+    witness = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=90, timestamp_ms=8_000),
+            _witness_row(block=100, timestamp_ms=9_500),
+            _witness_row(block=110, timestamp_ms=10_000),
+        ],
+    )
+    row = execute_causal_grid_extract(
+        [path, witness],
+        _request(
+            input_roles=(
+                {"input_index": 0, "role": "canonical_trade"},
+                {"input_index": 1, "role": "causal_witness"},
+            ),
+        ),
+    )["rows"][0]
+    facts = _facts_by_id(row)
+    assert facts["trade_notional_60s.sum"] == 75.0
+    assert facts["trade_notional_60s.count"] == 2
+
+
+def test_sentinel_exclusion(tmp_path):
+    profile = {**_PROFILE, "sentinel": _SENTINEL}
+    path = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=0, identity_norm=None, price=1.0, notional=999.0),
+            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, notional=10.0),
+            _trade_row(identity=2, identity_norm="2", block=110, timestamp_ms=9_000, notional=1.0),
+        ],
+    )
+    request = _request()
+    request["canonical_trade_mapping"]["canonical_trade_profile"] = profile
+    witness = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=90, timestamp_ms=8_000),
+            _witness_row(block=100, timestamp_ms=9_000),
+            _witness_row(block=110, timestamp_ms=10_000),
+        ],
+    )
+    request["input_roles"] = (
+        {"input_index": 0, "role": "canonical_trade"},
+        {"input_index": 1, "role": "causal_witness"},
+    )
+    facts = _facts_by_id(
+        execute_causal_grid_extract([path, witness], request)["rows"][0]
+    )
+    assert facts["trade_notional_60s.sum"] == 10.0
+
+
+def test_malformed_identity_fail_closed(tmp_path):
+    path = _write(tmp_path / "trades.parquet", [_trade_row(identity=-1, identity_norm="-1")])
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_causal_grid_extract([path], _request())
+
+
+def test_trade_and_liquidation_witness_cutoff(tmp_path):
+    trades = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(block=100, timestamp_ms=8_000),
+            _trade_row(identity=2, identity_norm="2", block=110, timestamp_ms=9_000),
+        ],
+    )
+    liq = _write(
+        tmp_path / "liq.parquet",
+        [
+            _witness_row(block=100, timestamp_ms=8_000),
+            _witness_row(block=120, timestamp_ms=9_500),
+        ],
+    )
+    request = _request(
+        input_roles=(
+            {"input_index": 0, "role": "canonical_trade"},
+            {"input_index": 1, "role": "causal_witness"},
+        ),
+        emit_grid={
+            "start_timestamp_ms": 10_000,
+            "end_timestamp_ms": 10_000,
+            "step_ms": 5_000,
+        },
+    )
+    row = execute_causal_grid_extract([trades, liq], request)["rows"][0]
+    assert row["causal_cutoff_block"] == 110
+
+
+def test_witness_block_excluded_from_measurement(tmp_path):
+    trades = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(block=100, timestamp_ms=8_000, price=1.0),
+            _trade_row(
+                identity=2,
+                identity_norm="2",
+                block=120,
+                timestamp_ms=9_500,
+                price=9.0,
+                notional=1.0,
+            ),
+        ],
+    )
+    liq = _write(tmp_path / "liq.parquet", [_witness_row(block=120, timestamp_ms=9_500)])
+    row = execute_causal_grid_extract(
+        [trades, liq],
+        _request(
+            input_roles=(
+                {"input_index": 0, "role": "canonical_trade"},
+                {"input_index": 1, "role": "causal_witness"},
+            ),
+        ),
+    )["rows"][0]
+    facts = _facts_by_id(row)
+    assert row["causal_cutoff_block"] == 100
+    assert facts["as_of.0"] == 1.0
+
+
+def test_no_predecessor_emits_unavailable(tmp_path):
+    path = _write(tmp_path / "trades.parquet", [_trade_row(block=100, timestamp_ms=9_000)])
+    row = execute_causal_grid_extract([path], _request())["rows"][0]
+    assert row["causal_cutoff_block"] is None
+    facts = _facts_by_id(row)
+    assert facts["as_of.0"] is None
+    assert facts["trade_notional_60s.sum"] is None
+
+
+def test_hard_gap_boundary(tmp_path):
+    path = _write(tmp_path / "trades.parquet", [_trade_row(timestamp_ms=86_400_000)])
+    request = _request(
+        partition={
+            "emit_start_ms": 86_400_000,
+            "emit_end_ms": 86_400_000,
+            "overlap_ms": 60_000,
+            "hard_gap_missing_dates": ("1970-01-02",),
+        },
+        emit_grid={
+            "start_timestamp_ms": 86_400_000,
+            "end_timestamp_ms": 86_400_000,
+            "step_ms": 5_000,
+        },
+    )
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_causal_grid_extract([path], request)
+
+
+def test_as_of_tie_breaking(tmp_path):
+    path = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=100, timestamp_ms=10_000, price=1.0, seq=0),
+            _trade_row(identity=2, identity_norm="2", block=101, timestamp_ms=10_000, price=2.0, seq=1),
+            _trade_row(identity=3, identity_norm="3", block=91, timestamp_ms=5_000, price=3.0, seq=0),
+            _trade_row(identity=4, identity_norm="4", block=92, timestamp_ms=5_000, price=4.0, seq=1),
+        ],
+    )
+    request = _request(
+        input_roles=({"input_index": 0, "role": "canonical_trade"},),
+        emit_grid={"start_timestamp_ms": 10_000, "end_timestamp_ms": 10_000, "step_ms": 5_000},
+    )
+    request["canonical_trade_mapping"]["canonical_trade_profile"] = {
+        **_PROFILE,
+        "sentinel": None,
+    }
+    liq = _write(
+        tmp_path / "witness.parquet",
+        [
+            _witness_row(block=90, timestamp_ms=4_000),
+            _witness_row(block=100, timestamp_ms=8_000),
+            _witness_row(block=104, timestamp_ms=10_000),
+        ],
+    )
+    request["input_roles"] = (
+        {"input_index": 0, "role": "canonical_trade"},
+        {"input_index": 1, "role": "causal_witness"},
+    )
+    row = execute_causal_grid_extract([path, liq], request)["rows"][0]
+    facts = _facts_by_id(row)
+    assert row["causal_cutoff_block"] == 101
+    assert facts["as_of.0"] == 2.0
+    assert facts["as_of.5000"] == 4.0
+
+
+def test_trailing_60s_notional(tmp_path):
+    path = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=95, timestamp_ms=9_000, notional=10.0),
+            _trade_row(identity=2, identity_norm="2", block=102, timestamp_ms=9_500, notional=20.0),
+            _trade_row(
+                identity=3,
+                identity_norm="3",
+                block=115,
+                timestamp_ms=10_000,
+                notional=100.0,
+            ),
+        ],
+    )
+    liq = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=90, timestamp_ms=8_000),
+            _witness_row(block=101, timestamp_ms=9_001),
+            _witness_row(block=110, timestamp_ms=10_000),
+        ],
+    )
+    facts = _facts_by_id(
+        execute_causal_grid_extract(
+            [path, liq],
+            _request(
+                input_roles=(
+                    {"input_index": 0, "role": "canonical_trade"},
+                    {"input_index": 1, "role": "causal_witness"},
+                ),
+            ),
+        )["rows"][0]
+    )
+    assert facts["trade_notional_60s.sum"] == 30.0
+
+
+def test_zero_liquidation_control_grid_row_still_emitted(tmp_path):
+    path = _write(tmp_path / "trades.parquet", [_trade_row(timestamp_ms=9_000)])
+    rows = execute_causal_grid_extract([path], _request(target_symbols=("AAA", "BBB")))[
+        "rows"
+    ]
+    assert len(rows) == 2
+    assert {row["symbol"] for row in rows} == {"AAA", "BBB"}
+
+
+def test_partition_carry_equivalence(tmp_path):
+    trades = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", timestamp_ms=40_000, notional=1.0),
+            _trade_row(identity=2, identity_norm="2", timestamp_ms=80_000, notional=2.0),
+            _trade_row(identity=3, identity_norm="3", timestamp_ms=120_000, notional=4.0),
+        ],
+    )
+    witness = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=10, timestamp_ms=30_000),
+            _witness_row(block=20, timestamp_ms=50_000),
+            _witness_row(block=30, timestamp_ms=90_000),
+            _witness_row(block=40, timestamp_ms=130_000),
+        ],
+    )
+    full = _request(
+        input_roles=(
+            {"input_index": 0, "role": "canonical_trade"},
+            {"input_index": 1, "role": "causal_witness"},
+        ),
+        emit_grid={"start_timestamp_ms": 50_000, "end_timestamp_ms": 120_000, "step_ms": 10_000},
+        partition={
+            "emit_start_ms": 50_000,
+            "emit_end_ms": 120_000,
+            "overlap_ms": 70_000,
+            "hard_gap_missing_dates": (),
+        },
+    )
+    one_pass = execute_causal_grid_extract([trades, witness], full)["rows"]
+
+    first = dict(full)
+    first["partition"] = {
+        "emit_start_ms": 50_000,
+        "emit_end_ms": 80_000,
+        "overlap_ms": 70_000,
+        "hard_gap_missing_dates": (),
+    }
+    first_result = execute_causal_grid_extract([trades, witness], first)
+    second = dict(full)
+    second["partition"] = {
+        "emit_start_ms": 90_000,
+        "emit_end_ms": 120_000,
+        "overlap_ms": 70_000,
+        "hard_gap_missing_dates": (),
+        "incoming_carry": first_result["outgoing_carry"],
+    }
+    merged = first_result["rows"] + execute_causal_grid_extract([trades, witness], second)["rows"]
+    assert merged == one_pass
+
+
+def test_multi_shard_deterministic_equivalence(tmp_path):
+    rows_a = [
+        _trade_row(identity=1, identity_norm="1", timestamp_ms=9_000, notional=1.0),
+        _trade_row(identity=2, identity_norm="2", timestamp_ms=9_500, notional=2.0),
+    ]
+    rows_b = [
+        _trade_row(identity=3, identity_norm="3", timestamp_ms=9_800, notional=3.0),
+    ]
+    path_a = _write(tmp_path / "a.parquet", rows_a)
+    path_b = _write(tmp_path / "b.parquet", rows_b)
+    witness = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=10, timestamp_ms=8_000),
+            _witness_row(block=20, timestamp_ms=9_000),
+            _witness_row(block=30, timestamp_ms=10_000),
+        ],
+    )
+    combined = execute_causal_grid_extract(
+        [path_a, path_b, witness],
+        _request(
+            input_roles=(
+                {"input_index": 0, "role": "canonical_trade"},
+                {"input_index": 1, "role": "canonical_trade"},
+                {"input_index": 2, "role": "causal_witness"},
+            ),
+        ),
+    )["rows"]
+    single = execute_causal_grid_extract(
+        [_write(tmp_path / "merged.parquet", rows_a + rows_b), witness],
+        _request(
+            input_roles=(
+                {"input_index": 0, "role": "canonical_trade"},
+                {"input_index": 1, "role": "causal_witness"},
+            ),
+        ),
+    )["rows"]
+    assert combined == single
