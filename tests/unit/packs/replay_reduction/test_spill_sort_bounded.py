@@ -37,7 +37,7 @@ def test_hierarchical_merge_never_exceeds_fan_in(tmp_path, monkeypatch):
         path = tmp_path / f"run_{index:02d}.parquet"
         frame.write_parquet(path)
         runs.append(path)
-    reduced = _reduce_sorted_runs(
+    _reduce_sorted_runs(
         runs,
         sort_keys=sort_keys,
         spill_dir=tmp_path / "reduce",
