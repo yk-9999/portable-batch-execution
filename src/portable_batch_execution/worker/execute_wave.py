@@ -34,7 +34,7 @@ from portable_batch_execution.packs.replay_reduction.canonicalize import (
     BUCKET_MEDIA_TYPE,
     StructuralCanonicalizeError,
     attach_bucket_refs,
-    decode_state,
+    decode_state_from_bucket_payloads,
     iter_state_bucket_payloads,
     state_summary,
 )
@@ -283,11 +283,12 @@ def _read_canonicalize_state(plane, summary_ref: ArtifactRef):
         raise _ShardStageFailure("input_artifact_invalid") from None
     if any(ref.media_type != BUCKET_MEDIA_TYPE for ref in bucket_refs):
         raise _ShardStageFailure("input_artifact_invalid")
-    bucket_payloads = tuple(
-        _read_verified_artifact_bytes(plane, ref) for ref in bucket_refs
-    )
+    def _iter_verified_bucket_payloads():
+        for ref in bucket_refs:
+            yield _read_verified_artifact_bytes(plane, ref)
+
     try:
-        return decode_state(summary, bucket_payloads)
+        return decode_state_from_bucket_payloads(summary, _iter_verified_bucket_payloads())
     except StructuralCanonicalizeError:
         raise _ShardStageFailure("input_artifact_invalid") from None
 

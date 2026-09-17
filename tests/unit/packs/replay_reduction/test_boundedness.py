@@ -181,3 +181,65 @@ def test_bucket_payload_bound_enforced(tmp_path, monkeypatch):
     with pytest.raises(canonicalize.StructuralCanonicalizeError):
         for _ in canonicalize.iter_state_bucket_payloads(state):
             pass
+
+
+def test_read_canonicalize_state_consumes_one_bucket_payload_at_a_time(tmp_path, monkeypatch):
+    from hashlib import sha256
+
+    from portable_batch_execution.contracts import ArtifactRef
+    from portable_batch_execution.worker import execute_wave as ew
+
+    path = tmp_path / "part.parquet"
+    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(path)
+    state = canonicalize.execute_structural_canonicalize([path], _PARAMS)
+
+    payloads = {}
+    bucket_refs = []
+    for index, payload in enumerate(canonicalize.iter_state_bucket_payloads(state)):
+        object_id = f"bucket-{index}"
+        payloads[object_id] = payload
+        bucket_refs.append(
+            ArtifactRef(
+                object_id=object_id,
+                uri=f"pbe://private/{object_id}",
+                sha256="sha256:" + sha256(payload).hexdigest(),
+                size_bytes=len(payload),
+                media_type=canonicalize.BUCKET_MEDIA_TYPE,
+            )
+        )
+    summary = canonicalize.attach_bucket_refs(
+        canonicalize.state_summary(state), tuple(bucket_refs)
+    )
+    summary_bytes = json.dumps(summary, sort_keys=True).encode("utf-8")
+    summary_id = "summary"
+    payloads[summary_id] = summary_bytes
+    summary_ref = ArtifactRef(
+        object_id=summary_id,
+        uri="pbe://private/summary",
+        sha256="sha256:" + sha256(summary_bytes).hexdigest(),
+        size_bytes=len(summary_bytes),
+        media_type="application/json",
+    )
+
+    class Plane:
+        def read(self, ref):
+            return payloads[ref.object_id]
+
+    plane = Plane()
+    live = 0
+    max_live = 0
+    original_read = ew._read_verified_artifact_bytes
+
+    def tracked_read(data_plane, ref):
+        nonlocal live, max_live
+        live += 1
+        max_live = max(max_live, live)
+        try:
+            return original_read(data_plane, ref)
+        finally:
+            live -= 1
+
+    monkeypatch.setattr(ew, "_read_verified_artifact_bytes", tracked_read)
+    decoded = ew._read_canonicalize_state(plane, summary_ref)
+    assert decoded.positive_group_count == state.positive_group_count
+    assert max_live == 1

@@ -409,11 +409,10 @@ def _single_input_state(
     if positive_row_count == 0:
         return _empty_state(bucket_count, witness_count)
 
-    ordered = positive.sort("_row_index")
     spill_dir = _make_spill_dir()
     group_count, bucket_counts, first_boundary, last_boundary = (
         _stream_validate_and_spill_positive_rows(
-            ordered,
+            positive,
             positive_row_count,
             spill_dir,
             bucket_count,
@@ -696,6 +695,7 @@ def decode_bucket(payload: bytes, bucket_count: int, expected_index: int) -> tup
 
 
 def _write_bucket_payload(path: Path, payload: bytes, bucket_count: int, index: int) -> int:
+    _assert_bucket_payload_bounded(len(payload))
     if len(payload) < _BUCKET_HEADER.size:
         raise StructuralCanonicalizeError("bucket artifact is truncated")
     magic, version, encoded_count, encoded_index, value_count = _BUCKET_HEADER.unpack_from(
@@ -751,9 +751,7 @@ def attach_bucket_refs(
     return enriched
 
 
-def decode_state(
-    summary: dict[str, Any], bucket_payloads: tuple[bytes, ...]
-) -> CanonicalizeState:
+def _validated_summary_for_decode(summary: dict[str, Any]) -> tuple[int, tuple[int, ...]]:
     if not isinstance(summary, dict):
         raise StructuralCanonicalizeError("canonicalization summary must be an object")
     if summary.get("schema_version") != STATE_SCHEMA_VERSION:
@@ -779,24 +777,36 @@ def decode_state(
         for count in bucket_counts
     ):
         raise StructuralCanonicalizeError("canonicalization bucket_counts are invalid")
-    if len(bucket_payloads) != bucket_count:
-        raise StructuralCanonicalizeError("canonicalization bucket artifacts are incomplete")
-
-    spill_dir = _make_spill_dir()
-    written_counts: list[int] = []
-    for index, payload in enumerate(bucket_payloads):
-        written = _write_bucket_payload(
-            _bucket_file(spill_dir, index), payload, bucket_count, index
-        )
-        if written != bucket_counts[index]:
-            raise StructuralCanonicalizeError("canonicalization bucket count mismatch")
-        written_counts.append(written)
-
     for name in ("positive_row_count", "positive_group_count", "witness_row_count"):
         value = summary.get(name)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise StructuralCanonicalizeError(f"canonicalization {name} is invalid")
+    return bucket_count, tuple(int(count) for count in bucket_counts)
 
+
+def decode_state_from_bucket_payloads(
+    summary: dict[str, Any],
+    bucket_payloads: Iterator[bytes],
+) -> CanonicalizeState:
+    """Decode state from bucket payloads consumed one at a time (production path)."""
+    bucket_count, expected_counts = _validated_summary_for_decode(summary)
+    spill_dir = _make_spill_dir()
+    written_counts: list[int] = []
+    for index in range(bucket_count):
+        try:
+            payload = next(bucket_payloads)
+        except StopIteration as exc:
+            raise StructuralCanonicalizeError(
+                "canonicalization bucket artifacts are incomplete"
+            ) from exc
+        written = _write_bucket_payload(
+            _bucket_file(spill_dir, index), payload, bucket_count, index
+        )
+        if written != expected_counts[index]:
+            raise StructuralCanonicalizeError("canonicalization bucket count mismatch")
+        written_counts.append(written)
+    if next(bucket_payloads, None) is not None:
+        raise StructuralCanonicalizeError("canonicalization bucket artifacts are incomplete")
     state = CanonicalizeState(
         bucket_count=bucket_count,
         spill_dir=spill_dir,
@@ -809,3 +819,12 @@ def decode_state(
     )
     _validate_state(state)
     return state
+
+
+def decode_state(
+    summary: dict[str, Any], bucket_payloads: tuple[bytes, ...]
+) -> CanonicalizeState:
+    """Test helper: decode from a fully materialized bucket payload tuple."""
+    if len(bucket_payloads) != int(summary.get("bucket_count", -1)):
+        raise StructuralCanonicalizeError("canonicalization bucket artifacts are incomplete")
+    return decode_state_from_bucket_payloads(summary, iter(bucket_payloads))
