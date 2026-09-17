@@ -33,6 +33,7 @@ CARRY_SCHEMA_VERSION = "pbe.replay.causal-grid-carry.v4"
 _CARRY_ABSENT_INT = -1
 _BUCKET_SPILL_BATCH = 65_536
 _COLLAPSED_RUN_BATCH = 65_536
+_GLOBAL_TRADE_BUCKET_BUFFER_ROWS = 65_536
 
 
 def _validated(
@@ -460,7 +461,17 @@ def _collapse_bucket_identity_groups(
             collapsed_batch.clear()
             run_index += 1
 
-    for row in iter_k_way_merge_dataframes(sorted_runs, sort_keys=sort_keys):
+    merge_spill = spill_dir / f"merge_b{bucket_index_value:05d}"
+    merge_iter = (
+        iter_k_way_merge_dataframes(
+            sorted_runs,
+            sort_keys=sort_keys,
+            spill_dir=merge_spill,
+        )
+        if sorted_runs
+        else iter(())
+    )
+    for row in merge_iter:
         identity = int(row["identity"])
         if current_identity is None or identity != current_identity:
             flush_collapsed()
@@ -502,8 +513,10 @@ def _materialize_collapsed_trades(
     bucket_root.mkdir(parents=True, exist_ok=True)
     bucket_batches: list[list[dict[str, Any]]] = [[] for _ in range(bucket_count)]
     bucket_part_counts = [0 for _ in range(bucket_count)]
+    total_buffered_rows = 0
 
     def flush_bucket_batch(bucket_value: int) -> None:
+        nonlocal total_buffered_rows
         batch = bucket_batches[bucket_value]
         if not batch:
             return
@@ -512,7 +525,12 @@ def _materialize_collapsed_trades(
         part_path = bucket_dir / f"part_{bucket_part_counts[bucket_value]:05d}.parquet"
         _flush_bucket_spill_batch(batch, part_path=part_path)
         bucket_part_counts[bucket_value] += 1
+        total_buffered_rows -= len(batch)
         batch.clear()
+
+    def flush_all_bucket_batches() -> None:
+        for bucket_value in range(bucket_count):
+            flush_bucket_batch(bucket_value)
 
     for path in trade_paths:
         for row in _stream_positive_rows(path, model):
@@ -536,11 +554,12 @@ def _materialize_collapsed_trades(
                 **{column: row[column] for column in tie_break},
             }
             bucket_batches[bucket_value].append(payload)
-            if len(bucket_batches[bucket_value]) >= _BUCKET_SPILL_BATCH:
-                flush_bucket_batch(bucket_value)
+            total_buffered_rows += 1
+            if total_buffered_rows >= _GLOBAL_TRADE_BUCKET_BUFFER_ROWS:
+                flush_all_bucket_batches()
+                total_buffered_rows = 0
 
-    for bucket_value in range(bucket_count):
-        flush_bucket_batch(bucket_value)
+    flush_all_bucket_batches()
 
     collapsed_unsorted: list[Path] = []
     for bucket_value in range(bucket_count):
@@ -578,7 +597,11 @@ def _iter_sorted_collapsed_trades_for_model(
     model: CausalGridExtractRequest,
 ) -> Iterator[_TradeEvent]:
     sort_keys = ("exchange_time_ms", "block_number")
-    for row in iter_k_way_merge_dataframes(sorted_runs, sort_keys=sort_keys):
+    for row in iter_k_way_merge_dataframes(
+        sorted_runs,
+        sort_keys=sort_keys,
+        spill_dir=sorted_runs[0].parent / "trade_merge" if sorted_runs else None,
+    ):
         yield _row_dict_to_trade_event(row, model)
 
 
@@ -590,55 +613,62 @@ def _materialize_sorted_witness_runs(
 ) -> list[Path]:
     mapping = model.causal_witness_mapping
     bindings = {binding.input_index: binding.role for binding in model.input_roles}
-    witness_frames: list[pl.DataFrame] = []
-    for input_index, path in enumerate(path_objs):
-        if bindings.get(input_index) != "causal_witness":
-            continue
-        lazy = pl.scan_parquet(str(path))
-        _require_columns(
-            lazy.collect_schema(),
-            (mapping.block_column, mapping.timestamp_column),
-        )
-        row_count = int(lazy.select(pl.len()).collect().item())
-        offset = 0
-        while offset < row_count:
-            batch_size = min(_IDENTITY_SCAN_BATCH, row_count - offset)
-            batch = (
-                lazy.slice(offset, batch_size)
-                .with_row_index("row_offset", offset=offset)
-                .select(
-                    pl.lit(input_index).alias("input_index"),
-                    pl.col("row_offset").cast(pl.Int64),
-                    pl.col(mapping.timestamp_column)
-                    .cast(pl.Int64, strict=False)
-                    .alias("exchange_time_ms"),
-                    pl.col(mapping.block_column).cast(pl.Int64, strict=False).alias("block_number"),
-                )
-                .collect()
+    def _witness_batch_iter() -> Iterator[pl.DataFrame]:
+        for input_index, path in enumerate(path_objs):
+            if bindings.get(input_index) != "causal_witness":
+                continue
+            lazy = pl.scan_parquet(str(path))
+            _require_columns(
+                lazy.collect_schema(),
+                (mapping.block_column, mapping.timestamp_column),
             )
-            if int(batch.filter(pl.col("exchange_time_ms").is_null() | pl.col("block_number").is_null()).height):
-                raise StructuralCanonicalizeError("witness block or timestamp missing")
-            witness_frames.append(batch)
-            offset += batch_size
-    if not witness_frames:
-        return []
+            row_count = int(lazy.select(pl.len()).collect().item())
+            offset = 0
+            while offset < row_count:
+                batch_size = min(_IDENTITY_SCAN_BATCH, row_count - offset)
+                batch = (
+                    lazy.slice(offset, batch_size)
+                    .with_row_index("row_offset", offset=offset)
+                    .select(
+                        pl.lit(input_index).alias("input_index"),
+                        pl.col("row_offset").cast(pl.Int64),
+                        pl.col(mapping.timestamp_column)
+                        .cast(pl.Int64, strict=False)
+                        .alias("exchange_time_ms"),
+                        pl.col(mapping.block_column)
+                        .cast(pl.Int64, strict=False)
+                        .alias("block_number"),
+                    )
+                    .collect()
+                )
+                if int(
+                    batch.filter(
+                        pl.col("exchange_time_ms").is_null() | pl.col("block_number").is_null()
+                    ).height
+                ):
+                    raise StructuralCanonicalizeError("witness block or timestamp missing")
+                yield batch
+                offset += batch_size
 
-    def _batch_iter() -> Iterator[pl.DataFrame]:
-        yield from witness_frames
-
-    return external_sort_lazy_batches(
-        _batch_iter(),
+    witness_sort_dir = spill_dir / "witness_sort"
+    runs = external_sort_lazy_batches(
+        _witness_batch_iter(),
         sort_keys=("exchange_time_ms", "block_number", "input_index", "row_offset"),
-        spill_dir=spill_dir / "witness_sort",
+        spill_dir=witness_sort_dir,
         run_prefix="witness",
     )
+    return runs
 
 
 def _iter_sorted_witness_events(
     sorted_runs: list[Path],
 ) -> Iterator[tuple[int, int, int, int]]:
     sort_keys = ("exchange_time_ms", "block_number", "input_index", "row_offset")
-    for row in iter_k_way_merge_dataframes(sorted_runs, sort_keys=sort_keys):
+    for row in iter_k_way_merge_dataframes(
+        sorted_runs,
+        sort_keys=sort_keys,
+        spill_dir=sorted_runs[0].parent / "witness_merge" if sorted_runs else None,
+    ):
         yield (
             int(row["exchange_time_ms"]),
             int(row["block_number"]),
