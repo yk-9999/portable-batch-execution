@@ -15,7 +15,9 @@ from portable_batch_execution.packs.replay_reduction.canonicalize import (
     encode_state_buckets,
     execute_structural_canonicalize,
     merge_structural_canonicalize_states,
+    read_bucket_values,
     state_summary,
+    states_equal,
 )
 
 _PARAMS = {
@@ -46,7 +48,9 @@ def _state(tmp_path, rows, params=_PARAMS):
 
 
 def _roundtrip(state):
-    return decode_state(state_summary(state), encode_state_buckets(state))
+    decoded = decode_state(state_summary(state), encode_state_buckets(state))
+    assert states_equal(decoded, state)
+    return decoded
 
 
 def test_many_distinct_identities_keep_constant_summary_cardinality(tmp_path):
@@ -87,14 +91,15 @@ def test_bucket_artifacts_carry_exact_identities(tmp_path):
     state = _state(tmp_path, rows)
     carried = {
         value
-        for values in (bucket.values for bucket in state.bucket_sets)
-        for value in values
+        for index in range(state.bucket_count)
+        for value in read_bucket_values(state, index)
     }
     assert carried == {5, 1, 9, 300}
-    for bucket in state.bucket_sets:
-        assert list(bucket.values) == sorted(set(bucket.values))
+    for index in range(state.bucket_count):
+        values = read_bucket_values(state, index)
+        assert list(values) == sorted(set(values))
     for identity in carried:
-        assert identity in state.bucket_sets[bucket_index(identity, state.bucket_count)].values
+        assert identity in read_bucket_values(state, bucket_index(identity, state.bucket_count))
 
 
 def test_non_monotonic_unique_identities_pass(tmp_path):
@@ -372,7 +377,7 @@ def test_roundtrip_preserves_state_across_binary_buckets(tmp_path):
         [{"identity": value, "identity_norm": str(value), "price": float(value)} for value in (7, 3, 11, 300)],
     )
     decoded = decode_state(state_summary(state), encode_state_buckets(state))
-    assert decoded == state
+    assert states_equal(decoded, state)
 
 
 def test_malformed_bucket_state_fails_closed(tmp_path):

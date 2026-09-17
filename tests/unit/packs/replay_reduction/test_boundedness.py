@@ -1,6 +1,7 @@
 import json
 
 import polars as pl
+import pytest
 
 from portable_batch_execution.packs.replay_reduction import canonicalize, event_window
 
@@ -58,3 +59,24 @@ def test_event_window_rejects_whole_history_to_dicts(tmp_path, monkeypatch):
     }
     result = event_window.execute_event_window_extract([path], request)
     assert result["facts"]
+
+
+def test_canonicalize_does_not_materialize_all_bucket_lists(tmp_path):
+    assert not hasattr(canonicalize, "_bucket_values")
+    rows = [
+        {"identity": i, "identity_norm": str(i), "price": float(i)} for i in range(1, 5001)
+    ]
+    path = tmp_path / "part.parquet"
+    pl.DataFrame(rows).write_parquet(path)
+    state = canonicalize.execute_structural_canonicalize([path], _PARAMS)
+    assert state.positive_group_count == 5000
+    assert len(json.dumps(canonicalize.state_summary(state))) < 4000
+
+
+def test_canonicalize_materialization_guard_enforced(tmp_path, monkeypatch):
+    monkeypatch.setattr(canonicalize, "_MAX_IDENTITY_MATERIALIZATION", 32)
+    rows = [{"identity": i, "identity_norm": str(i), "price": 1.0} for i in range(1, 200)]
+    path = tmp_path / "dense.parquet"
+    pl.DataFrame(rows).write_parquet(path)
+    with pytest.raises(canonicalize.StructuralCanonicalizeError):
+        canonicalize.execute_structural_canonicalize([path], _PARAMS)

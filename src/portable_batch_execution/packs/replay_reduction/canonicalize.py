@@ -1,15 +1,17 @@
-"""Exact structural canonicalization via a partitioned exact-ID state.
+"""Exact structural canonicalization via partitioned exact-ID spill state.
 
-Positive identity groups are formed from consecutive equal positive identities in
-source order; identity values are never required to be numerically ordered and are
-never compared through hashes. Exact identity membership is carried by closed
-binary bucket artifacts (deterministic sorted unique uint64 sets), while the
-mergeable summary JSON stays O(bucket_count) rather than O(identity_count).
+Identity membership lives in per-bucket sorted spill files. Merge and
+canonicalization stream one bucket at a time so peak memory does not scale
+with total distinct identities across a wave.
 """
 
 from __future__ import annotations
 
+import heapq
+import shutil
 import struct
+import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,10 +32,14 @@ BUCKET_FORMAT_VERSION = 1
 BUCKET_MEDIA_TYPE = "application/vnd.pbe.exact-id-bucket.v1"
 BUCKET_MAGIC = b"PBEBKT01"
 _BUCKET_HEADER = struct.Struct("<8sHIIQ")
+_UINT64_PACK = struct.Struct("<Q")
 _UINT64_MASK = (1 << 64) - 1
 _SPLITMIX_GOLDEN = 0x9E3779B97F4A7C15
 _SPLITMIX_MUL_A = 0xBF58476D1CE4E5B9
 _SPLITMIX_MUL_B = 0x94D049BB133111EB
+_IDENTITY_SCAN_BATCH = 65_536
+_SORT_RUN_CAPACITY = 8_192
+_MAX_IDENTITY_MATERIALIZATION = 1 << 20
 
 
 class StructuralCanonicalizeError(Exception):
@@ -42,7 +48,7 @@ class StructuralCanonicalizeError(Exception):
 
 @dataclass(frozen=True)
 class BucketSet:
-    """One deterministic sorted unique uint64 identity bucket."""
+    """One deterministic sorted unique uint64 identity bucket (artifact view)."""
 
     bucket_index: int
     values: tuple[int, ...]
@@ -50,10 +56,11 @@ class BucketSet:
 
 @dataclass(frozen=True)
 class CanonicalizeState:
-    """A complete mergeable canonicalization state (summary plus bucket sets)."""
+    """Mergeable canonicalization state backed by on-disk bucket spill files."""
 
     bucket_count: int
-    bucket_sets: tuple[BucketSet, ...]
+    spill_dir: Path
+    bucket_counts: tuple[int, ...]
     positive_row_count: int
     positive_group_count: int
     witness_row_count: int
@@ -62,12 +69,6 @@ class CanonicalizeState:
 
 
 def splitmix64(value: int) -> int:
-    """Bijective uint64 mixing permutation (SplitMix64 finalizer over a golden-ratio add).
-
-    The permutation is a bijection on the full uint64 domain, so distinct
-    identities stay distinct; bucket assignment may collide by bucket bits, but
-    identity equality is never decided by the mixed value.
-    """
     z = (value + _SPLITMIX_GOLDEN) & _UINT64_MASK
     z = ((z ^ (z >> 30)) * _SPLITMIX_MUL_A) & _UINT64_MASK
     z = ((z ^ (z >> 27)) * _SPLITMIX_MUL_B) & _UINT64_MASK
@@ -75,8 +76,12 @@ def splitmix64(value: int) -> int:
 
 
 def bucket_index(value: int, bucket_count: int) -> int:
-    """Assign a uint64 identity to one of bucket_count buckets via mixed low bits."""
     return splitmix64(value) & (bucket_count - 1)
+
+
+def _assert_bounded_materialization(count: int) -> None:
+    if count > _MAX_IDENTITY_MATERIALIZATION:
+        raise StructuralCanonicalizeError("identity materialization exceeds bounded limit")
 
 
 def _validated(
@@ -115,42 +120,197 @@ def _boundary_profile(row: dict[str, Any], core_fields: list[str]) -> dict[str, 
     }
 
 
-def _uint64_literal(value: int) -> pl.Expr:
-    return pl.lit(value, dtype=pl.UInt64)
+def _bucket_file(spill_dir: Path, index: int) -> Path:
+    return spill_dir / f"bucket_{index:05d}.bin"
 
 
-def _logical_right_shift(expr: pl.Expr, bits: int) -> pl.Expr:
-    return expr // _uint64_literal(1 << bits)
+def _make_spill_dir() -> Path:
+    return Path(tempfile.mkdtemp(prefix="pbe-canonicalize-"))
 
 
-def _bucket_expr(bucket_count: int) -> pl.Expr:
-    """Vectorized form of bucket_index over the _identity_u64 column."""
-    expr = pl.col("_identity_u64") + _uint64_literal(_SPLITMIX_GOLDEN)
-    expr = (expr ^ _logical_right_shift(expr, 30)) * _uint64_literal(_SPLITMIX_MUL_A)
-    expr = (expr ^ _logical_right_shift(expr, 27)) * _uint64_literal(_SPLITMIX_MUL_B)
-    expr = expr ^ _logical_right_shift(expr, 31)
-    return (expr & _uint64_literal(bucket_count - 1)).cast(pl.UInt32)
+def _init_empty_spill(bucket_count: int, spill_dir: Path) -> tuple[int, ...]:
+    counts: list[int] = []
+    for index in range(bucket_count):
+        path = _bucket_file(spill_dir, index)
+        path.touch()
+        counts.append(0)
+    return tuple(counts)
 
 
-def _bucket_values(ordered: pl.LazyFrame, bucket_count: int) -> list[list[int]]:
-    rows = (
-        ordered.select(pl.col("_identity_int").cast(pl.UInt64).alias("_identity_u64"))
-        .unique()
-        .with_columns(_bucket_expr(bucket_count).alias("_bucket"))
-        .group_by("_bucket")
-        .agg(pl.col("_identity_u64").sort().alias("_ids"))
-        .collect()
-    )
-    per_bucket: list[list[int]] = [[] for _ in range(bucket_count)]
-    for item in rows.iter_rows(named=True):
-        per_bucket[int(item["_bucket"])] = [int(value) for value in item["_ids"]]
-    return per_bucket
+def _iter_uint64_path(path: Path) -> Iterator[int]:
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with path.open("rb") as handle:
+        while True:
+            payload = handle.read(8)
+            if not payload:
+                return
+            if len(payload) != 8:
+                raise StructuralCanonicalizeError("bucket spill file is corrupt")
+            yield int(_UINT64_PACK.unpack(payload)[0])
+
+
+def _k_way_merge_unique_files(sources: list[Path], dest: Path) -> None:
+    heap: list[tuple[int, int, Iterator[int]]] = []
+    for source_index, source in enumerate(sources):
+        iterator = _iter_uint64_path(source)
+        value = next(iterator, None)
+        if value is not None:
+            heapq.heappush(heap, (value, source_index, iterator))
+    last_written: int | None = None
+    with dest.open("wb") as output:
+        while heap:
+            value, _, iterator = heapq.heappop(heap)
+            if last_written != value:
+                output.write(_UINT64_PACK.pack(value & _UINT64_MASK))
+                last_written = value
+            next_value = next(iterator, None)
+            if next_value is not None:
+                heapq.heappush(heap, (next_value, 0, iterator))
+
+
+def _sort_unique_bucket_file_in_place(path: Path) -> int:
+    if not path.exists() or path.stat().st_size == 0:
+        path.touch()
+        return 0
+    run_paths: list[Path] = []
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(_SORT_RUN_CAPACITY * 8)
+            if not chunk:
+                break
+            if len(chunk) % 8:
+                raise StructuralCanonicalizeError("bucket spill file is corrupt")
+            values = sorted(
+                {
+                    _UINT64_PACK.unpack_from(chunk, offset)[0]
+                    for offset in range(0, len(chunk), 8)
+                }
+            )
+            _assert_bounded_materialization(len(values))
+            run_path = path.with_name(f"{path.name}.run{len(run_paths)}")
+            with run_path.open("wb") as run:
+                for value in values:
+                    run.write(_UINT64_PACK.pack(value & _UINT64_MASK))
+            run_paths.append(run_path)
+    path.unlink(missing_ok=True)
+    if not run_paths:
+        path.touch()
+        return 0
+    if len(run_paths) == 1:
+        run_paths[0].replace(path)
+        return path.stat().st_size // 8
+    _k_way_merge_unique_files(run_paths, path)
+    for run_path in run_paths:
+        run_path.unlink(missing_ok=True)
+    return path.stat().st_size // 8
+
+
+def _spill_group_identities(
+    ordered: pl.LazyFrame,
+    positive_row_count: int,
+    spill_dir: Path,
+    bucket_count: int,
+) -> tuple[int, ...]:
+    _init_empty_spill(bucket_count, spill_dir)
+    handles = [_bucket_file(spill_dir, index).open("ab") for index in range(bucket_count)]
+    previous: int | None = None
+    try:
+        offset = 0
+        while offset < positive_row_count:
+            batch_size = min(_IDENTITY_SCAN_BATCH, positive_row_count - offset)
+            batch = (
+                ordered.slice(offset, batch_size)
+                .select(pl.col("_identity_int"))
+                .collect()
+                .get_column("_identity_int")
+            )
+            _assert_bounded_materialization(batch.len())
+            for raw in batch:
+                identity = int(raw)
+                if previous is None or identity != previous:
+                    index = bucket_index(identity, bucket_count)
+                    handles[index].write(_UINT64_PACK.pack(identity & _UINT64_MASK))
+                previous = identity
+            offset += batch_size
+    finally:
+        for handle in handles:
+            handle.close()
+    counts: list[int] = []
+    for index in range(bucket_count):
+        counts.append(_sort_unique_bucket_file_in_place(_bucket_file(spill_dir, index)))
+    return tuple(counts)
+
+
+def _stream_merge_sorted_unique_files(
+    left_path: Path,
+    right_path: Path,
+    dest_path: Path,
+    *,
+    allowed_identity: int | None,
+) -> int:
+    left_iter = _iter_uint64_path(left_path)
+    right_iter = _iter_uint64_path(right_path)
+    left_value = next(left_iter, None)
+    right_value = next(right_iter, None)
+    last_written: int | None = None
+    count = 0
+    with dest_path.open("wb") as output:
+        while left_value is not None or right_value is not None:
+            if right_value is None or (
+                left_value is not None and left_value < right_value
+            ):
+                chosen = left_value
+                left_value = next(left_iter, None)
+            elif left_value is None or right_value < left_value:
+                chosen = right_value
+                right_value = next(right_iter, None)
+            else:
+                if allowed_identity is None or left_value != allowed_identity:
+                    raise StructuralCanonicalizeError(
+                        "non-contiguous recurrence of a positive identity"
+                    )
+                chosen = left_value
+                left_value = next(left_iter, None)
+                right_value = next(right_iter, None)
+            if last_written == chosen:
+                continue
+            output.write(_UINT64_PACK.pack(chosen & _UINT64_MASK))
+            last_written = chosen
+            count += 1
+    return count
+
+
+def _bucket_contains_identity(path: Path, bucket_count: int, identity: int) -> bool:
+    target = identity & _UINT64_MASK
+    for value in _iter_uint64_path(path):
+        if value == target:
+            return True
+        if value > target:
+            return False
+    return False
+
+
+def _validate_bucket_file(path: Path, bucket_count: int, expected_index: int) -> int:
+    previous = 0
+    count = 0
+    for value in _iter_uint64_path(path):
+        if value <= previous:
+            raise StructuralCanonicalizeError("bucket values must be sorted unique")
+        if bucket_index(value, bucket_count) != expected_index:
+            raise StructuralCanonicalizeError("bucket value is not in its bucket")
+        previous = value
+        count += 1
+    return count
 
 
 def _empty_state(bucket_count: int, witness_row_count: int) -> CanonicalizeState:
+    spill_dir = _make_spill_dir()
+    bucket_counts = _init_empty_spill(bucket_count, spill_dir)
     return CanonicalizeState(
         bucket_count=bucket_count,
-        bucket_sets=tuple(BucketSet(index, ()) for index in range(bucket_count)),
+        spill_dir=spill_dir,
+        bucket_counts=bucket_counts,
         positive_row_count=0,
         positive_group_count=0,
         witness_row_count=witness_row_count,
@@ -233,43 +393,21 @@ def _single_input_state(
 
     first_row = ordered.head(1).collect().row(0, named=True)
     last_row = ordered.tail(1).collect().row(0, named=True)
-    per_bucket = _bucket_values(ordered, bucket_count)
+    spill_dir = _make_spill_dir()
+    bucket_counts = _spill_group_identities(
+        ordered, positive_row_count, spill_dir, bucket_count
+    )
 
     return CanonicalizeState(
         bucket_count=bucket_count,
-        bucket_sets=tuple(
-            BucketSet(index, tuple(values)) for index, values in enumerate(per_bucket)
-        ),
+        spill_dir=spill_dir,
+        bucket_counts=bucket_counts,
         positive_row_count=positive_row_count,
         positive_group_count=group_count,
         witness_row_count=witness_count,
         first_boundary=_boundary_profile(first_row, core_fields),
         last_boundary=_boundary_profile(last_row, core_fields),
     )
-
-
-def _merge_sorted_unique(
-    left: tuple[int, ...], right: tuple[int, ...]
-) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    merged: list[int] = []
-    shared: list[int] = []
-    i = j = 0
-    while i < len(left) and j < len(right):
-        a, b = left[i], right[j]
-        if a == b:
-            merged.append(a)
-            shared.append(a)
-            i += 1
-            j += 1
-        elif a < b:
-            merged.append(a)
-            i += 1
-        else:
-            merged.append(b)
-            j += 1
-    merged.extend(left[i:])
-    merged.extend(right[j:])
-    return tuple(merged), tuple(shared)
 
 
 def _validate_state(state: CanonicalizeState) -> None:
@@ -281,20 +419,16 @@ def _validate_state(state: CanonicalizeState) -> None:
         or state.bucket_count & (state.bucket_count - 1)
     ):
         raise StructuralCanonicalizeError("invalid bucket_count")
-    if len(state.bucket_sets) != state.bucket_count:
-        raise StructuralCanonicalizeError("bucket set cardinality mismatch")
+    if len(state.bucket_counts) != state.bucket_count:
+        raise StructuralCanonicalizeError("bucket count metadata mismatch")
     total_identities = 0
-    for index, bucket in enumerate(state.bucket_sets):
-        if bucket.bucket_index != index:
-            raise StructuralCanonicalizeError("bucket order mismatch")
-        previous = 0
-        for value in bucket.values:
-            if not isinstance(value, int) or value <= previous:
-                raise StructuralCanonicalizeError("bucket values must be sorted unique")
-            if bucket_index(value, state.bucket_count) != index:
-                raise StructuralCanonicalizeError("bucket value is not in its bucket")
-            previous = value
-        total_identities += len(bucket.values)
+    for index in range(state.bucket_count):
+        count = _validate_bucket_file(
+            _bucket_file(state.spill_dir, index), state.bucket_count, index
+        )
+        if count != state.bucket_counts[index]:
+            raise StructuralCanonicalizeError("bucket count metadata mismatch")
+        total_identities += count
     if total_identities != state.positive_group_count:
         raise StructuralCanonicalizeError("bucket identity total does not match group count")
     if state.positive_row_count < state.positive_group_count or state.witness_row_count < 0:
@@ -314,7 +448,8 @@ def _validate_state(state: CanonicalizeState) -> None:
         identity = boundary["identity"]
         if not isinstance(identity, int) or isinstance(identity, bool) or identity <= 0:
             raise StructuralCanonicalizeError(f"{name} boundary identity is not positive")
-        if identity not in state.bucket_sets[bucket_index(identity, state.bucket_count)].values:
+        bucket_path = _bucket_file(state.spill_dir, bucket_index(identity, state.bucket_count))
+        if not _bucket_contains_identity(bucket_path, state.bucket_count, identity):
             raise StructuralCanonicalizeError(f"{name} boundary identity is not in its bucket")
 
 
@@ -344,49 +479,45 @@ def _merge_states(
         )
     allowed_identity = left.last_boundary["identity"] if shared_boundary else None
 
-    merged_sets: list[BucketSet] = []
-    for index in range(left.bucket_count):
-        merged, shared = _merge_sorted_unique(
-            left.bucket_sets[index].values, right.bucket_sets[index].values
-        )
-        for value in shared:
-            if allowed_identity is None or value != allowed_identity:
-                raise StructuralCanonicalizeError(
-                    "non-contiguous recurrence of a positive identity"
-                )
-        merged_sets.append(BucketSet(index, merged))
-
     if not left_positive:
-        first_boundary = right.first_boundary
-        last_boundary = right.last_boundary
-        group_count = right.positive_group_count
-        row_count = right.positive_row_count
-    elif not right_positive:
-        first_boundary = left.first_boundary
-        last_boundary = left.last_boundary
-        group_count = left.positive_group_count
-        row_count = left.positive_row_count
+        shutil.rmtree(left.spill_dir, ignore_errors=True)
+        return right
+    if not right_positive:
+        shutil.rmtree(right.spill_dir, ignore_errors=True)
+        return left
+
+    merged_dir = _make_spill_dir()
+    merged_counts: list[int] = []
+    for index in range(left.bucket_count):
+        count = _stream_merge_sorted_unique_files(
+            _bucket_file(left.spill_dir, index),
+            _bucket_file(right.spill_dir, index),
+            _bucket_file(merged_dir, index),
+            allowed_identity=allowed_identity,
+        )
+        merged_counts.append(count)
+
+    if shared_boundary:
+        group_count = left.positive_group_count + right.positive_group_count - 1
+        row_count = left.positive_row_count + right.positive_row_count - (
+            1 if subtract_boundary_row else 0
+        )
     else:
-        first_boundary = left.first_boundary
-        last_boundary = right.last_boundary
-        if shared_boundary:
-            group_count = left.positive_group_count + right.positive_group_count - 1
-            row_count = left.positive_row_count + right.positive_row_count - (
-                1 if subtract_boundary_row else 0
-            )
-        else:
-            group_count = left.positive_group_count + right.positive_group_count
-            row_count = left.positive_row_count + right.positive_row_count
+        group_count = left.positive_group_count + right.positive_group_count
+        row_count = left.positive_row_count + right.positive_row_count
 
     merged_state = CanonicalizeState(
         bucket_count=left.bucket_count,
-        bucket_sets=tuple(merged_sets),
+        spill_dir=merged_dir,
+        bucket_counts=tuple(merged_counts),
         positive_row_count=row_count,
         positive_group_count=group_count,
         witness_row_count=left.witness_row_count + right.witness_row_count,
-        first_boundary=first_boundary,
-        last_boundary=last_boundary,
+        first_boundary=left.first_boundary,
+        last_boundary=right.last_boundary,
     )
+    shutil.rmtree(left.spill_dir, ignore_errors=True)
+    shutil.rmtree(right.spill_dir, ignore_errors=True)
     _validate_state(merged_state)
     return merged_state
 
@@ -395,14 +526,14 @@ def execute_structural_canonicalize(
     paths: list[str | Path],
     params: dict[str, Any] | StructuralCanonicalizeParams,
 ) -> CanonicalizeState:
-    """Build one exact partitioned state from ordered parquet inputs."""
     if not paths:
         raise StructuralCanonicalizeError("at least one parquet input is required")
     model = _validated(params)
-    states = [_single_input_state(path, model) for path in paths]
-    state = states[0]
-    for part in states[1:]:
-        state = _merge_states(state, part, subtract_boundary_row=False)
+    state: CanonicalizeState | None = None
+    for path in paths:
+        part = _single_input_state(path, model)
+        state = part if state is None else _merge_states(state, part, subtract_boundary_row=False)
+    assert state is not None
     return state
 
 
@@ -410,12 +541,51 @@ def merge_structural_canonicalize_states(
     left: CanonicalizeState,
     right: CanonicalizeState,
 ) -> CanonicalizeState:
-    """Merge two complete states exactly across bounded waves."""
     return _merge_states(left, right, subtract_boundary_row=True)
 
 
+def read_bucket_values(state: CanonicalizeState, index: int) -> tuple[int, ...]:
+    """Read one bucket into memory (tests and small artifacts only)."""
+    values = tuple(_iter_uint64_path(_bucket_file(state.spill_dir, index)))
+    _assert_bounded_materialization(len(values))
+    return values
+
+
+def states_equal(left: CanonicalizeState, right: CanonicalizeState) -> bool:
+    try:
+        _validate_state(left)
+        _validate_state(right)
+    except StructuralCanonicalizeError:
+        return False
+    fields = (
+        left.bucket_count,
+        left.bucket_counts,
+        left.positive_row_count,
+        left.positive_group_count,
+        left.witness_row_count,
+        left.first_boundary,
+        left.last_boundary,
+    )
+    other_fields = (
+        right.bucket_count,
+        right.bucket_counts,
+        right.positive_row_count,
+        right.positive_group_count,
+        right.witness_row_count,
+        right.first_boundary,
+        right.last_boundary,
+    )
+    if fields != other_fields:
+        return False
+    for index in range(left.bucket_count):
+        if _bucket_file(left.spill_dir, index).read_bytes() != _bucket_file(
+            right.spill_dir, index
+        ).read_bytes():
+            return False
+    return True
+
+
 def encode_bucket(bucket_count: int, bucket: BucketSet) -> bytes:
-    """Encode one bucket as the closed deterministic binary sorted unique set."""
     header = _BUCKET_HEADER.pack(
         BUCKET_MAGIC,
         BUCKET_FORMAT_VERSION,
@@ -425,19 +595,46 @@ def encode_bucket(bucket_count: int, bucket: BucketSet) -> bytes:
     )
     if not bucket.values:
         return header
+    _assert_bounded_materialization(len(bucket.values))
     return header + struct.pack(f"<{len(bucket.values)}Q", *bucket.values)
 
 
+def encode_bucket_from_path(
+    bucket_count: int, bucket_index_value: int, path: Path, value_count: int
+) -> bytes:
+    header = _BUCKET_HEADER.pack(
+        BUCKET_MAGIC,
+        BUCKET_FORMAT_VERSION,
+        bucket_count,
+        bucket_index_value,
+        value_count,
+    )
+    if value_count == 0:
+        return header
+    chunks: list[bytes] = [header]
+    with path.open("rb") as handle:
+        while True:
+            payload = handle.read(8192 * 8)
+            if not payload:
+                break
+            chunks.append(payload)
+    return b"".join(chunks)
+
+
 def encode_state_buckets(state: CanonicalizeState) -> tuple[bytes, ...]:
-    """Encode every bucket artifact in deterministic bucket order."""
     _validate_state(state)
     return tuple(
-        encode_bucket(state.bucket_count, bucket) for bucket in state.bucket_sets
+        encode_bucket_from_path(
+            state.bucket_count,
+            index,
+            _bucket_file(state.spill_dir, index),
+            state.bucket_counts[index],
+        )
+        for index in range(state.bucket_count)
     )
 
 
 def decode_bucket(payload: bytes, bucket_count: int, expected_index: int) -> tuple[int, ...]:
-    """Decode and validate one deterministic bucket artifact."""
     if len(payload) < _BUCKET_HEADER.size:
         raise StructuralCanonicalizeError("bucket artifact is truncated")
     magic, version, encoded_count, encoded_index, value_count = _BUCKET_HEADER.unpack_from(
@@ -463,11 +660,38 @@ def decode_bucket(payload: bytes, bucket_count: int, expected_index: int) -> tup
         if value <= previous:
             raise StructuralCanonicalizeError("bucket artifact values are not sorted unique")
         previous = value
+    _assert_bounded_materialization(len(values))
     return values
 
 
+def _write_bucket_payload(path: Path, payload: bytes, bucket_count: int, index: int) -> int:
+    if len(payload) < _BUCKET_HEADER.size:
+        raise StructuralCanonicalizeError("bucket artifact is truncated")
+    magic, version, encoded_count, encoded_index, value_count = _BUCKET_HEADER.unpack_from(
+        payload, 0
+    )
+    if magic != BUCKET_MAGIC:
+        raise StructuralCanonicalizeError("bucket artifact magic mismatch")
+    if version != BUCKET_FORMAT_VERSION:
+        raise StructuralCanonicalizeError("bucket artifact version mismatch")
+    if encoded_count != bucket_count or encoded_index != index:
+        raise StructuralCanonicalizeError("bucket artifact order mismatch")
+    if len(payload) != _BUCKET_HEADER.size + value_count * 8:
+        raise StructuralCanonicalizeError("bucket artifact length mismatch")
+    previous = 0
+    with path.open("wb") as handle:
+        for offset in range(_BUCKET_HEADER.size, len(payload), 8):
+            value = _UINT64_PACK.unpack_from(payload, offset)[0]
+            if value <= previous:
+                raise StructuralCanonicalizeError("bucket artifact values are not sorted unique")
+            if bucket_index(value, bucket_count) != index:
+                raise StructuralCanonicalizeError("bucket value is not in its bucket")
+            handle.write(_UINT64_PACK.pack(value & _UINT64_MASK))
+            previous = value
+    return value_count
+
+
 def state_summary(state: CanonicalizeState) -> dict[str, Any]:
-    """Return the O(bucket_count) summary JSON of a state."""
     _validate_state(state)
     return {
         "schema_version": STATE_SCHEMA_VERSION,
@@ -479,14 +703,13 @@ def state_summary(state: CanonicalizeState) -> dict[str, Any]:
         "witness_row_count": state.witness_row_count,
         "first_boundary": state.first_boundary,
         "last_boundary": state.last_boundary,
-        "bucket_counts": [len(bucket.values) for bucket in state.bucket_sets],
+        "bucket_counts": list(state.bucket_counts),
     }
 
 
 def attach_bucket_refs(
     summary: dict[str, Any], bucket_refs: tuple[Any, ...]
 ) -> dict[str, Any]:
-    """Return the summary carrying bucket artifact references in bucket order."""
     if len(bucket_refs) != int(summary["bucket_count"]):
         raise StructuralCanonicalizeError("bucket reference count mismatch")
     enriched = dict(summary)
@@ -500,7 +723,6 @@ def attach_bucket_refs(
 def decode_state(
     summary: dict[str, Any], bucket_payloads: tuple[bytes, ...]
 ) -> CanonicalizeState:
-    """Rebuild and validate a state from a summary and its bucket artifacts."""
     if not isinstance(summary, dict):
         raise StructuralCanonicalizeError("canonicalization summary must be an object")
     if summary.get("schema_version") != STATE_SCHEMA_VERSION:
@@ -529,12 +751,15 @@ def decode_state(
     if len(bucket_payloads) != bucket_count:
         raise StructuralCanonicalizeError("canonicalization bucket artifacts are incomplete")
 
-    bucket_sets: list[BucketSet] = []
+    spill_dir = _make_spill_dir()
+    written_counts: list[int] = []
     for index, payload in enumerate(bucket_payloads):
-        values = decode_bucket(payload, bucket_count, index)
-        if len(values) != bucket_counts[index]:
+        written = _write_bucket_payload(
+            _bucket_file(spill_dir, index), payload, bucket_count, index
+        )
+        if written != bucket_counts[index]:
             raise StructuralCanonicalizeError("canonicalization bucket count mismatch")
-        bucket_sets.append(BucketSet(index, values))
+        written_counts.append(written)
 
     for name in ("positive_row_count", "positive_group_count", "witness_row_count"):
         value = summary.get(name)
@@ -543,7 +768,8 @@ def decode_state(
 
     state = CanonicalizeState(
         bucket_count=bucket_count,
-        bucket_sets=tuple(bucket_sets),
+        spill_dir=spill_dir,
+        bucket_counts=tuple(written_counts),
         positive_row_count=int(summary["positive_row_count"]),
         positive_group_count=int(summary["positive_group_count"]),
         witness_row_count=int(summary["witness_row_count"]),

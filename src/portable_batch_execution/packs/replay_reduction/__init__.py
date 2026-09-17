@@ -16,8 +16,10 @@ from .canonicalize import (
     encode_state_buckets,
     execute_structural_canonicalize,
     merge_structural_canonicalize_states,
+    read_bucket_values,
     splitmix64,
     state_summary,
+    states_equal,
 )
 from .event_window import execute_event_window_extract
 from .pack import ReplayReductionPack
@@ -40,7 +42,9 @@ __all__ = [
     "execute_event_window_extract",
     "execute_structural_canonicalize",
     "merge_structural_canonicalize_states",
+    "read_bucket_values",
     "splitmix64",
     "state_summary",
+    "states_equal",
 ]
 
