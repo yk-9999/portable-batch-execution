@@ -233,7 +233,7 @@ def test_invalid_non_positive_fails_closed(tmp_path):
         execute_event_window_extract([path], _REQUEST)
 
 
-def test_non_contiguous_recurrence_fails_closed(tmp_path):
+def test_non_contiguous_recurrence_collapses_for_event_window(tmp_path):
     path = tmp_path / "recur.parquet"
     pl.DataFrame(
         [
@@ -266,5 +266,5 @@ def test_non_contiguous_recurrence_fails_closed(tmp_path):
             },
         ]
     ).write_parquet(path)
-    with pytest.raises(StructuralCanonicalizeError):
-        execute_event_window_extract([path], _REQUEST)
+    result = execute_event_window_extract([path], _REQUEST)
+    assert result["facts"]

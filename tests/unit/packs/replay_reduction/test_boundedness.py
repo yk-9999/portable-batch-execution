@@ -119,7 +119,7 @@ def test_canonicalize_avoids_global_group_and_nunique_aggregations(tmp_path, mon
     assert state.positive_group_count == 3
 
 
-def test_non_contiguous_recurrence_fails_across_scan_batches(tmp_path, monkeypatch):
+def test_non_contiguous_recurrence_collapses_across_scan_batches(tmp_path, monkeypatch):
     monkeypatch.setattr(canonicalize, "_IDENTITY_SCAN_BATCH", 2)
     path = tmp_path / "part.parquet"
     pl.DataFrame(
@@ -129,11 +129,11 @@ def test_non_contiguous_recurrence_fails_across_scan_batches(tmp_path, monkeypat
             {"identity": 1, "identity_norm": "1", "price": 1.0},
         ]
     ).write_parquet(path)
-    with pytest.raises(canonicalize.StructuralCanonicalizeError):
-        canonicalize.execute_structural_canonicalize([path], _PARAMS)
+    state = canonicalize.execute_structural_canonicalize([path], _PARAMS)
+    assert state.positive_group_count == 2
 
 
-def test_non_contiguous_recurrence_fails_across_sort_runs(tmp_path, monkeypatch):
+def test_non_contiguous_recurrence_collapses_across_sort_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(canonicalize, "_SORT_RUN_CAPACITY", 1)
     path = tmp_path / "part.parquet"
     pl.DataFrame(
@@ -143,8 +143,8 @@ def test_non_contiguous_recurrence_fails_across_sort_runs(tmp_path, monkeypatch)
             {"identity": 1, "identity_norm": "1", "price": 1.0},
         ]
     ).write_parquet(path)
-    with pytest.raises(canonicalize.StructuralCanonicalizeError):
-        canonicalize.execute_structural_canonicalize([path], _PARAMS)
+    state = canonicalize.execute_structural_canonicalize([path], _PARAMS)
+    assert state.positive_group_count == 2
 
 
 def test_production_publish_uses_incremental_bucket_payloads(tmp_path, monkeypatch):

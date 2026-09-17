@@ -428,33 +428,59 @@ def test_multi_shard_deterministic_equivalence(tmp_path):
     assert combined == single
 
 
-def test_non_contiguous_same_file_duplicate_identity_fail_closed(tmp_path):
+def test_non_contiguous_same_file_duplicate_identity_collapses(tmp_path):
     path = _write(
         tmp_path / "trades.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000),
-            _trade_row(identity=2, identity_norm="2", block=91, timestamp_ms=8_100),
-            _trade_row(identity=1, identity_norm="1", block=92, timestamp_ms=8_200),
+            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, notional=10.0),
+            _trade_row(identity=2, identity_norm="2", block=91, timestamp_ms=8_100, notional=20.0),
+            _trade_row(identity=1, identity_norm="1", block=92, timestamp_ms=8_200, notional=30.0),
         ],
     )
-    with pytest.raises(StructuralCanonicalizeError):
-        execute_causal_grid_extract([path], _request())
+    witness = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=90, timestamp_ms=8_000),
+            _witness_row(block=100, timestamp_ms=9_000),
+            _witness_row(block=110, timestamp_ms=10_000),
+        ],
+    )
+    facts = _facts_by_id(
+        execute_causal_grid_extract(
+            [path, witness],
+            _request(
+                input_roles=(
+                    {"input_index": 0, "role": "canonical_trade"},
+                    {"input_index": 1, "role": "causal_witness"},
+                ),
+            ),
+        )["rows"][0]
+    )
+    assert facts["trade_notional_60s.sum"] == 50.0
+    assert facts["trade_notional_60s.count"] == 2
 
 
-def test_cross_shard_duplicate_identity_fail_closed(tmp_path):
+def test_cross_shard_duplicate_identity_collapses_once(tmp_path):
     path_a = _write(
         tmp_path / "a.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000),
-            _trade_row(identity=2, identity_norm="2", block=91, timestamp_ms=8_050),
+            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, notional=10.0),
+            _trade_row(identity=2, identity_norm="2", block=91, timestamp_ms=8_050, notional=20.0),
         ],
     )
     path_b = _write(
         tmp_path / "b.parquet",
-        [_trade_row(identity=1, identity_norm="1", block=92, timestamp_ms=8_100)],
+        [_trade_row(identity=1, identity_norm="1", block=92, timestamp_ms=8_100, notional=5.0)],
     )
-    witness = _write(tmp_path / "w.parquet", [_witness_row(block=90, timestamp_ms=8_000)])
-    with pytest.raises(StructuralCanonicalizeError):
+    witness = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=90, timestamp_ms=8_000),
+            _witness_row(block=100, timestamp_ms=9_000),
+            _witness_row(block=110, timestamp_ms=10_000),
+        ],
+    )
+    facts = _facts_by_id(
         execute_causal_grid_extract(
             [path_a, path_b, witness],
             _request(
@@ -464,7 +490,10 @@ def test_cross_shard_duplicate_identity_fail_closed(tmp_path):
                     {"input_index": 2, "role": "causal_witness"},
                 ),
             ),
-        )
+        )["rows"][0]
+    )
+    assert facts["trade_notional_60s.sum"] == 25.0
+    assert facts["trade_notional_60s.count"] == 2
 
 
 def test_conflicting_duplicate_core_fail_closed(tmp_path):
@@ -527,5 +556,62 @@ def test_rolling_window_eviction_at_carry_boundary(tmp_path):
     )
     first_result = execute_causal_grid_extract([trades, witness], first)
     carry = first_result["outgoing_carry"]
-    assert carry["schema_version"] == "pbe.replay.causal-grid-carry.v2"
+    assert carry["schema_version"] == "pbe.replay.causal-grid-carry.v3"
     assert all(row["exchange_time_ms"] >= 10_000 for row in carry["trade_rows"])
+
+
+def test_unsorted_witness_matches_sorted_equivalent(tmp_path):
+    trades = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=100, timestamp_ms=8_000),
+            _trade_row(identity=2, identity_norm="2", block=110, timestamp_ms=9_000),
+        ],
+    )
+    sorted_witness = _write(
+        tmp_path / "w_sorted.parquet",
+        [
+            _witness_row(block=100, timestamp_ms=8_000),
+            _witness_row(block=120, timestamp_ms=9_500),
+            _witness_row(block=130, timestamp_ms=10_000),
+        ],
+    )
+    unsorted_witness = _write(
+        tmp_path / "w_unsorted.parquet",
+        [
+            _witness_row(block=130, timestamp_ms=10_000),
+            _witness_row(block=100, timestamp_ms=8_000),
+            _witness_row(block=120, timestamp_ms=9_500),
+        ],
+    )
+    request = _request(
+        input_roles=(
+            {"input_index": 0, "role": "canonical_trade"},
+            {"input_index": 1, "role": "causal_witness"},
+        ),
+    )
+    sorted_rows = execute_causal_grid_extract([trades, sorted_witness], request)["rows"]
+    unsorted_rows = execute_causal_grid_extract([trades, unsorted_witness], request)["rows"]
+    assert sorted_rows == unsorted_rows
+
+
+def test_large_observation_count_does_not_hit_history_cap(tmp_path):
+    witness_rows = [
+        _witness_row(block=100 + index, timestamp_ms=8_000 + index)
+        for index in range(80_000)
+    ]
+    trades = _write(
+        tmp_path / "trades.parquet",
+        [_trade_row(identity=1, identity_norm="1", block=200_000, timestamp_ms=100_000)],
+    )
+    witness = _write(tmp_path / "w.parquet", witness_rows)
+    row = execute_causal_grid_extract(
+        [trades, witness],
+        _request(
+            input_roles=(
+                {"input_index": 0, "role": "canonical_trade"},
+                {"input_index": 1, "role": "causal_witness"},
+            ),
+        ),
+    )["rows"][0]
+    assert row["causal_cutoff_block"] is not None

@@ -183,7 +183,7 @@ def _iter_uint64_path(path: Path) -> Iterator[int]:
             yield int(_UINT64_PACK.unpack(payload)[0])
 
 
-def _k_way_merge_sorted_fail_on_duplicate(sources: list[Path], dest: Path) -> None:
+def _k_way_merge_sorted_unique(sources: list[Path], dest: Path) -> None:
     heap: list[tuple[int, int, Iterator[int]]] = []
     for source_index, source in enumerate(sources):
         iterator = _iter_uint64_path(source)
@@ -195,9 +195,10 @@ def _k_way_merge_sorted_fail_on_duplicate(sources: list[Path], dest: Path) -> No
         while heap:
             value, source_index, iterator = heapq.heappop(heap)
             if last_written == value:
-                raise StructuralCanonicalizeError(
-                    "positive identity recurs non-contiguously within one input"
-                )
+                next_value = next(iterator, None)
+                if next_value is not None:
+                    heapq.heappush(heap, (next_value, source_index, iterator))
+                continue
             output.write(_UINT64_PACK.pack(value & _UINT64_MASK))
             last_written = value
             next_value = next(iterator, None)
@@ -206,14 +207,12 @@ def _k_way_merge_sorted_fail_on_duplicate(sources: list[Path], dest: Path) -> No
 
 
 def _finalize_sorted_bucket_file(path: Path) -> int:
-    previous = 0
+    previous: int | None = None
     count = 0
     for value in _iter_uint64_path(path):
-        if count and value <= previous:
+        if previous is not None and value <= previous:
             if value == previous:
-                raise StructuralCanonicalizeError(
-                    "positive identity recurs non-contiguously within one input"
-                )
+                continue
             raise StructuralCanonicalizeError("bucket values must be sorted unique")
         previous = value
         count += 1
@@ -249,7 +248,7 @@ def _sort_unique_bucket_file_in_place(path: Path) -> int:
     if len(run_paths) == 1:
         run_paths[0].replace(path)
         return _finalize_sorted_bucket_file(path)
-    _k_way_merge_sorted_fail_on_duplicate(run_paths, path)
+    _k_way_merge_sorted_unique(run_paths, path)
     for run_path in run_paths:
         run_path.unlink(missing_ok=True)
     return _finalize_sorted_bucket_file(path)
@@ -264,9 +263,9 @@ def _stream_validate_and_spill_positive_rows(
 ) -> tuple[int, tuple[int, ...], dict[str, Any], dict[str, Any]]:
     _init_empty_spill(bucket_count, spill_dir)
     handles = [_bucket_file(spill_dir, index).open("ab") for index in range(bucket_count)]
-    previous_identity: int | None = None
-    group_core: dict[str, Any] | None = None
-    group_count = 0
+    bucket_cores: list[dict[int, dict[str, Any]]] = [
+        {} for _ in range(bucket_count)
+    ]
     first_boundary: dict[str, Any] | None = None
     last_boundary: dict[str, Any] | None = None
     select_columns = ["_identity_int", *core_fields]
@@ -281,31 +280,29 @@ def _stream_validate_and_spill_positive_rows(
                     if row[field] is None:
                         raise StructuralCanonicalizeError("measurement core fields disagree")
                 identity = int(row["_identity_int"])
-                if previous_identity is None or identity != previous_identity:
-                    index = bucket_index(identity, bucket_count)
+                index = bucket_index(identity, bucket_count)
+                core = {field: row[field] for field in core_fields}
+                existing = bucket_cores[index].get(identity)
+                if existing is None:
+                    bucket_cores[index][identity] = core
                     handles[index].write(_UINT64_PACK.pack(identity & _UINT64_MASK))
-                    group_core = {field: row[field] for field in core_fields}
-                    group_count += 1
-                    profile = _boundary_profile(row, core_fields)
-                    if first_boundary is None:
-                        first_boundary = profile
-                    last_boundary = profile
                 else:
-                    if group_core is None:
-                        raise StructuralCanonicalizeError("measurement core fields disagree")
                     for field in core_fields:
-                        if row[field] != group_core[field]:
+                        if core[field] != existing[field]:
                             raise StructuralCanonicalizeError(
                                 "measurement core fields disagree"
                             )
-                    last_boundary = _boundary_profile(row, core_fields)
-                previous_identity = identity
+                profile = _boundary_profile(row, core_fields)
+                if first_boundary is None:
+                    first_boundary = profile
+                last_boundary = profile
             offset += batch_size
     finally:
         for handle in handles:
             handle.close()
     if first_boundary is None or last_boundary is None:
         raise StructuralCanonicalizeError("positive rows missing boundary profiles")
+    group_count = sum(len(bucket) for bucket in bucket_cores)
     bucket_counts: list[int] = []
     for index in range(bucket_count):
         bucket_counts.append(
@@ -338,10 +335,6 @@ def _stream_merge_sorted_unique_files(
                 chosen = right_value
                 right_value = next(right_iter, None)
             else:
-                if allowed_identity is None or left_value != allowed_identity:
-                    raise StructuralCanonicalizeError(
-                        "non-contiguous recurrence of a positive identity"
-                    )
                 chosen = left_value
                 left_value = next(left_iter, None)
                 right_value = next(right_iter, None)
@@ -562,13 +555,12 @@ def _merge_states(
         )
         merged_counts.append(count)
 
+    group_count = sum(merged_counts)
     if shared_boundary:
-        group_count = left.positive_group_count + right.positive_group_count - 1
         row_count = left.positive_row_count + right.positive_row_count - (
             1 if subtract_boundary_row else 0
         )
     else:
-        group_count = left.positive_group_count + right.positive_group_count
         row_count = left.positive_row_count + right.positive_row_count
 
     merged_state = CanonicalizeState(

@@ -175,35 +175,35 @@ def test_shared_boundary_core_conflict_fails(tmp_path):
         )
 
 
-def test_non_contiguous_recurrence_within_one_input_fails(tmp_path):
-    with pytest.raises(StructuralCanonicalizeError):
-        execute_structural_canonicalize(
-            _paths(
-                tmp_path,
-                [
-                    {"identity": 1, "identity_norm": "1", "price": 1.0},
-                    {"identity": 2, "identity_norm": "2", "price": 2.0},
-                    {"identity": 1, "identity_norm": "1", "price": 1.0},
-                ],
-            ),
-            _PARAMS,
-        )
+def test_non_contiguous_recurrence_within_one_input_collapses(tmp_path):
+    state = execute_structural_canonicalize(
+        _paths(
+            tmp_path,
+            [
+                {"identity": 1, "identity_norm": "1", "price": 1.0},
+                {"identity": 2, "identity_norm": "2", "price": 2.0},
+                {"identity": 1, "identity_norm": "1", "price": 1.0},
+            ],
+        ),
+        _PARAMS,
+    )
+    assert state.positive_group_count == 2
 
 
-def test_non_contiguous_recurrence_across_source_files_fails(tmp_path):
-    with pytest.raises(StructuralCanonicalizeError):
-        execute_structural_canonicalize(
-            _paths(
-                tmp_path,
-                [{"identity": 1, "identity_norm": "1", "price": 1.0}],
-                [{"identity": 2, "identity_norm": "2", "price": 2.0}],
-                [{"identity": 1, "identity_norm": "1", "price": 1.0}],
-            ),
-            _PARAMS,
-        )
+def test_non_contiguous_recurrence_across_source_files_collapses(tmp_path):
+    state = execute_structural_canonicalize(
+        _paths(
+            tmp_path,
+            [{"identity": 1, "identity_norm": "1", "price": 1.0}],
+            [{"identity": 2, "identity_norm": "2", "price": 2.0}],
+            [{"identity": 1, "identity_norm": "1", "price": 1.0}],
+        ),
+        _PARAMS,
+    )
+    assert state.positive_group_count == 2
 
 
-def test_non_contiguous_recurrence_across_merge_waves_fails(tmp_path):
+def test_non_contiguous_recurrence_across_merge_waves_collapses(tmp_path):
     left = _state(tmp_path, [{"identity": 1, "identity_norm": "1", "price": 1.0}])
     right = _state(
         tmp_path,
@@ -212,8 +212,8 @@ def test_non_contiguous_recurrence_across_merge_waves_fails(tmp_path):
             {"identity": 1, "identity_norm": "1", "price": 1.0},
         ],
     )
-    with pytest.raises(StructuralCanonicalizeError):
-        merge_structural_canonicalize_states(left, right)
+    merged = merge_structural_canonicalize_states(left, right)
+    assert merged.positive_group_count == 2
 
 
 def test_group_split_exactly_across_adjacent_wave_boundary_dedups_once(tmp_path):

@@ -128,8 +128,13 @@ class EmitGridSpec(Frozen):
 
 
 class CausalGridCarryState(Frozen):
-    schema_version: Literal["pbe.replay.causal-grid-carry.v1", "pbe.replay.causal-grid-carry.v2"]
+    schema_version: Literal[
+        "pbe.replay.causal-grid-carry.v1",
+        "pbe.replay.causal-grid-carry.v2",
+        "pbe.replay.causal-grid-carry.v3",
+    ]
     causal_observations: tuple[tuple[int, int, int], ...] = ()
+    causal_block_first_ms: tuple[tuple[int, int, int], ...] = ()
     trade_rows: tuple[dict[str, Any], ...] = ()
 
 

@@ -16,49 +16,23 @@ import polars as pl
 
 from .canonicalize import (
     _IDENTITY_SCAN_BATCH,
-    _UINT64_MASK,
-    _UINT64_PACK,
     StructuralCanonicalizeError,
-    _bucket_contains_identity,
-    _bucket_file,
-    _init_empty_spill,
     _require_columns,
-    _sort_unique_bucket_file_in_place,
     bucket_index,
     execute_structural_canonicalize,
 )
 from .event_window import _as_of_preferred, _row_is_sentinel, _validate_positive_row
 from .models import CausalGridExtractRequest
+from .spill_sort import (
+    external_sort_lazy_batches,
+    external_sort_lazy_frame,
+    iter_k_way_merge_dataframes,
+)
 
 RESULT_SCHEMA_VERSION = "pbe.replay.causal-grid-extract-result.v1"
-CARRY_SCHEMA_VERSION = "pbe.replay.causal-grid-carry.v2"
-_COLLAPSE_BATCH_ROWS = 65_536
-_MAX_CAUSAL_OBSERVATIONS_PER_SEGMENT = 65_536
-
-
-class _EmittedIdentitySpill:
-    """On-disk exact-ID membership for collapsed trade identities (bounded buckets)."""
-
-    def __init__(self, *, bucket_count: int, spill_dir: Path) -> None:
-        self.bucket_count = bucket_count
-        self.spill_dir = spill_dir / "emitted_ids"
-        self.spill_dir.mkdir(parents=True, exist_ok=True)
-        _init_empty_spill(bucket_count, self.spill_dir)
-
-    def _contains(self, identity: int) -> bool:
-        path = _bucket_file(self.spill_dir, bucket_index(identity, self.bucket_count))
-        return _bucket_contains_identity(path, self.bucket_count, identity)
-
-    def mark_emitted(self, identity: int) -> None:
-        if self._contains(identity):
-            raise StructuralCanonicalizeError(
-                "positive identity recurs non-contiguously within one input"
-            )
-        index = bucket_index(identity, self.bucket_count)
-        path = _bucket_file(self.spill_dir, index)
-        with path.open("ab") as handle:
-            handle.write(_UINT64_PACK.pack(identity & _UINT64_MASK))
-        _sort_unique_bucket_file_in_place(path)
+CARRY_SCHEMA_VERSION = "pbe.replay.causal-grid-carry.v3"
+_BUCKET_SPILL_BATCH = 65_536
+_COLLAPSED_RUN_BATCH = 65_536
 
 
 def _validated(
@@ -87,12 +61,14 @@ def _segment_id(ms: int, missing_dates: frozenset[str]) -> int:
 
 
 @dataclass
-class _CausalSegmentCompact:
+class _CausalSegmentFrontier:
+    """Compact per-segment block frontier for frozen causal cutoff semantics."""
+
     segment_id: int
     monotone_ok: bool = True
     last_time: int | None = None
     last_block: int | None = None
-    observations: deque[tuple[int, int]] = field(default_factory=deque)
+    block_first_ms: dict[int, int] = field(default_factory=dict)
 
     def observe(self, *, exchange_time_ms: int, block_number: int) -> None:
         if (
@@ -101,65 +77,81 @@ class _CausalSegmentCompact:
                 exchange_time_ms < self.last_time
                 or (
                     self.last_block is not None
-                    and exchange_time_ms >= self.last_time
                     and block_number < self.last_block
+                    and exchange_time_ms >= self.last_time
                 )
             )
         ):
             self.monotone_ok = False
-        if len(self.observations) >= _MAX_CAUSAL_OBSERVATIONS_PER_SEGMENT:
-            raise StructuralCanonicalizeError("causal observation carry exceeded safe bound")
-        self.observations.append((exchange_time_ms, block_number))
+        prior = self.block_first_ms.get(block_number)
+        if prior is None or exchange_time_ms < prior:
+            self.block_first_ms[block_number] = exchange_time_ms
         self.last_time = exchange_time_ms
         self.last_block = block_number
 
     def causal_cutoff_block(self, decision_time_ms: int) -> int | None:
         if not self.monotone_ok:
             return None
-        eligible_blocks = {
+        eligible = [
             block
-            for observed_time, block in self.observations
-            if observed_time <= decision_time_ms
-        }
-        if len(eligible_blocks) < 2:
+            for block, first_ms in self.block_first_ms.items()
+            if first_ms <= decision_time_ms
+        ]
+        if len(eligible) < 2:
             return None
-        witness = max(eligible_blocks)
-        lower = [block for block in eligible_blocks if block < witness]
+        witness = max(eligible)
+        lower = [block for block in eligible if block < witness]
         if not lower:
             return None
         return max(lower)
 
-    def export_carry(self, *, min_time_ms: int) -> tuple[tuple[int, int], ...]:
-        return tuple((self.segment_id, tm, block) for tm, block in self.observations if tm >= min_time_ms)
+    def export_block_first_ms(self) -> tuple[tuple[int, int, int], ...]:
+        return tuple(
+            (self.segment_id, block, first_ms)
+            for block, first_ms in sorted(self.block_first_ms.items())
+        )
+
+    def load_block_first_ms(self, entries: tuple[tuple[int, int, int], ...]) -> None:
+        for segment_id, block_number, first_ms in entries:
+            if segment_id != self.segment_id:
+                continue
+            prior = self.block_first_ms.get(block_number)
+            if prior is None or first_ms < prior:
+                self.block_first_ms[block_number] = first_ms
 
 
 @dataclass
 class _CausalIndex:
     missing_dates: frozenset[str]
-    segments: dict[int, _CausalSegmentCompact] = field(default_factory=dict)
+    segments: dict[int, _CausalSegmentFrontier] = field(default_factory=dict)
 
     @classmethod
     def from_carry(
         cls,
         missing_dates: frozenset[str],
         carry_observations: tuple[tuple[int, int, int], ...],
+        carry_block_first_ms: tuple[tuple[int, int, int], ...] = (),
     ) -> _CausalIndex:
         index = cls(missing_dates=missing_dates)
-        for segment_id, exchange_time_ms, block_number in carry_observations:
-            state = index._state_for_segment(segment_id)
-            state.observe(
-                exchange_time_ms=exchange_time_ms,
-                block_number=block_number,
-            )
+        if carry_block_first_ms:
+            for segment_id, block_number, first_ms in carry_block_first_ms:
+                state = index._state_for_segment(segment_id)
+                state.load_block_first_ms(((segment_id, block_number, first_ms),))
+        else:
+            for segment_id, exchange_time_ms, block_number in carry_observations:
+                index._state_for_segment(segment_id).observe(
+                    exchange_time_ms=exchange_time_ms,
+                    block_number=block_number,
+                )
         return index
 
-    def _state_for_time(self, exchange_ms: int) -> _CausalSegmentCompact:
+    def _state_for_time(self, exchange_ms: int) -> _CausalSegmentFrontier:
         segment = _segment_id(exchange_ms, self.missing_dates)
         return self._state_for_segment(segment)
 
-    def _state_for_segment(self, segment_id: int) -> _CausalSegmentCompact:
+    def _state_for_segment(self, segment_id: int) -> _CausalSegmentFrontier:
         if segment_id not in self.segments:
-            self.segments[segment_id] = _CausalSegmentCompact(segment_id=segment_id)
+            self.segments[segment_id] = _CausalSegmentFrontier(segment_id=segment_id)
         return self.segments[segment_id]
 
     def observe(self, *, exchange_time_ms: int, block_number: int) -> None:
@@ -175,10 +167,10 @@ class _CausalIndex:
             return None
         return state.causal_cutoff_block(decision_time_ms)
 
-    def export_carry(self, *, min_time_ms: int) -> tuple[tuple[int, int, int], ...]:
+    def export_carry(self) -> tuple[tuple[int, int, int], ...]:
         exported: list[tuple[int, int, int]] = []
-        for segment_id, state in sorted(self.segments.items()):
-            exported.extend(state.export_carry(min_time_ms=min_time_ms))
+        for segment_id in sorted(self.segments):
+            exported.extend(self.segments[segment_id].export_block_first_ms())
         return tuple(exported)
 
 
@@ -354,36 +346,105 @@ def _stream_positive_rows(path: Path, model: CausalGridExtractRequest) -> Iterat
         offset += batch_size
 
 
-def _row_to_trade_event(row: dict[str, Any], model: CausalGridExtractRequest) -> _TradeEvent:
-    trade_map = model.canonical_trade_mapping
+def _row_dict_to_trade_event(row: dict[str, Any], model: CausalGridExtractRequest) -> _TradeEvent:
+    tie = row.get("tie_break")
+    if tie is None:
+        tie = _tie_break_tuple(row, model.tie_break_columns)
     return _TradeEvent(
-        symbol=str(row[trade_map.symbol_column]),
-        exchange_time_ms=int(row["_timestamp_ms"]),
-        block_number=int(row["_block_int"]),
-        price=float(row[trade_map.price_field]),
-        notional_usd=float(row[trade_map.notional_field]),
-        tie_break=_tie_break_tuple(row, model.tie_break_columns),
+        symbol=str(row["symbol"]),
+        exchange_time_ms=int(row["exchange_time_ms"]),
+        block_number=int(row["block_number"]),
+        price=float(row["price"]),
+        notional_usd=float(row["notional_usd"]),
+        tie_break=tuple(tie),
     )
 
 
-def _flush_collapsed_batch(
-    batch: list[_TradeEvent],
+def _row_preferred(
+    candidate: dict[str, Any],
+    current: dict[str, Any],
+    tie_break: tuple[str, ...],
+) -> bool:
+    candidate_dict = {
+        "price": candidate["price"],
+        **{column: candidate[column] for column in tie_break},
+    }
+    current_dict = {
+        "price": current["price"],
+        **{column: current[column] for column in tie_break},
+    }
+    return _as_of_preferred(candidate_dict, current_dict, tie_break)
+
+
+def _flush_bucket_spill_batch(batch: list[dict[str, Any]], *, part_path: Path) -> None:
+    pl.DataFrame(batch).write_parquet(part_path)
+
+
+def _collapse_bucket_identity_groups(
+    bucket_dir: Path,
+    model: CausalGridExtractRequest,
     *,
+    core_fields: tuple[str, ...],
     spill_dir: Path,
-    part_index: int,
-) -> Path:
-    path = spill_dir / f"collapsed_{part_index:05d}.parquet"
-    pl.DataFrame(
-        {
-            "exchange_time_ms": [item.exchange_time_ms for item in batch],
-            "block_number": [item.block_number for item in batch],
-            "symbol": [item.symbol for item in batch],
-            "price": [item.price for item in batch],
-            "notional_usd": [item.notional_usd for item in batch],
-            "tie_break": [item.tie_break for item in batch],
-        }
-    ).write_parquet(path)
-    return path
+    bucket_index_value: int,
+) -> list[Path]:
+    parts = sorted(bucket_dir.glob("part_*.parquet"))
+    if not parts:
+        return []
+    lazy = pl.concat([pl.scan_parquet(str(path)) for path in parts], how="vertical_relaxed")
+    sort_keys = (
+        "identity",
+        "exchange_time_ms",
+        "block_number",
+        *model.tie_break_columns,
+    )
+    sorted_runs = external_sort_lazy_frame(
+        lazy,
+        sort_keys=sort_keys,
+        spill_dir=spill_dir / f"sort_b{bucket_index_value:05d}",
+        run_prefix="identity",
+    )
+    collapsed_batch: list[dict[str, Any]] = []
+    collapsed_runs: list[Path] = []
+    run_index = 0
+    current_identity: int | None = None
+    current_core: dict[str, Any] | None = None
+    best_row: dict[str, Any] | None = None
+
+    def flush_collapsed() -> None:
+        nonlocal run_index, best_row
+        if best_row is None:
+            return
+        collapsed_batch.append(best_row)
+        best_row = None
+        if len(collapsed_batch) >= _COLLAPSED_RUN_BATCH:
+            run_path = spill_dir / f"collapsed_b{bucket_index_value:05d}_{run_index:05d}.parquet"
+            pl.DataFrame(collapsed_batch).write_parquet(run_path)
+            collapsed_runs.append(run_path)
+            collapsed_batch.clear()
+            run_index += 1
+
+    for row in iter_k_way_merge_dataframes(sorted_runs, sort_keys=sort_keys):
+        identity = int(row["identity"])
+        if current_identity is None or identity != current_identity:
+            flush_collapsed()
+            current_identity = identity
+            current_core = {field: row[field] for field in core_fields}
+            best_row = row
+            continue
+        if current_core is None:
+            raise StructuralCanonicalizeError("measurement core fields disagree")
+        for core_field in core_fields:
+            if row[core_field] != current_core[core_field]:
+                raise StructuralCanonicalizeError("measurement core fields disagree")
+        if best_row is not None and _row_preferred(row, best_row, model.tie_break_columns):
+            best_row = row
+    flush_collapsed()
+    if collapsed_batch:
+        run_path = spill_dir / f"collapsed_b{bucket_index_value:05d}_{run_index:05d}.parquet"
+        pl.DataFrame(collapsed_batch).write_parquet(run_path)
+        collapsed_runs.append(run_path)
+    return collapsed_runs
 
 
 def _materialize_collapsed_trades(
@@ -391,34 +452,31 @@ def _materialize_collapsed_trades(
     model: CausalGridExtractRequest,
     *,
     spill_dir: Path,
-    emitted: _EmittedIdentitySpill,
+    bucket_count: int,
 ) -> list[Path]:
     profile = model.canonical_trade_mapping.canonical_trade_profile
     sentinel = profile.sentinel
     identity_col = profile.identity_source_column
     normalized_col = profile.identity_normalized_column
-    core_fields = profile.measurement_core_fields
+    core_fields = tuple(profile.measurement_core_fields)
+    trade_map = model.canonical_trade_mapping
+    tie_break = model.tie_break_columns
 
-    pending_row: dict[str, Any] | None = None
-    pending_identity: int | None = None
-    pending_core: dict[str, Any] | None = None
-    batch: list[_TradeEvent] = []
-    part_paths: list[Path] = []
+    bucket_root = spill_dir / "trade_buckets"
+    bucket_root.mkdir(parents=True, exist_ok=True)
+    bucket_batches: list[list[dict[str, Any]]] = [[] for _ in range(bucket_count)]
+    bucket_part_counts = [0 for _ in range(bucket_count)]
 
-    def flush_pending() -> None:
-        nonlocal pending_row, pending_identity, pending_core
-        if pending_row is None or pending_identity is None:
+    def flush_bucket_batch(bucket_value: int) -> None:
+        batch = bucket_batches[bucket_value]
+        if not batch:
             return
-        emitted.mark_emitted(pending_identity)
-        batch.append(_row_to_trade_event(pending_row, model))
-        pending_row = None
-        pending_identity = None
-        pending_core = None
-        if len(batch) >= _COLLAPSE_BATCH_ROWS:
-            part_paths.append(
-                _flush_collapsed_batch(batch, spill_dir=spill_dir, part_index=len(part_paths))
-            )
-            batch.clear()
+        bucket_dir = bucket_root / f"bucket_{bucket_value:05d}"
+        bucket_dir.mkdir(parents=True, exist_ok=True)
+        part_path = bucket_dir / f"part_{bucket_part_counts[bucket_value]:05d}.parquet"
+        _flush_bucket_spill_batch(batch, part_path=part_path)
+        bucket_part_counts[bucket_value] += 1
+        batch.clear()
 
     for path in trade_paths:
         for row in _stream_positive_rows(path, model):
@@ -430,128 +488,148 @@ def _materialize_collapsed_trades(
                 normalized_col=normalized_col,
                 core_fields=core_fields,
             )
-            if pending_identity is None or identity != pending_identity:
-                flush_pending()
-                if emitted._contains(identity):
-                    raise StructuralCanonicalizeError(
-                        "positive identity recurs non-contiguously within one input"
-                    )
-                pending_identity = identity
-                pending_core = {field_name: row[field_name] for field_name in core_fields}
-            elif pending_core is None:
-                raise StructuralCanonicalizeError("measurement core fields disagree")
-            else:
-                for field_name in core_fields:
-                    if row[field_name] != pending_core[field_name]:
-                        raise StructuralCanonicalizeError("measurement core fields disagree")
-            pending_row = row
-    flush_pending()
-    if batch:
-        part_paths.append(
-            _flush_collapsed_batch(batch, spill_dir=spill_dir, part_index=len(part_paths))
-        )
-    return part_paths
+            bucket_value = bucket_index(identity, bucket_count)
+            payload = {
+                "identity": identity,
+                "exchange_time_ms": int(row["_timestamp_ms"]),
+                "block_number": int(row["_block_int"]),
+                "symbol": str(row[trade_map.symbol_column]),
+                "price": float(row[trade_map.price_field]),
+                "notional_usd": float(row[trade_map.notional_field]),
+                **{field: row[field] for field in core_fields},
+                **{column: row[column] for column in tie_break},
+            }
+            bucket_batches[bucket_value].append(payload)
+            if len(bucket_batches[bucket_value]) >= _BUCKET_SPILL_BATCH:
+                flush_bucket_batch(bucket_value)
 
+    for bucket_value in range(bucket_count):
+        flush_bucket_batch(bucket_value)
 
-def _iter_sorted_collapsed_trades(part_paths: list[Path]) -> Iterator[_TradeEvent]:
-    if not part_paths:
-        return
-    if len(part_paths) == 1:
-        lazy = pl.scan_parquet(str(part_paths[0])).sort(
-            "exchange_time_ms", "block_number"
+    collapsed_unsorted: list[Path] = []
+    for bucket_value in range(bucket_count):
+        bucket_dir = bucket_root / f"bucket_{bucket_value:05d}"
+        if not bucket_dir.exists():
+            continue
+        collapsed_unsorted.extend(
+            _collapse_bucket_identity_groups(
+                bucket_dir,
+                model,
+                core_fields=core_fields,
+                spill_dir=spill_dir,
+                bucket_index_value=bucket_value,
+            )
         )
+    if not collapsed_unsorted:
+        return []
+    if len(collapsed_unsorted) == 1:
+        sort_source = pl.scan_parquet(str(collapsed_unsorted[0]))
     else:
-        lazy = pl.concat(
-            [pl.scan_parquet(str(path)) for path in part_paths],
+        sort_source = pl.concat(
+            [pl.scan_parquet(str(path)) for path in collapsed_unsorted],
             how="vertical_relaxed",
-        ).sort("exchange_time_ms", "block_number")
-    row_count = int(lazy.select(pl.len()).collect().item())
-    offset = 0
-    while offset < row_count:
-        batch_size = min(_IDENTITY_SCAN_BATCH, row_count - offset)
-        batch = lazy.slice(offset, batch_size).collect()
-        for row in batch.iter_rows(named=True):
-            yield _TradeEvent(
-                symbol=str(row["symbol"]),
-                exchange_time_ms=int(row["exchange_time_ms"]),
-                block_number=int(row["block_number"]),
-                price=float(row["price"]),
-                notional_usd=float(row["notional_usd"]),
-                tie_break=tuple(row["tie_break"]),
-            )
-        offset += batch_size
-
-
-def _iter_witness_events(
-    path: Path,
-    *,
-    input_index: int,
-    mapping: Any,
-) -> Iterator[tuple[int, int, int, int]]:
-    lazy = pl.scan_parquet(str(path))
-    _require_columns(
-        lazy.collect_schema(),
-        (mapping.block_column, mapping.timestamp_column),
-    )
-    row_count = int(lazy.select(pl.len()).collect().item())
-    offset = 0
-    while offset < row_count:
-        batch_size = min(_IDENTITY_SCAN_BATCH, row_count - offset)
-        batch = (
-            lazy.slice(offset, batch_size)
-            .select(
-                pl.col(mapping.block_column).cast(pl.Int64, strict=False),
-                pl.col(mapping.timestamp_column).cast(pl.Int64, strict=False),
-            )
-            .collect()
         )
-        for row_index, (block_raw, time_raw) in enumerate(batch.iter_rows()):
-            if block_raw is None or time_raw is None:
-                raise StructuralCanonicalizeError("witness block or timestamp missing")
-            yield (
-                int(time_raw),
-                int(block_raw),
-                input_index,
-                offset + row_index,
-            )
-        offset += batch_size
+    return external_sort_lazy_frame(
+        sort_source,
+        sort_keys=("exchange_time_ms", "block_number"),
+        spill_dir=spill_dir / "collapsed_time_sort",
+        run_prefix="collapsed",
+    )
 
 
-def _chronological_stream(
+def _iter_sorted_collapsed_trades_for_model(
+    sorted_runs: list[Path],
+    model: CausalGridExtractRequest,
+) -> Iterator[_TradeEvent]:
+    sort_keys = ("exchange_time_ms", "block_number")
+    for row in iter_k_way_merge_dataframes(sorted_runs, sort_keys=sort_keys):
+        yield _row_dict_to_trade_event(row, model)
+
+
+def _materialize_sorted_witness_runs(
     path_objs: list[Path],
     model: CausalGridExtractRequest,
     *,
-    collapsed_parts: list[Path],
-) -> Iterator[tuple[Literal["witness", "trade"], int, int, _TradeEvent | None]]:
+    spill_dir: Path,
+) -> list[Path]:
+    mapping = model.causal_witness_mapping
     bindings = {binding.input_index: binding.role for binding in model.input_roles}
-    witness_iters: list[Iterator[tuple[int, int, int, int]]] = []
+    witness_frames: list[pl.DataFrame] = []
     for input_index, path in enumerate(path_objs):
-        role = bindings.get(input_index)
-        if role == "causal_witness":
-            witness_iters.append(
-                _iter_witness_events(
-                    path,
-                    input_index=input_index,
-                    mapping=model.causal_witness_mapping,
+        if bindings.get(input_index) != "causal_witness":
+            continue
+        lazy = pl.scan_parquet(str(path))
+        _require_columns(
+            lazy.collect_schema(),
+            (mapping.block_column, mapping.timestamp_column),
+        )
+        row_count = int(lazy.select(pl.len()).collect().item())
+        offset = 0
+        while offset < row_count:
+            batch_size = min(_IDENTITY_SCAN_BATCH, row_count - offset)
+            batch = (
+                lazy.slice(offset, batch_size)
+                .with_row_index("row_offset", offset=offset)
+                .select(
+                    pl.lit(input_index).alias("input_index"),
+                    pl.col("row_offset").cast(pl.Int64),
+                    pl.col(mapping.timestamp_column)
+                    .cast(pl.Int64, strict=False)
+                    .alias("exchange_time_ms"),
+                    pl.col(mapping.block_column).cast(pl.Int64, strict=False).alias("block_number"),
                 )
+                .collect()
             )
-    trade_iter = _iter_sorted_collapsed_trades(collapsed_parts)
+            if int(batch.filter(pl.col("exchange_time_ms").is_null() | pl.col("block_number").is_null()).height):
+                raise StructuralCanonicalizeError("witness block or timestamp missing")
+            witness_frames.append(batch)
+            offset += batch_size
+    if not witness_frames:
+        return []
+
+    def _batch_iter() -> Iterator[pl.DataFrame]:
+        yield from witness_frames
+
+    return external_sort_lazy_batches(
+        _batch_iter(),
+        sort_keys=("exchange_time_ms", "block_number", "input_index", "row_offset"),
+        spill_dir=spill_dir / "witness_sort",
+        run_prefix="witness",
+    )
+
+
+def _iter_sorted_witness_events(
+    sorted_runs: list[Path],
+) -> Iterator[tuple[int, int, int, int]]:
+    sort_keys = ("exchange_time_ms", "block_number", "input_index", "row_offset")
+    for row in iter_k_way_merge_dataframes(sorted_runs, sort_keys=sort_keys):
+        yield (
+            int(row["exchange_time_ms"]),
+            int(row["block_number"]),
+            int(row["input_index"]),
+            int(row["row_offset"]),
+        )
+
+
+def _chronological_stream(
+    *,
+    witness_runs: list[Path],
+    collapsed_runs: list[Path],
+    model: CausalGridExtractRequest,
+) -> Iterator[tuple[Literal["witness", "trade"], int, int, _TradeEvent | None]]:
+    witness_iter = _iter_sorted_witness_events(witness_runs)
+    trade_iter = _iter_sorted_collapsed_trades_for_model(collapsed_runs, model)
 
     heap: list[
         tuple[int, int, int, int, int, Literal["witness", "trade"], _TradeEvent | None]
     ] = []
-    for source_id, witness in enumerate(witness_iters):
-        try:
-            time_ms, block, input_index, row_off = next(witness)
-        except StopIteration:
-            continue
-        heapq.heappush(heap, (time_ms, block, input_index, row_off, source_id, "witness", None))
+    try:
+        time_ms, block, input_index, row_off = next(witness_iter)
+        heapq.heappush(heap, (time_ms, block, input_index, row_off, 0, "witness", None))
+    except StopIteration:
+        pass
     try:
         first_trade = next(trade_iter)
-    except StopIteration:
-        first_trade = None
-    trade_source_id = len(witness_iters)
-    if first_trade is not None:
         heapq.heappush(
             heap,
             (
@@ -559,24 +637,25 @@ def _chronological_stream(
                 first_trade.block_number,
                 0,
                 0,
-                trade_source_id,
+                1,
                 "trade",
                 first_trade,
             ),
         )
+    except StopIteration:
+        pass
 
     while heap:
-        time_ms, block, input_index, row_off, sid, kind, payload = heapq.heappop(heap)
+        time_ms, block, input_index, row_off, _sid, kind, payload = heapq.heappop(heap)
         yield kind, block, time_ms, payload
         if kind == "witness":
-            iterator = witness_iters[sid]
             try:
-                next_time, next_block, next_index, next_off = next(iterator)
+                next_time, next_block, next_index, next_off = next(witness_iter)
             except StopIteration:
                 continue
             heapq.heappush(
                 heap,
-                (next_time, next_block, next_index, next_off, sid, "witness", None),
+                (next_time, next_block, next_index, next_off, 0, "witness", None),
             )
         else:
             try:
@@ -590,7 +669,7 @@ def _chronological_stream(
                     next_trade.block_number,
                     0,
                     0,
-                    trade_source_id,
+                    1,
                     "trade",
                     next_trade,
                 ),
@@ -638,27 +717,30 @@ def execute_causal_grid_extract(
         raise ValueError("at least one canonical_trade input is required")
     trade_paths = [path_objs[index] for index in trade_indices]
     profile = model.canonical_trade_mapping.canonical_trade_profile
+    bucket_count = profile.structural_canonicalize_params().bucket_count
     validation_state = execute_structural_canonicalize(
         trade_paths,
         profile.structural_canonicalize_params(),
     )
     collapse_dir = tempfile.mkdtemp(prefix="pbe-grid-collapse-")
     try:
-        emitted = _EmittedIdentitySpill(
-            bucket_count=profile.structural_canonicalize_params().bucket_count,
-            spill_dir=Path(collapse_dir),
-        )
-        collapsed_parts = _materialize_collapsed_trades(
+        collapsed_runs = _materialize_collapsed_trades(
             trade_paths,
             model,
             spill_dir=Path(collapse_dir),
-            emitted=emitted,
+            bucket_count=bucket_count,
+        )
+        witness_runs = _materialize_sorted_witness_runs(
+            path_objs,
+            model,
+            spill_dir=Path(collapse_dir),
         )
         missing = frozenset(model.partition.hard_gap_missing_dates)
         carry_in = model.partition.incoming_carry
         causal = _CausalIndex.from_carry(
             missing,
             carry_in.causal_observations if carry_in is not None else (),
+            carry_block_first_ms=carry_in.causal_block_first_ms if carry_in is not None else (),
         )
         lookback = _max_lookback_ms(model)
         scan_start = model.partition.emit_start_ms - lookback
@@ -717,9 +799,9 @@ def execute_causal_grid_extract(
                 )
 
         for kind, block_number, exchange_time_ms, trade in _chronological_stream(
-            path_objs,
-            model,
-            collapsed_parts=collapsed_parts,
+            witness_runs=witness_runs,
+            collapsed_runs=collapsed_runs,
+            model=model,
         ):
             if exchange_time_ms < scan_start:
                 if kind == "witness" or trade is not None:
@@ -746,11 +828,14 @@ def execute_causal_grid_extract(
             _emit_grid_row(grid_times[grid_index])
             grid_index += 1
 
-        carry_start = model.partition.emit_end_ms - model.partition.overlap_ms
         outgoing_carry = {
             "schema_version": CARRY_SCHEMA_VERSION,
-            "causal_observations": causal.export_carry(min_time_ms=carry_start),
-            "trade_rows": _trade_carry_rows(rolling, carry_start_ms=carry_start),
+            "causal_observations": (),
+            "causal_block_first_ms": causal.export_carry(),
+            "trade_rows": _trade_carry_rows(
+                rolling,
+                carry_start_ms=model.partition.emit_end_ms - model.partition.overlap_ms,
+            ),
         }
         return {
             "schema_version": RESULT_SCHEMA_VERSION,
