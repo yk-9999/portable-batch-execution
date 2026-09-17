@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from portable_batch_execution.contracts.models import Frozen
 
 SentinelScalar = str | int | float | bool | None
+
+BUCKET_COUNT_DEFAULT = 256
+BUCKET_COUNT_MIN = 1
+BUCKET_COUNT_MAX = 4096
 
 
 class SentinelPredicate(Frozen):
@@ -22,6 +26,22 @@ class StructuralCanonicalizeParams(Frozen):
     identity_normalized_column: str
     measurement_core_fields: tuple[str, ...] = Field(min_length=1)
     sentinel: SentinelPredicate | None = None
+    bucket_count: int = BUCKET_COUNT_DEFAULT
+
+    @field_validator("bucket_count")
+    @classmethod
+    def _power_of_two_in_range(cls, value: int) -> int:
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < BUCKET_COUNT_MIN
+            or value > BUCKET_COUNT_MAX
+            or value & (value - 1)
+        ):
+            raise ValueError(
+                "bucket_count must be a power of two within the allowed range"
+            )
+        return value
 
 
 class TrailingWindowSpec(Frozen):

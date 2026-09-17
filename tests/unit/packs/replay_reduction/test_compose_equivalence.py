@@ -60,8 +60,8 @@ def test_canonicalize_then_event_window_matches_direct_reference(tmp_path):
     ).write_parquet(path_b)
 
     canonical = execute_structural_canonicalize([path_a, path_b], _CANON)
-    assert canonical["witness_row_count"] == 1
-    assert len([s for s in canonical["range_segments"] if s.get("positive_row_count")]) == 2
+    assert canonical.witness_row_count == 1
+    assert canonical.positive_group_count == 4
     composed = execute_event_window_extract([path_a, path_b], _REQUEST)
     reference = execute_event_window_extract([path_a, path_b], _REQUEST)
     assert composed == reference

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .canonicalize import (
+    CanonicalizeState,
     execute_structural_canonicalize,
     merge_structural_canonicalize_states,
 )
@@ -51,15 +52,16 @@ class ReplayReductionPack:
         operation: str,
         *,
         paths: list[str | Path] | None = None,
-        left_state: dict[str, Any] | None = None,
-        right_state: dict[str, Any] | None = None,
+        left_state: CanonicalizeState | None = None,
+        right_state: CanonicalizeState | None = None,
         request: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
     ):
         if operation == "replay.structural_canonicalize":
             return execute_structural_canonicalize(paths or [], params or {})
         if operation == "replay.structural_canonicalize_merge":
-            return merge_structural_canonicalize_states(left_state or {}, right_state or {})
+            return merge_structural_canonicalize_states(left_state, right_state)
         if operation == "replay.event_window_extract":
             return execute_event_window_extract(paths or [], request or {})
         raise ValueError(f"unsupported replay operation: {operation}")
+

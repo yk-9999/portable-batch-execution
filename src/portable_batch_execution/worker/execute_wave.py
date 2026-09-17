@@ -31,7 +31,15 @@ from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
     execute_distilbert_pair_binary_scores,
 )
 from portable_batch_execution.packs.replay_reduction.canonicalize import (
+    BUCKET_MEDIA_TYPE,
     StructuralCanonicalizeError,
+    attach_bucket_refs,
+    decode_state,
+    encode_state_buckets,
+    state_summary,
+)
+from portable_batch_execution.packs.replay_reduction.models import (
+    BUCKET_COUNT_MAX,
 )
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
@@ -237,6 +245,53 @@ def _parquet_row_count(path: Path) -> int:
     return int(pl.scan_parquet(str(path)).select(pl.len()).collect().item())
 
 
+def _write_canonicalize_state(
+    plane, state
+) -> tuple[bytes, tuple[ArtifactRef, ...]]:
+    """Publish one summary JSON plus bucket artifacts in deterministic bucket order."""
+    bucket_refs: list[ArtifactRef] = []
+    for payload in encode_state_buckets(state):
+        ref = plane.write(payload, BUCKET_MEDIA_TYPE)
+        if not _artifact_ref_matches_bytes(payload, ref):
+            raise _ShardStageFailure("output_artifact_mismatch")
+        bucket_refs.append(ref)
+    summary = attach_bucket_refs(state_summary(state), tuple(bucket_refs))
+    summary_bytes = json.dumps(summary, sort_keys=True).encode("utf-8")
+    summary_ref = plane.write(summary_bytes, "application/json")
+    if not _artifact_ref_matches_bytes(summary_bytes, summary_ref):
+        raise _ShardStageFailure("output_artifact_mismatch")
+    return summary_bytes, (summary_ref, *bucket_refs)
+
+
+def _read_canonicalize_state(plane, summary_ref: ArtifactRef):
+    """Read and validate one complete canonicalization state from its artifacts."""
+    payload = _read_verified_artifact_bytes(plane, summary_ref)
+    try:
+        summary = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise _ShardStageFailure(
+            _execution_failure_code(exc, stage="input_parse")
+        ) from None
+    if not isinstance(summary, dict):
+        raise _ShardStageFailure("input_artifact_invalid")
+    raw_refs = summary.get("bucket_refs")
+    if not isinstance(raw_refs, list) or not 1 <= len(raw_refs) <= BUCKET_COUNT_MAX:
+        raise _ShardStageFailure("input_artifact_invalid")
+    try:
+        bucket_refs = tuple(ArtifactRef.model_validate(item) for item in raw_refs)
+    except ValueError:
+        raise _ShardStageFailure("input_artifact_invalid") from None
+    if any(ref.media_type != BUCKET_MEDIA_TYPE for ref in bucket_refs):
+        raise _ShardStageFailure("input_artifact_invalid")
+    bucket_payloads = tuple(
+        _read_verified_artifact_bytes(plane, ref) for ref in bucket_refs
+    )
+    try:
+        return decode_state(summary, bucket_payloads)
+    except StructuralCanonicalizeError:
+        raise _ShardStageFailure("input_artifact_invalid") from None
+
+
 def _private_tabular_single_input_is_parquet(
     job, input_ref: ArtifactRef
 ) -> bool:
@@ -424,6 +479,8 @@ def execute_private_wave(
             execution_fingerprint=shard.execution_fingerprint,
             current_attempt_count=len(current),
         )
+        output_refs: tuple[ArtifactRef, ...] | None = None
+        output_digest_value: str | None = None
         try:
             if (
                 private_pack == "ml-batch"
@@ -498,7 +555,7 @@ def execute_private_wave(
                 }
                 output_media_type = "audio/flac"
             elif private_pack == "replay-batch":
-
+                publish_single_output = True
                 if job.operation == "replay.structural_canonicalize":
                     with tempfile.TemporaryDirectory() as temporary:
                         paths = _materialize_verified_parquet_inputs(
@@ -506,7 +563,7 @@ def execute_private_wave(
                         )
                         input_rows = sum(_parquet_row_count(path) for path in paths)
                         try:
-                            result_payload = replay_pack.execute(
+                            state = replay_pack.execute(
                                 job,
                                 shard,
                                 job.operation_params,
@@ -520,24 +577,17 @@ def execute_private_wave(
                             raise _ShardStageFailure(
                                 _execution_failure_code(exc, stage="pack")
                             ) from None
-                        output_rows = sum(
-                            int(segment.get("positive_row_count", 0))
-                            for segment in result_payload.get("range_segments", ())
-                        ) + int(result_payload.get("witness_row_count", 0))
+                        output, output_refs = _write_canonicalize_state(plane, state)
+                        output_digest_value = sha256(output).hexdigest()
+                        output_rows = state.positive_row_count + state.witness_row_count
+                        publish_single_output = False
                 elif job.operation == "replay.structural_canonicalize_merge":
                     if len(shard.input_refs) != 2:
                         raise _ShardStageFailure("input_artifact_invalid")
-                    left_payload = _read_verified_artifact_bytes(plane, shard.input_refs[0])
-                    right_payload = _read_verified_artifact_bytes(plane, shard.input_refs[1])
+                    left_state = _read_canonicalize_state(plane, shard.input_refs[0])
+                    right_state = _read_canonicalize_state(plane, shard.input_refs[1])
                     try:
-                        left_state = json.loads(left_payload.decode("utf-8"))
-                        right_state = json.loads(right_payload.decode("utf-8"))
-                    except (UnicodeDecodeError, ValueError) as exc:
-                        raise _ShardStageFailure(
-                            _execution_failure_code(exc, stage="input_parse")
-                        ) from None
-                    try:
-                        result_payload = replay_pack.execute(
+                        merged_state = replay_pack.execute(
                             job,
                             shard,
                             job.operation_params,
@@ -555,11 +605,15 @@ def execute_private_wave(
                         raise _ShardStageFailure(
                             _execution_failure_code(exc, stage="pack")
                         ) from None
-                    input_rows = sum(
-                        int(segment.get("positive_row_count", 0))
-                        for segment in result_payload.get("range_segments", ())
+                    input_rows = (
+                        left_state.positive_row_count + right_state.positive_row_count
                     )
-                    output_rows = input_rows
+                    output, output_refs = _write_canonicalize_state(plane, merged_state)
+                    output_digest_value = sha256(output).hexdigest()
+                    output_rows = (
+                        merged_state.positive_row_count + merged_state.witness_row_count
+                    )
+                    publish_single_output = False
                 elif job.operation == "replay.event_window_extract":
                     if len(shard.input_refs) < 2:
                         raise _ShardStageFailure("input_artifact_invalid")
@@ -599,8 +653,9 @@ def execute_private_wave(
                     raise _ShardStageFailure(
                         _execution_failure_code(ValueError(), stage="pack")
                     )
-                output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
-                output_media_type = "application/json"
+                if publish_single_output:
+                    output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
+                    output_media_type = "application/json"
             else:
                 input_ref = shard.input_refs[0]
                 if _private_tabular_single_input_is_parquet(job, input_ref):
@@ -710,14 +765,17 @@ def execute_private_wave(
                                 _execution_failure_code(exc, stage="pack")
                             ) from None
                         output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
-            try:
-                output_ref = plane.write(output, output_media_type)
-            except Exception as exc:  # noqa: BLE001
-                raise _ShardStageFailure(
-                    _execution_failure_code(exc, stage="output")
-                ) from None
-            if not _artifact_ref_matches_bytes(output, output_ref):
-                raise _ShardStageFailure("output_artifact_mismatch")
+            if output_refs is None:
+                try:
+                    single_ref = plane.write(output, output_media_type)
+                except Exception as exc:  # noqa: BLE001
+                    raise _ShardStageFailure(
+                        _execution_failure_code(exc, stage="output")
+                    ) from None
+                if not _artifact_ref_matches_bytes(output, single_ref):
+                    raise _ShardStageFailure("output_artifact_mismatch")
+                output_refs = (single_ref,)
+                output_digest_value = sha256(output).hexdigest()
             attempt = ShardAttemptRecord(
                 logical_run_id=run_id,
                 shard_id=shard.shard_id,
@@ -728,8 +786,8 @@ def execute_private_wave(
                 started_at=started_at,
                 finished_at=datetime.now(UTC),
                 wave_id=wave_id,
-                output_refs=(output_ref,),
-                output_digest=sha256(output).hexdigest(),
+                output_refs=output_refs,
+                output_digest=output_digest_value,
                 counts=(
                     media_counts
                     if private_pack == "media-batch"

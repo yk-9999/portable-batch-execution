@@ -1,3 +1,5 @@
+import json
+
 import polars as pl
 
 from portable_batch_execution.packs.replay_reduction import canonicalize, event_window
@@ -24,7 +26,8 @@ def test_canonicalize_rejects_whole_corpus_read_and_concat(tmp_path, monkeypatch
     monkeypatch.setattr(pl, "concat", forbid_concat)
 
     result = canonicalize.execute_structural_canonicalize([path], _PARAMS)
-    assert result["range_segments"][0]["identity_min"] == 1
+    assert result.positive_group_count == 1
+    assert len(json.dumps(canonicalize.state_summary(result))) < 4000
 
 
 def test_event_window_rejects_whole_history_to_dicts(tmp_path, monkeypatch):
