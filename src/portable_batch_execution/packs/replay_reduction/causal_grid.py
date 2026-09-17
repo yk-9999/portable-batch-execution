@@ -808,6 +808,9 @@ def execute_causal_grid_extract(
             ),
         )
         lookback = _max_lookback_ms(model)
+        if model.partition.overlap_ms < lookback:
+            raise ValueError("partition overlap_ms shorter than required replay lookback")
+        partition_emit_end_ms = model.partition.emit_end_ms
         scan_start = model.partition.emit_start_ms - lookback
         grid_times = _grid_timestamps(model)
         projected_rows = len(grid_times) * len(model.target_symbols)
@@ -868,6 +871,8 @@ def execute_causal_grid_extract(
             collapsed_runs=collapsed_runs,
             model=model,
         ):
+            if exchange_time_ms > partition_emit_end_ms:
+                break
             if exchange_time_ms < scan_start:
                 if kind == "witness" or trade is not None:
                     causal.observe(
@@ -900,7 +905,7 @@ def execute_causal_grid_extract(
             "causal_segment_frontiers": causal.export_carry(),
             "trade_rows": _trade_carry_rows(
                 rolling,
-                carry_start_ms=model.partition.emit_end_ms - model.partition.overlap_ms,
+                carry_start_ms=partition_emit_end_ms - model.partition.overlap_ms,
             ),
         }
         return {

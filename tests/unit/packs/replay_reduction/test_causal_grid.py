@@ -388,6 +388,72 @@ def test_partition_carry_equivalence(tmp_path):
     assert merged == one_pass
 
 
+def test_outgoing_carry_excludes_post_emit_end_state(tmp_path):
+    trades = _write(
+        tmp_path / "trades.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=40_000, notional=1.0),
+            _trade_row(identity=2, identity_norm="2", block=95, timestamp_ms=80_000, notional=2.0),
+            _trade_row(identity=3, identity_norm="3", block=100, timestamp_ms=120_000, notional=4.0),
+        ],
+    )
+    witness = _write(
+        tmp_path / "w.parquet",
+        [
+            _witness_row(block=10, timestamp_ms=30_000),
+            _witness_row(block=20, timestamp_ms=50_000),
+            _witness_row(block=30, timestamp_ms=70_000),
+            _witness_row(block=35, timestamp_ms=80_000),
+            _witness_row(block=99, timestamp_ms=90_000),
+            _witness_row(block=100, timestamp_ms=130_000),
+        ],
+    )
+    request = _request(
+        input_roles=(
+            {"input_index": 0, "role": "canonical_trade"},
+            {"input_index": 1, "role": "causal_witness"},
+        ),
+        emit_grid={"start_timestamp_ms": 50_000, "end_timestamp_ms": 80_000, "step_ms": 10_000},
+        partition={
+            "emit_start_ms": 50_000,
+            "emit_end_ms": 80_000,
+            "overlap_ms": 70_000,
+            "hard_gap_missing_dates": (),
+        },
+    )
+    carry = execute_causal_grid_extract([trades, witness], request)["outgoing_carry"]
+    truncated_witness = _write(
+        tmp_path / "w_trunc.parquet",
+        [
+            _witness_row(block=10, timestamp_ms=30_000),
+            _witness_row(block=20, timestamp_ms=50_000),
+            _witness_row(block=30, timestamp_ms=70_000),
+            _witness_row(block=35, timestamp_ms=80_000),
+        ],
+    )
+    reference_carry = execute_causal_grid_extract(
+        [trades, truncated_witness],
+        request,
+    )["outgoing_carry"]
+    assert carry == reference_carry
+    assert all(row["exchange_time_ms"] <= 80_000 for row in carry["trade_rows"])
+    assert not any(row["exchange_time_ms"] == 120_000 for row in carry["trade_rows"])
+
+
+def test_insufficient_partition_overlap_fails_closed(tmp_path):
+    path = _write(tmp_path / "trades.parquet", [_trade_row(timestamp_ms=9_000)])
+    request = _request(
+        partition={
+            "emit_start_ms": 10_000,
+            "emit_end_ms": 10_000,
+            "overlap_ms": 1_000,
+            "hard_gap_missing_dates": (),
+        },
+    )
+    with pytest.raises(ValueError, match="overlap_ms shorter than required replay lookback"):
+        execute_causal_grid_extract([path], request)
+
+
 def test_multi_shard_deterministic_equivalence(tmp_path):
     rows_a = [
         _trade_row(identity=1, identity_norm="1", timestamp_ms=9_000, notional=1.0),
