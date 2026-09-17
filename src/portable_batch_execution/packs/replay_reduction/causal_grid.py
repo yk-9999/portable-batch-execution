@@ -19,7 +19,6 @@ from .canonicalize import (
     StructuralCanonicalizeError,
     _require_columns,
     bucket_index,
-    execute_structural_canonicalize,
 )
 from .event_window import _as_of_preferred, _row_is_sentinel, _validate_positive_row
 from .models import CausalGridExtractRequest
@@ -755,10 +754,6 @@ def execute_causal_grid_extract(
     trade_paths = [path_objs[index] for index in trade_indices]
     profile = model.canonical_trade_mapping.canonical_trade_profile
     bucket_count = profile.structural_canonicalize_params().bucket_count
-    validation_state = execute_structural_canonicalize(
-        trade_paths,
-        profile.structural_canonicalize_params(),
-    )
     collapse_dir = tempfile.mkdtemp(prefix="pbe-grid-collapse-")
     try:
         collapsed_runs = _materialize_collapsed_trades(
@@ -884,5 +879,4 @@ def execute_causal_grid_extract(
             "outgoing_carry": outgoing_carry,
         }
     finally:
-        shutil.rmtree(validation_state.spill_dir, ignore_errors=True)
         shutil.rmtree(collapse_dir, ignore_errors=True)

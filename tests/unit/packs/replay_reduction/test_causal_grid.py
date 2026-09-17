@@ -508,6 +508,32 @@ def test_conflicting_duplicate_core_fail_closed(tmp_path):
         execute_causal_grid_extract([path], _request())
 
 
+def test_cross_shard_conflicting_core_fail_closed(tmp_path):
+    path_a = _write(
+        tmp_path / "a.parquet",
+        [
+            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, price=10.0),
+            _trade_row(identity=2, identity_norm="2", block=91, timestamp_ms=8_050, price=20.0),
+        ],
+    )
+    path_b = _write(
+        tmp_path / "b.parquet",
+        [_trade_row(identity=1, identity_norm="1", block=92, timestamp_ms=8_100, price=11.0)],
+    )
+    witness = _write(tmp_path / "w.parquet", [_witness_row(block=90, timestamp_ms=8_000)])
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_causal_grid_extract(
+            [path_a, path_b, witness],
+            _request(
+                input_roles=(
+                    {"input_index": 0, "role": "canonical_trade"},
+                    {"input_index": 1, "role": "canonical_trade"},
+                    {"input_index": 2, "role": "causal_witness"},
+                ),
+            ),
+        )
+
+
 def test_output_row_bound_fail_closed(tmp_path):
     path = _write(tmp_path / "trades.parquet", [_trade_row(timestamp_ms=9_000)])
     request = _request(

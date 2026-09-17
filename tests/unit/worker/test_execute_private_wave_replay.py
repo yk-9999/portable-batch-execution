@@ -220,7 +220,7 @@ def test_private_wave_merge_reads_and_republishes_multi_artifact_state():
     assert state.positive_row_count == 2
 
 
-def test_private_wave_merge_collapses_non_contiguous_recurrence():
+def test_private_wave_merge_fails_closed_on_non_contiguous_recurrence():
     def seed(rows, name):
         payload = _parquet_payload(rows)
         plane = _plane_for_replay(
@@ -258,17 +258,14 @@ def test_private_wave_merge_collapses_non_contiguous_recurrence():
     for ref in right.output_refs:
         merge_plane._payloads[ref.object_id] = right_plane._payloads[ref.object_id]
 
-    merged = execute_private_wave("opaque-run", "opaque-wave", plane=merge_plane)
-    assert merged[0].status == "succeeded"
-    summary_ref = merged[0].output_refs[0]
-    summary = json.loads(merge_plane._payloads[summary_ref.object_id].decode())
-    state = decode_state(
-        summary,
-        tuple(
-            merge_plane._payloads[ref.object_id] for ref in merged[0].output_refs[1:]
-        ),
-    )
-    assert state.positive_group_count == 2
+    from portable_batch_execution.worker.execute_wave import PrivateWaveExecutionError
+
+    try:
+        execute_private_wave("opaque-run", "opaque-wave", plane=merge_plane)
+    except PrivateWaveExecutionError as error:
+        assert error.attempts[0].failure == "shard_pack_execution_failed"
+    else:
+        raise AssertionError("merge must fail closed on non-contiguous recurrence")
 
 
 def test_private_wave_merge_fails_closed_on_mismatched_bucket_state():
