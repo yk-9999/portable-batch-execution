@@ -64,12 +64,29 @@ class FutureWindowSpec(Frozen):
         return self
 
 
+class CanonicalTradeProfile(Frozen):
+    schema_version: Literal["pbe.replay.canonical-trade-profile.v1"]
+    identity_source_column: str
+    identity_normalized_column: str
+    measurement_core_fields: tuple[str, ...] = Field(min_length=1)
+    sentinel: SentinelPredicate | None = None
+
+    def structural_canonicalize_params(self) -> StructuralCanonicalizeParams:
+        return StructuralCanonicalizeParams(
+            schema_version="pbe.replay.structural-canonicalize.v1",
+            identity_source_column=self.identity_source_column,
+            identity_normalized_column=self.identity_normalized_column,
+            measurement_core_fields=self.measurement_core_fields,
+            sentinel=self.sentinel,
+        )
+
+
 class EventWindowExtractJobParams(Frozen):
     schema_version: Literal["pbe.replay.event-window-extract-job.v1"]
 
 
 class EventWindowExtractRequest(Frozen):
-    schema_version: Literal["pbe.replay.event-window-extract.v2"]
+    schema_version: Literal["pbe.replay.event-window-extract.v3"]
     request_id: str
     symbol: str
     symbol_column: str
@@ -78,6 +95,7 @@ class EventWindowExtractRequest(Frozen):
     decision_timestamp_ms: int
     causal_cutoff_block: int
     as_of_measurement_field: str
+    canonical_trade_profile: CanonicalTradeProfile
     as_of_offsets_ms: tuple[int, ...] = (0,)
     trailing_windows: tuple[TrailingWindowSpec, ...] = ()
     future_windows: tuple[FutureWindowSpec, ...] = ()
