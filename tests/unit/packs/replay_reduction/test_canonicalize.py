@@ -136,6 +136,79 @@ def test_structural_canonicalize_counts_sentinel_witness_rows(tmp_path):
     assert result["witness_row_count"] == 1
 
 
+_EXACT_PARAMS = {
+    "schema_version": "pbe.replay.structural-canonicalize.v1",
+    "identity_source_column": "identity",
+    "identity_normalized_column": "identity_norm",
+    "measurement_core_fields": ["price"],
+    "sentinel": {
+        "identity_equals": -1,
+        "exact_match_fields": {"marker_kind": "boundary", "marker_rank": 7},
+    },
+}
+
+
+def test_sentinel_exact_match_accepts_matching_witness(tmp_path):
+    paths = _paths(
+        tmp_path,
+        [
+            {
+                "identity": -1,
+                "identity_norm": "x",
+                "price": 0.0,
+                "marker_kind": "boundary",
+                "marker_rank": 7,
+            },
+            {"identity": 1, "identity_norm": "1", "price": 1.0, "marker_kind": "a", "marker_rank": 1},
+        ],
+    )
+    result = execute_structural_canonicalize(paths, _EXACT_PARAMS)
+    assert result["witness_row_count"] == 1
+
+
+def test_sentinel_exact_match_wrong_field_value_fails_closed(tmp_path):
+    paths = _paths(
+        tmp_path,
+        [
+            {
+                "identity": -1,
+                "identity_norm": "x",
+                "price": 0.0,
+                "marker_kind": "boundary",
+                "marker_rank": 8,
+            }
+        ],
+    )
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_structural_canonicalize(paths, _EXACT_PARAMS)
+
+
+def test_sentinel_exact_match_missing_predicate_field_fails_closed(tmp_path):
+    paths = _paths(
+        tmp_path,
+        [{"identity": -1, "identity_norm": "x", "price": 0.0, "marker_kind": "boundary"}],
+    )
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_structural_canonicalize(paths, _EXACT_PARAMS)
+
+
+def test_sentinel_exact_match_null_predicate_value_fails_closed(tmp_path):
+    paths = _paths(
+        tmp_path,
+        [
+            {
+                "identity": -1,
+                "identity_norm": "x",
+                "price": 0.0,
+                "marker_kind": "boundary",
+                "marker_rank": None,
+            }
+        ],
+    )
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_structural_canonicalize(paths, _EXACT_PARAMS)
+
+
 @pytest.mark.parametrize(
     "rows",
     [

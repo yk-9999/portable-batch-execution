@@ -8,9 +8,12 @@ from pydantic import Field, model_validator
 
 from portable_batch_execution.contracts.models import Frozen
 
+SentinelScalar = str | int | float | bool | None
+
 
 class SentinelPredicate(Frozen):
     identity_equals: int
+    exact_match_fields: dict[str, SentinelScalar] = Field(default_factory=dict)
 
 
 class StructuralCanonicalizeParams(Frozen):

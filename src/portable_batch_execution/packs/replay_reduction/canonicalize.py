@@ -8,7 +8,7 @@ from typing import Any
 
 import polars as pl
 
-from .models import StructuralCanonicalizeParams
+from .models import SentinelPredicate, SentinelScalar, StructuralCanonicalizeParams
 
 RESULT_SCHEMA_VERSION = "pbe.replay.structural-canonicalize-result.v3"
 
@@ -29,6 +29,19 @@ def _require_columns(schema: pl.Schema, columns: tuple[str, ...]) -> None:
         raise StructuralCanonicalizeError(f"missing required columns: {', '.join(missing)}")
 
 
+def _exact_match_expr(field: str, expected: SentinelScalar) -> pl.Expr:
+    if expected is None:
+        return pl.col(field).is_null()
+    return (pl.col(field) == expected).fill_null(False)
+
+
+def _sentinel_witness_expr(sentinel: SentinelPredicate) -> pl.Expr:
+    expr = (pl.col("_identity_int") == sentinel.identity_equals).fill_null(False)
+    for field, expected in sentinel.exact_match_fields.items():
+        expr = expr & _exact_match_expr(field, expected)
+    return expr
+
+
 def _boundary_profile(row: dict[str, Any], core_fields: list[str]) -> dict[str, Any]:
     return {
         "identity": int(row["_identity_int"]),
@@ -44,30 +57,32 @@ def _summarize_single_input(
     identity_col = model.identity_source_column
     normalized_col = model.identity_normalized_column
     core_fields = list(model.measurement_core_fields)
-    sentinel_value = model.sentinel.identity_equals if model.sentinel is not None else None
+    sentinel = model.sentinel
 
     lazy = pl.scan_parquet(str(path))
-    _require_columns(lazy.collect_schema(), (identity_col, normalized_col, *core_fields))
+    required = (identity_col, normalized_col, *core_fields)
+    if sentinel is not None:
+        required = required + tuple(sentinel.exact_match_fields)
+    _require_columns(lazy.collect_schema(), required)
     lazy = lazy.with_row_index("_row_index").with_columns(
         pl.col(identity_col).cast(pl.Int64, strict=False).alias("_identity_int"),
     )
 
-    if sentinel_value is not None:
+    if sentinel is not None:
+        witness_expr = _sentinel_witness_expr(sentinel)
         witness_count = int(
-            lazy.filter(pl.col("_identity_int") == sentinel_value)
-            .select(pl.len())
-            .collect()
-            .item()
+            lazy.filter(witness_expr).select(pl.len()).collect().item()
         )
     else:
+        witness_expr = None
         witness_count = 0
 
     nonpositive = pl.col("_identity_int") <= 0
-    if sentinel_value is None:
+    if witness_expr is None:
         invalid_expr = pl.col("_identity_int").is_null() | nonpositive
     else:
         invalid_expr = pl.col("_identity_int").is_null() | (
-            nonpositive & (pl.col("_identity_int") != sentinel_value)
+            nonpositive & witness_expr.not_()
         )
     if int(lazy.filter(invalid_expr).select(pl.len()).collect().item()) > 0:
         raise StructuralCanonicalizeError("identity is missing or not positive")
