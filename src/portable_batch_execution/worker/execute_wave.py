@@ -35,7 +35,7 @@ from portable_batch_execution.packs.replay_reduction.canonicalize import (
     StructuralCanonicalizeError,
     attach_bucket_refs,
     decode_state,
-    encode_state_buckets,
+    iter_state_bucket_payloads,
     state_summary,
 )
 from portable_batch_execution.packs.replay_reduction.models import (
@@ -250,7 +250,7 @@ def _write_canonicalize_state(
 ) -> tuple[bytes, tuple[ArtifactRef, ...]]:
     """Publish one summary JSON plus bucket artifacts in deterministic bucket order."""
     bucket_refs: list[ArtifactRef] = []
-    for payload in encode_state_buckets(state):
+    for payload in iter_state_bucket_payloads(state):
         ref = plane.write(payload, BUCKET_MEDIA_TYPE)
         if not _artifact_ref_matches_bytes(payload, ref):
             raise _ShardStageFailure("output_artifact_mismatch")

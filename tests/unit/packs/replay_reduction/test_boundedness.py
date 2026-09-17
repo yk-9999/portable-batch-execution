@@ -80,3 +80,104 @@ def test_canonicalize_materialization_guard_enforced(tmp_path, monkeypatch):
     pl.DataFrame(rows).write_parquet(path)
     with pytest.raises(canonicalize.StructuralCanonicalizeError):
         canonicalize.execute_structural_canonicalize([path], _PARAMS)
+
+
+def test_canonicalize_avoids_global_group_and_nunique_aggregations(tmp_path, monkeypatch):
+    def forbid_group_by(self, *args, **kwargs):
+        raise AssertionError("group_by must not be used in canonicalize validation")
+
+    def forbid_n_unique(self, *args, **kwargs):
+        raise AssertionError("n_unique must not be used in canonicalize validation")
+
+    monkeypatch.setattr(pl.DataFrame, "group_by", forbid_group_by)
+    monkeypatch.setattr(pl.Expr, "n_unique", forbid_n_unique)
+    path = tmp_path / "part.parquet"
+    pl.DataFrame(
+        [
+            {"identity": 9, "identity_norm": "9", "price": 9.0},
+            {"identity": 1, "identity_norm": "1", "price": 1.0},
+            {"identity": 5, "identity_norm": "5", "price": 5.0},
+        ]
+    ).write_parquet(path)
+    state = canonicalize.execute_structural_canonicalize([path], _PARAMS)
+    assert state.positive_group_count == 3
+
+
+def test_non_contiguous_recurrence_fails_across_scan_batches(tmp_path, monkeypatch):
+    monkeypatch.setattr(canonicalize, "_IDENTITY_SCAN_BATCH", 2)
+    path = tmp_path / "part.parquet"
+    pl.DataFrame(
+        [
+            {"identity": 1, "identity_norm": "1", "price": 1.0},
+            {"identity": 2, "identity_norm": "2", "price": 2.0},
+            {"identity": 1, "identity_norm": "1", "price": 1.0},
+        ]
+    ).write_parquet(path)
+    with pytest.raises(canonicalize.StructuralCanonicalizeError):
+        canonicalize.execute_structural_canonicalize([path], _PARAMS)
+
+
+def test_non_contiguous_recurrence_fails_across_sort_runs(tmp_path, monkeypatch):
+    monkeypatch.setattr(canonicalize, "_SORT_RUN_CAPACITY", 1)
+    path = tmp_path / "part.parquet"
+    pl.DataFrame(
+        [
+            {"identity": 1, "identity_norm": "1", "price": 1.0},
+            {"identity": 2, "identity_norm": "2", "price": 2.0},
+            {"identity": 1, "identity_norm": "1", "price": 1.0},
+        ]
+    ).write_parquet(path)
+    with pytest.raises(canonicalize.StructuralCanonicalizeError):
+        canonicalize.execute_structural_canonicalize([path], _PARAMS)
+
+
+def test_production_publish_uses_incremental_bucket_payloads(tmp_path, monkeypatch):
+    from hashlib import sha256
+
+    from portable_batch_execution.contracts import ArtifactRef
+
+    rows = [{"identity": 1, "identity_norm": "1", "price": 1.0}]
+    path = tmp_path / "part.parquet"
+    pl.DataFrame(rows).write_parquet(path)
+    state = canonicalize.execute_structural_canonicalize([path], _PARAMS)
+
+    def forbid_bulk(*args, **kwargs):
+        raise AssertionError("encode_state_buckets must not be used in production publish")
+
+    monkeypatch.setattr(canonicalize, "encode_state_buckets", forbid_bulk)
+
+    class Plane:
+        def __init__(self):
+            self.max_live_payload = 0
+            self.live = 0
+            self.written = []
+
+        def write(self, data, media_type):
+            self.live += 1
+            self.max_live_payload = max(self.max_live_payload, self.live)
+            self.written.append((data, media_type))
+            self.live -= 1
+            return ArtifactRef(
+                object_id=str(len(self.written)),
+                uri=f"pbe://private/{len(self.written)}",
+                sha256="sha256:" + sha256(data).hexdigest(),
+                size_bytes=len(data),
+                media_type=media_type,
+            )
+
+    from portable_batch_execution.worker import execute_wave as ew
+
+    plane = Plane()
+    ew._write_canonicalize_state(plane, state)
+    assert plane.max_live_payload == 1
+    assert len(plane.written) == 1 + state.bucket_count
+
+
+def test_bucket_payload_bound_enforced(tmp_path, monkeypatch):
+    monkeypatch.setattr(canonicalize, "_MAX_BUCKET_PAYLOAD_BYTES", 30)
+    path = tmp_path / "part.parquet"
+    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(path)
+    state = canonicalize.execute_structural_canonicalize([path], _PARAMS)
+    with pytest.raises(canonicalize.StructuralCanonicalizeError):
+        for _ in canonicalize.iter_state_bucket_payloads(state):
+            pass

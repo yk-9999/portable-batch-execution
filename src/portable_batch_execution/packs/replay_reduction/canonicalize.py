@@ -40,6 +40,7 @@ _SPLITMIX_MUL_B = 0x94D049BB133111EB
 _IDENTITY_SCAN_BATCH = 65_536
 _SORT_RUN_CAPACITY = 8_192
 _MAX_IDENTITY_MATERIALIZATION = 1 << 20
+_MAX_BUCKET_PAYLOAD_BYTES = _BUCKET_HEADER.size + (_MAX_IDENTITY_MATERIALIZATION * 8)
 
 
 class StructuralCanonicalizeError(Exception):
@@ -82,6 +83,11 @@ def bucket_index(value: int, bucket_count: int) -> int:
 def _assert_bounded_materialization(count: int) -> None:
     if count > _MAX_IDENTITY_MATERIALIZATION:
         raise StructuralCanonicalizeError("identity materialization exceeds bounded limit")
+
+
+def _assert_bucket_payload_bounded(payload_size: int) -> None:
+    if payload_size > _MAX_BUCKET_PAYLOAD_BYTES:
+        raise StructuralCanonicalizeError("bucket payload materialization exceeds bounded limit")
 
 
 def _validated(
@@ -150,7 +156,7 @@ def _iter_uint64_path(path: Path) -> Iterator[int]:
             yield int(_UINT64_PACK.unpack(payload)[0])
 
 
-def _k_way_merge_unique_files(sources: list[Path], dest: Path) -> None:
+def _k_way_merge_sorted_fail_on_duplicate(sources: list[Path], dest: Path) -> None:
     heap: list[tuple[int, int, Iterator[int]]] = []
     for source_index, source in enumerate(sources):
         iterator = _iter_uint64_path(source)
@@ -160,13 +166,31 @@ def _k_way_merge_unique_files(sources: list[Path], dest: Path) -> None:
     last_written: int | None = None
     with dest.open("wb") as output:
         while heap:
-            value, _, iterator = heapq.heappop(heap)
-            if last_written != value:
-                output.write(_UINT64_PACK.pack(value & _UINT64_MASK))
-                last_written = value
+            value, source_index, iterator = heapq.heappop(heap)
+            if last_written == value:
+                raise StructuralCanonicalizeError(
+                    "positive identity recurs non-contiguously within one input"
+                )
+            output.write(_UINT64_PACK.pack(value & _UINT64_MASK))
+            last_written = value
             next_value = next(iterator, None)
             if next_value is not None:
-                heapq.heappush(heap, (next_value, 0, iterator))
+                heapq.heappush(heap, (next_value, source_index, iterator))
+
+
+def _finalize_sorted_bucket_file(path: Path) -> int:
+    previous = 0
+    count = 0
+    for value in _iter_uint64_path(path):
+        if count and value <= previous:
+            if value == previous:
+                raise StructuralCanonicalizeError(
+                    "positive identity recurs non-contiguously within one input"
+                )
+            raise StructuralCanonicalizeError("bucket values must be sorted unique")
+        previous = value
+        count += 1
+    return count
 
 
 def _sort_unique_bucket_file_in_place(path: Path) -> int:
@@ -182,10 +206,8 @@ def _sort_unique_bucket_file_in_place(path: Path) -> int:
             if len(chunk) % 8:
                 raise StructuralCanonicalizeError("bucket spill file is corrupt")
             values = sorted(
-                {
-                    _UINT64_PACK.unpack_from(chunk, offset)[0]
-                    for offset in range(0, len(chunk), 8)
-                }
+                _UINT64_PACK.unpack_from(chunk, offset)[0]
+                for offset in range(0, len(chunk), 8)
             )
             _assert_bounded_materialization(len(values))
             run_path = path.with_name(f"{path.name}.run{len(run_paths)}")
@@ -196,50 +218,70 @@ def _sort_unique_bucket_file_in_place(path: Path) -> int:
     path.unlink(missing_ok=True)
     if not run_paths:
         path.touch()
-        return 0
+        return _finalize_sorted_bucket_file(path)
     if len(run_paths) == 1:
         run_paths[0].replace(path)
-        return path.stat().st_size // 8
-    _k_way_merge_unique_files(run_paths, path)
+        return _finalize_sorted_bucket_file(path)
+    _k_way_merge_sorted_fail_on_duplicate(run_paths, path)
     for run_path in run_paths:
         run_path.unlink(missing_ok=True)
-    return path.stat().st_size // 8
+    return _finalize_sorted_bucket_file(path)
 
 
-def _spill_group_identities(
+def _stream_validate_and_spill_positive_rows(
     ordered: pl.LazyFrame,
     positive_row_count: int,
     spill_dir: Path,
     bucket_count: int,
-) -> tuple[int, ...]:
+    core_fields: list[str],
+) -> tuple[int, tuple[int, ...], dict[str, Any], dict[str, Any]]:
     _init_empty_spill(bucket_count, spill_dir)
     handles = [_bucket_file(spill_dir, index).open("ab") for index in range(bucket_count)]
-    previous: int | None = None
+    previous_identity: int | None = None
+    group_core: dict[str, Any] | None = None
+    group_count = 0
+    first_boundary: dict[str, Any] | None = None
+    last_boundary: dict[str, Any] | None = None
+    select_columns = ["_identity_int", *core_fields]
     try:
         offset = 0
         while offset < positive_row_count:
             batch_size = min(_IDENTITY_SCAN_BATCH, positive_row_count - offset)
-            batch = (
-                ordered.slice(offset, batch_size)
-                .select(pl.col("_identity_int"))
-                .collect()
-                .get_column("_identity_int")
-            )
-            _assert_bounded_materialization(batch.len())
-            for raw in batch:
-                identity = int(raw)
-                if previous is None or identity != previous:
+            batch = ordered.slice(offset, batch_size).select(select_columns).collect()
+            _assert_bounded_materialization(batch.height)
+            for row in batch.iter_rows(named=True):
+                identity = int(row["_identity_int"])
+                if previous_identity is None or identity != previous_identity:
                     index = bucket_index(identity, bucket_count)
                     handles[index].write(_UINT64_PACK.pack(identity & _UINT64_MASK))
-                previous = identity
+                    group_core = {field: row[field] for field in core_fields}
+                    group_count += 1
+                    profile = _boundary_profile(row, core_fields)
+                    if first_boundary is None:
+                        first_boundary = profile
+                    last_boundary = profile
+                else:
+                    if group_core is None:
+                        raise StructuralCanonicalizeError("measurement core fields disagree")
+                    for field in core_fields:
+                        if row[field] != group_core[field]:
+                            raise StructuralCanonicalizeError(
+                                "measurement core fields disagree"
+                            )
+                    last_boundary = _boundary_profile(row, core_fields)
+                previous_identity = identity
             offset += batch_size
     finally:
         for handle in handles:
             handle.close()
-    counts: list[int] = []
+    if first_boundary is None or last_boundary is None:
+        raise StructuralCanonicalizeError("positive rows missing boundary profiles")
+    bucket_counts: list[int] = []
     for index in range(bucket_count):
-        counts.append(_sort_unique_bucket_file_in_place(_bucket_file(spill_dir, index)))
-    return tuple(counts)
+        bucket_counts.append(
+            _sort_unique_bucket_file_in_place(_bucket_file(spill_dir, index))
+        )
+    return group_count, tuple(bucket_counts), first_boundary, last_boundary
 
 
 def _stream_merge_sorted_unique_files(
@@ -368,34 +410,15 @@ def _single_input_state(
         return _empty_state(bucket_count, witness_count)
 
     ordered = positive.sort("_row_index")
-    grouped = ordered.with_columns(
-        (pl.col("_identity_int") != pl.col("_identity_int").shift(1))
-        .fill_null(True)
-        .cum_sum()
-        .alias("_group")
-    )
-
-    group_count = int(grouped.select(pl.col("_group").n_unique()).collect().item())
-    distinct_count = int(ordered.select(pl.col("_identity_int").n_unique()).collect().item())
-    if group_count != distinct_count:
-        raise StructuralCanonicalizeError(
-            "positive identity recurs non-contiguously within one input"
-        )
-
-    nunique = grouped.group_by("_group").agg(
-        [pl.col(field).n_unique().alias(field) for field in core_fields]
-    )
-    disagree = nunique.filter(
-        pl.any_horizontal([pl.col(field) > 1 for field in core_fields])
-    )
-    if int(disagree.select(pl.len()).collect().item()) > 0:
-        raise StructuralCanonicalizeError("measurement core fields disagree")
-
-    first_row = ordered.head(1).collect().row(0, named=True)
-    last_row = ordered.tail(1).collect().row(0, named=True)
     spill_dir = _make_spill_dir()
-    bucket_counts = _spill_group_identities(
-        ordered, positive_row_count, spill_dir, bucket_count
+    group_count, bucket_counts, first_boundary, last_boundary = (
+        _stream_validate_and_spill_positive_rows(
+            ordered,
+            positive_row_count,
+            spill_dir,
+            bucket_count,
+            core_fields,
+        )
     )
 
     return CanonicalizeState(
@@ -405,8 +428,8 @@ def _single_input_state(
         positive_row_count=positive_row_count,
         positive_group_count=group_count,
         witness_row_count=witness_count,
-        first_boundary=_boundary_profile(first_row, core_fields),
-        last_boundary=_boundary_profile(last_row, core_fields),
+        first_boundary=first_boundary,
+        last_boundary=last_boundary,
     )
 
 
@@ -609,29 +632,37 @@ def encode_bucket_from_path(
         bucket_index_value,
         value_count,
     )
+    body_size = value_count * 8
+    payload_size = _BUCKET_HEADER.size + body_size
+    _assert_bucket_payload_bounded(payload_size)
     if value_count == 0:
         return header
-    chunks: list[bytes] = [header]
+    buffer = bytearray(header)
     with path.open("rb") as handle:
-        while True:
-            payload = handle.read(8192 * 8)
-            if not payload:
-                break
-            chunks.append(payload)
-    return b"".join(chunks)
+        remaining = body_size
+        while remaining > 0:
+            chunk = handle.read(min(8192 * 8, remaining))
+            if not chunk:
+                raise StructuralCanonicalizeError("bucket spill file is corrupt")
+            buffer.extend(chunk)
+            remaining -= len(chunk)
+    return bytes(buffer)
 
 
-def encode_state_buckets(state: CanonicalizeState) -> tuple[bytes, ...]:
+def iter_state_bucket_payloads(state: CanonicalizeState):
     _validate_state(state)
-    return tuple(
-        encode_bucket_from_path(
+    for index in range(state.bucket_count):
+        yield encode_bucket_from_path(
             state.bucket_count,
             index,
             _bucket_file(state.spill_dir, index),
             state.bucket_counts[index],
         )
-        for index in range(state.bucket_count)
-    )
+
+
+def encode_state_buckets(state: CanonicalizeState) -> tuple[bytes, ...]:
+    """Test helper: materializes every bucket payload (not for production)."""
+    return tuple(iter_state_bucket_payloads(state))
 
 
 def decode_bucket(payload: bytes, bucket_count: int, expected_index: int) -> tuple[int, ...]:
