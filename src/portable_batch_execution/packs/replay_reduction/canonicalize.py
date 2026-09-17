@@ -119,6 +119,18 @@ def _sentinel_witness_expr(sentinel: SentinelPredicate) -> pl.Expr:
     return expr
 
 
+def _positive_normalized_mismatch_expr(normalized_col: str) -> pl.Expr:
+    normalized_utf8 = pl.col(normalized_col).cast(pl.Utf8, strict=False)
+    expected = pl.col("_identity_int").cast(pl.Utf8)
+    return normalized_utf8.is_null() | (normalized_utf8 != expected)
+
+
+def _positive_null_core_expr(core_fields: list[str]) -> pl.Expr:
+    if len(core_fields) == 1:
+        return pl.col(core_fields[0]).is_null()
+    return pl.any_horizontal([pl.col(field).is_null() for field in core_fields])
+
+
 def _boundary_profile(row: dict[str, Any], core_fields: list[str]) -> dict[str, Any]:
     return {
         "identity": int(row["_identity_int"]),
@@ -250,6 +262,9 @@ def _stream_validate_and_spill_positive_rows(
             batch = ordered.slice(offset, batch_size).select(select_columns).collect()
             _assert_bounded_materialization(batch.height)
             for row in batch.iter_rows(named=True):
+                for field in core_fields:
+                    if row[field] is None:
+                        raise StructuralCanonicalizeError("measurement core fields disagree")
                 identity = int(row["_identity_int"])
                 if previous_identity is None or identity != previous_identity:
                     index = bucket_index(identity, bucket_count)
@@ -398,12 +413,13 @@ def _single_input_state(
         raise StructuralCanonicalizeError("identity is missing or not positive")
 
     positive = lazy.filter(pl.col("_identity_int") > 0)
-    mismatch = positive.filter(
-        pl.col(normalized_col).cast(pl.Utf8, strict=False)
-        != pl.col("_identity_int").cast(pl.Utf8)
-    )
+    mismatch = positive.filter(_positive_normalized_mismatch_expr(normalized_col))
     if int(mismatch.select(pl.len()).collect().item()) > 0:
         raise StructuralCanonicalizeError("identity normalized column mismatch")
+
+    null_core = positive.filter(_positive_null_core_expr(core_fields))
+    if int(null_core.select(pl.len()).collect().item()) > 0:
+        raise StructuralCanonicalizeError("measurement core fields disagree")
 
     positive_row_count = int(positive.select(pl.len()).collect().item())
     if positive_row_count == 0:

@@ -371,6 +371,61 @@ def test_structural_canonicalize_rejects_core_field_disagreement_within_group(tm
         )
 
 
+def test_singleton_positive_rejects_null_normalized_identity(tmp_path):
+    with pytest.raises(StructuralCanonicalizeError, match="identity normalized column mismatch"):
+        execute_structural_canonicalize(
+            _paths(tmp_path, [{"identity": 1, "identity_norm": None, "price": 1.0}]),
+            _PARAMS,
+        )
+
+
+def test_singleton_positive_rejects_null_measurement_core_field(tmp_path):
+    with pytest.raises(StructuralCanonicalizeError, match="measurement core fields disagree"):
+        execute_structural_canonicalize(
+            _paths(tmp_path, [{"identity": 1, "identity_norm": "1", "price": None}]),
+            _PARAMS,
+        )
+
+
+def test_multi_shard_path_rejects_null_normalized_identity(tmp_path):
+    with pytest.raises(StructuralCanonicalizeError, match="identity normalized column mismatch"):
+        execute_structural_canonicalize(
+            _paths(
+                tmp_path,
+                [{"identity": 1, "identity_norm": "1", "price": 1.0}],
+                [{"identity": 2, "identity_norm": None, "price": 2.0}],
+            ),
+            _PARAMS,
+        )
+
+
+def test_multi_shard_path_rejects_null_measurement_core_field(tmp_path):
+    with pytest.raises(StructuralCanonicalizeError, match="measurement core fields disagree"):
+        execute_structural_canonicalize(
+            _paths(
+                tmp_path,
+                [{"identity": 1, "identity_norm": "1", "price": 1.0}],
+                [{"identity": 2, "identity_norm": "2", "price": None}],
+            ),
+            _PARAMS,
+        )
+
+
+def test_sentinel_and_positive_rows_still_pass_after_identity_core_guards(tmp_path):
+    result = execute_structural_canonicalize(
+        _paths(
+            tmp_path,
+            [
+                {"identity": -1, "identity_norm": "x", "price": 0.0},
+                {"identity": 1, "identity_norm": "1", "price": 1.0},
+            ],
+        ),
+        _PARAMS,
+    )
+    assert result.witness_row_count == 1
+    assert result.positive_group_count == 1
+
+
 def test_roundtrip_preserves_state_across_binary_buckets(tmp_path):
     state = _state(
         tmp_path,
