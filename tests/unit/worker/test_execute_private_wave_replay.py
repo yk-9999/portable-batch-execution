@@ -127,5 +127,6 @@ def test_private_wave_materializes_multiple_parquet_inputs_for_canonicalize():
     attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
     assert attempts[0].status == "succeeded"
     body = json.loads(plane.last_written.decode())
-    assert len(body["canonical_records"]) == 2
+    assert body["schema_version"] == "pbe.replay.structural-canonicalize-result.v2"
+    assert len(body["identity_profiles"]) == 2
     assert attempts[0].counts["input_rows"] == 2

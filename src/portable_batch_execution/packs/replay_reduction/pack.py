@@ -1,11 +1,14 @@
-"""Replay reduction pack: structural canonicalize and event-window extraction."""
+"""Replay reduction pack: structural canonicalize, merge, and event-window extraction."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-from .canonicalize import execute_structural_canonicalize
+from .canonicalize import (
+    execute_structural_canonicalize,
+    merge_structural_canonicalize_states,
+)
 from .event_window import execute_event_window_extract
 from .models import PARAM_MODELS
 
@@ -28,10 +31,16 @@ class ReplayReductionPack:
             if paths is None:
                 raise TypeError("structural canonicalize requires parquet_paths")
             return execute_structural_canonicalize(paths, params)
+        if operation == "replay.structural_canonicalize_merge":
+            return merge_structural_canonicalize_states(
+                context["left_state"], context["right_state"]
+            )
         if operation == "replay.event_window_extract":
-            records = context["records"]
+            paths = context.get("parquet_paths")
             request = context["request"]
-            return execute_event_window_extract(records, request)
+            if paths is None:
+                raise TypeError("event window extract requires parquet_paths")
+            return execute_event_window_extract(paths, request)
         raise ValueError(f"unsupported replay operation: {operation}")
 
     def finalize(self, job, canonical_attempts, context):
@@ -42,12 +51,15 @@ class ReplayReductionPack:
         operation: str,
         *,
         paths: list[str | Path] | None = None,
-        records: list[dict[str, Any]] | None = None,
+        left_state: dict[str, Any] | None = None,
+        right_state: dict[str, Any] | None = None,
         request: dict[str, Any] | None = None,
         params: dict[str, Any] | None = None,
     ):
         if operation == "replay.structural_canonicalize":
             return execute_structural_canonicalize(paths or [], params or {})
+        if operation == "replay.structural_canonicalize_merge":
+            return merge_structural_canonicalize_states(left_state or {}, right_state or {})
         if operation == "replay.event_window_extract":
-            return execute_event_window_extract(records or [], request or {})
+            return execute_event_window_extract(paths or [], request or {})
         raise ValueError(f"unsupported replay operation: {operation}")

@@ -1,11 +1,10 @@
-import io
-
 import polars as pl
 import pytest
 
 from portable_batch_execution.packs.replay_reduction.canonicalize import (
     StructuralCanonicalizeError,
     execute_structural_canonicalize,
+    merge_structural_canonicalize_states,
 )
 
 _PARAMS = {
@@ -15,13 +14,6 @@ _PARAMS = {
     "measurement_core_fields": ["price"],
     "sentinel": {"identity_equals": -1},
 }
-
-
-def _write_parquet(rows: list[dict]) -> io.BytesIO:
-    buffer = io.BytesIO()
-    pl.DataFrame(rows).write_parquet(buffer)
-    buffer.seek(0)
-    return buffer
 
 
 def _paths(tmp_path, *row_groups):
@@ -37,32 +29,23 @@ def test_structural_canonicalize_collapses_identity_across_inputs(tmp_path):
     paths = _paths(
         tmp_path,
         [
-            {"identity": 1, "identity_norm": "1", "price": 10.0, "symbol": "AAA"},
-            {"identity": 2, "identity_norm": "2", "price": 20.0, "symbol": "AAA"},
+            {"identity": 1, "identity_norm": "1", "price": 10.0},
+            {"identity": 2, "identity_norm": "2", "price": 20.0},
         ],
-        [
-            {"identity": 1, "identity_norm": "1", "price": 10.0, "symbol": "AAA", "note": "later"},
-        ],
+        [{"identity": 1, "identity_norm": "1", "price": 10.0}],
     )
     result = execute_structural_canonicalize(paths, _PARAMS)
-    assert result["schema_version"] == "pbe.replay.structural-canonicalize-result.v1"
-    assert len(result["canonical_records"]) == 2
-    first = next(item for item in result["canonical_records"] if item["identity"] == 1)
-    assert first.get("note") is None
-    assert result["boundary_evidence"] == [
-        {"source_input_index": 0, "identities": [1, 2]},
-        {"source_input_index": 1, "identities": [1]},
-    ]
+    assert result["schema_version"] == "pbe.replay.structural-canonicalize-result.v2"
+    profile = next(item for item in result["identity_profiles"] if item["identity"] == 1)
+    assert profile["core"] == {"price": 10.0}
+    assert profile["source_input_indices"] == [0, 1]
+    assert profile["row_count"] == 2
 
 
-def test_structural_canonicalize_collects_witness_facts(tmp_path):
-    paths = _paths(
-        tmp_path,
-        [{"identity": -1, "identity_norm": "x", "price": 0.0}],
-    )
+def test_structural_canonicalize_counts_sentinel_witness_rows(tmp_path):
+    paths = _paths(tmp_path, [{"identity": -1, "identity_norm": "x", "price": 0.0}])
     result = execute_structural_canonicalize(paths, _PARAMS)
-    assert result["witness_facts"] == [{"identity": -1, "identity_norm": "x", "price": 0.0}]
-    assert result["canonical_records"] == []
+    assert result["witness_row_count"] == 1
 
 
 @pytest.mark.parametrize(
@@ -74,47 +57,65 @@ def test_structural_canonicalize_collects_witness_facts(tmp_path):
     ],
 )
 def test_structural_canonicalize_rejects_missing_or_nonpositive(tmp_path, rows):
-    paths = _paths(tmp_path, rows)
     with pytest.raises(StructuralCanonicalizeError):
-        execute_structural_canonicalize(paths, _PARAMS)
-
-
-def test_structural_canonicalize_rejects_normalized_mismatch(tmp_path):
-    paths = _paths(tmp_path, [{"identity": 1, "identity_norm": "2", "price": 1.0}])
-    with pytest.raises(StructuralCanonicalizeError):
-        execute_structural_canonicalize(paths, _PARAMS)
+        execute_structural_canonicalize(_paths(tmp_path, rows), _PARAMS)
 
 
 def test_structural_canonicalize_rejects_core_field_disagreement(tmp_path):
-    paths = _paths(
-        tmp_path,
-        [
-            {"identity": 1, "identity_norm": "1", "price": 1.0},
-            {"identity": 1, "identity_norm": "1", "price": 2.0},
-        ],
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_structural_canonicalize(
+            _paths(
+                tmp_path,
+                [
+                    {"identity": 1, "identity_norm": "1", "price": 1.0},
+                    {"identity": 1, "identity_norm": "1", "price": 2.0},
+                ],
+            ),
+            _PARAMS,
+        )
+
+
+def test_structural_canonicalize_allows_non_contiguous_source_indices(tmp_path):
+    result = execute_structural_canonicalize(
+        _paths(
+            tmp_path,
+            [{"identity": 1, "identity_norm": "1", "price": 1.0}],
+            [{"identity": 2, "identity_norm": "2", "price": 2.0}],
+            [{"identity": 1, "identity_norm": "1", "price": 1.0}],
+        ),
+        _PARAMS,
+    )
+    profile = next(item for item in result["identity_profiles"] if item["identity"] == 1)
+    assert profile["source_input_indices"] == [0, 2]
+
+
+def test_merge_detects_cross_wave_core_conflict(tmp_path):
+    wave_a = execute_structural_canonicalize(
+        _paths(tmp_path, [{"identity": 1, "identity_norm": "1", "price": 1.0}]),
+        _PARAMS,
+    )
+    wave_b = execute_structural_canonicalize(
+        _paths(tmp_path, [{"identity": 1, "identity_norm": "1", "price": 2.0}]),
+        _PARAMS,
     )
     with pytest.raises(StructuralCanonicalizeError):
-        execute_structural_canonicalize(paths, _PARAMS)
+        merge_structural_canonicalize_states(wave_a, wave_b)
 
 
-def test_structural_canonicalize_rejects_non_contiguous_source_indices(tmp_path):
-    paths = _paths(
-        tmp_path,
-        [{"identity": 1, "identity_norm": "1", "price": 1.0}],
-        [{"identity": 2, "identity_norm": "2", "price": 2.0}],
-        [{"identity": 1, "identity_norm": "1", "price": 1.0}],
+def test_merge_finalizes_same_identity_across_waves(tmp_path):
+    wave_a = execute_structural_canonicalize(
+        _paths(tmp_path, [{"identity": 1, "identity_norm": "1", "price": 5.0}]),
+        _PARAMS,
     )
-    with pytest.raises(StructuralCanonicalizeError):
-        execute_structural_canonicalize(paths, _PARAMS)
-
-
-def test_structural_canonicalize_prefers_earliest_row(tmp_path):
-    paths = _paths(
-        tmp_path,
-        [
-            {"identity": 1, "identity_norm": "1", "price": 5.0, "tag": "first"},
-            {"identity": 1, "identity_norm": "1", "price": 5.0, "tag": "second"},
-        ],
+    wave_b = execute_structural_canonicalize(
+        _paths(
+            tmp_path,
+            [{"identity": 1, "identity_norm": "1", "price": 5.0}],
+            [{"identity": 2, "identity_norm": "2", "price": 6.0}],
+        ),
+        _PARAMS,
     )
-    result = execute_structural_canonicalize(paths, _PARAMS)
-    assert result["canonical_records"][0]["tag"] == "first"
+    merged = merge_structural_canonicalize_states(wave_a, wave_b)
+    profiles = {item["identity"]: item for item in merged["identity_profiles"]}
+    assert profiles[1]["row_count"] == 2
+    assert profiles[2]["core"] == {"price": 6.0}

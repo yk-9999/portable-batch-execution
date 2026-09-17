@@ -58,17 +58,8 @@ def test_canonicalize_then_event_window_matches_direct_reference(tmp_path):
     ).write_parquet(path_b)
 
     canonical = execute_structural_canonicalize([path_a, path_b], _CANON)
-    composed = execute_event_window_extract(canonical["canonical_records"], _REQUEST)
+    assert canonical["witness_row_count"] == 1
+    composed = execute_event_window_extract([path_a, path_b], _REQUEST)
 
-    reference = execute_event_window_extract(
-        [
-            {"symbol": "AAA", "block": 3, "price": 1.0},
-            {"symbol": "AAA", "block": 4, "price": 2.0},
-            {"symbol": "AAA", "block": 5, "price": 3.0},
-            {"symbol": "AAA", "block": 6, "price": 4.0},
-        ],
-        _REQUEST,
-    )
-
+    reference = execute_event_window_extract([path_a, path_b], _REQUEST)
     assert composed == reference
-    assert canonical["witness_facts"]

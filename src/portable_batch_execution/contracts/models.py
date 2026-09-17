@@ -57,6 +57,7 @@ PACK_OPS = {
     "replay-batch": {
         "replay.structural_canonicalize",
         "replay.event_window_extract",
+        "replay.structural_canonicalize_merge",
     },
     "media-batch": {
         "media.decode",

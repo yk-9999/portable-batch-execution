@@ -53,7 +53,13 @@ class EventWindowExtractRequest(Frozen):
     tie_break_columns: tuple[str, ...] = ("block",)
 
 
+
+
+class StructuralCanonicalizeMergeParams(Frozen):
+    schema_version: Literal["pbe.replay.structural-canonicalize-merge.v1"]
+
 PARAM_MODELS = {
     "replay.structural_canonicalize": StructuralCanonicalizeParams,
     "replay.event_window_extract": EventWindowExtractJobParams,
+    "replay.structural_canonicalize_merge": StructuralCanonicalizeMergeParams,
 }

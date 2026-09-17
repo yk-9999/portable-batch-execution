@@ -71,6 +71,7 @@ _PRIVATE_MEDIA_SINGLE_INPUT_OPS = frozenset({"media.asr_normalize_flac"})
 _PRIVATE_REPLAY_BATCH_OPS = frozenset(
     {
         "replay.structural_canonicalize",
+        "replay.structural_canonicalize_merge",
         "replay.event_window_extract",
     }
 )
@@ -497,7 +498,6 @@ def execute_private_wave(
                 }
                 output_media_type = "audio/flac"
             elif private_pack == "replay-batch":
-                import polars as pl
 
                 if job.operation == "replay.structural_canonicalize":
                     with tempfile.TemporaryDirectory() as temporary:
@@ -520,41 +520,68 @@ def execute_private_wave(
                             raise _ShardStageFailure(
                                 _execution_failure_code(exc, stage="pack")
                             ) from None
-                        output_rows = len(result_payload["canonical_records"]) + len(
-                            result_payload["witness_facts"]
+                        output_rows = len(result_payload.get("identity_profiles", ())) + int(
+                            result_payload.get("witness_row_count", 0)
                         )
-                elif job.operation == "replay.event_window_extract":
+                elif job.operation == "replay.structural_canonicalize_merge":
                     if len(shard.input_refs) != 2:
                         raise _ShardStageFailure("input_artifact_invalid")
-                    if not _artifact_ref_is_parquet(shard.input_refs[0]):
-                        raise _ShardStageFailure("input_artifact_invalid")
-                    request_payload = _read_verified_artifact_bytes(plane, shard.input_refs[1])
+                    left_payload = _read_verified_artifact_bytes(plane, shard.input_refs[0])
+                    right_payload = _read_verified_artifact_bytes(plane, shard.input_refs[1])
                     try:
-                        request_text = request_payload.decode("utf-8")
-                    except UnicodeDecodeError as exc:
+                        left_state = json.loads(left_payload.decode("utf-8"))
+                        right_state = json.loads(right_payload.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError) as exc:
                         raise _ShardStageFailure(
-                            _execution_failure_code(exc, stage="input_decode")
+                            _execution_failure_code(exc, stage="input_parse")
                         ) from None
                     try:
-                        parsed_request = json.loads(request_text)
-                    except ValueError as exc:
+                        result_payload = replay_pack.execute(
+                            job,
+                            shard,
+                            job.operation_params,
+                            {
+                                "left_state": left_state,
+                                "right_state": right_state,
+                                "operation": job.operation,
+                            },
+                        )
+                    except StructuralCanonicalizeError as exc:
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="pack")
+                        ) from None
+                    except Exception as exc:  # noqa: BLE001
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="pack")
+                        ) from None
+                    input_rows = len(result_payload.get("identity_profiles", ()))
+                    output_rows = input_rows
+                elif job.operation == "replay.event_window_extract":
+                    if len(shard.input_refs) < 2:
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    parquet_refs = shard.input_refs[:-1]
+                    request_ref = shard.input_refs[-1]
+                    if not all(_artifact_ref_is_parquet(ref) for ref in parquet_refs):
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    request_payload = _read_verified_artifact_bytes(plane, request_ref)
+                    try:
+                        parsed_request = json.loads(request_payload.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError) as exc:
                         raise _ShardStageFailure(
                             _execution_failure_code(exc, stage="input_parse")
                         ) from None
                     with tempfile.TemporaryDirectory() as temporary:
-                        records_path = Path(temporary) / "canonical.parquet"
-                        _materialize_verified_artifact(
-                            plane, shard.input_refs[0], records_path
+                        paths = _materialize_verified_parquet_inputs(
+                            plane, tuple(parquet_refs), Path(temporary)
                         )
-                        input_rows = _parquet_row_count(records_path)
-                        records = pl.read_parquet(records_path).to_dicts()
+                        input_rows = sum(_parquet_row_count(path) for path in paths)
                         try:
                             result_payload = replay_pack.execute(
                                 job,
                                 shard,
                                 job.operation_params,
                                 {
-                                    "records": records,
+                                    "parquet_paths": paths,
                                     "request": parsed_request,
                                     "operation": job.operation,
                                 },
