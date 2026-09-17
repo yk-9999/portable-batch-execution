@@ -20,7 +20,7 @@ from portable_batch_execution.contracts import (
 )
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
 from portable_batch_execution.data_plane.base import ArtifactContentStream
-from portable_batch_execution.packs import MediaPack, TabularPack
+from portable_batch_execution.packs import MediaPack, ReplayReductionPack, TabularPack
 from portable_batch_execution.packs.ml.char_wb_tfidf_logistic_score import (
     execute_char_wb_tfidf_logistic_score,
 )
@@ -29,6 +29,9 @@ from portable_batch_execution.packs.ml.cosine_similarity_matrix import (
 )
 from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
     execute_distilbert_pair_binary_scores,
+)
+from portable_batch_execution.packs.replay_reduction.canonicalize import (
+    StructuralCanonicalizeError,
 )
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
@@ -65,6 +68,14 @@ _PRIVATE_ML_SINGLE_INPUT_OPS = frozenset(
 )
 _PRIVATE_ML_FIVE_INPUT_OPS = frozenset({"ml.distilbert_pair_binary_scores"})
 _PRIVATE_MEDIA_SINGLE_INPUT_OPS = frozenset({"media.asr_normalize_flac"})
+_PRIVATE_REPLAY_BATCH_OPS = frozenset(
+    {
+        "replay.structural_canonicalize",
+        "replay.event_window_extract",
+    }
+)
+_MAX_REPLAY_PARQUET_INPUTS = 64
+_PRIVATE_REPLAY_PARQUET_MEDIA_TYPES = _PRIVATE_TABULAR_PARQUET_MEDIA_TYPES
 
 
 class PrivateWaveExecutionError(RuntimeError):
@@ -161,6 +172,27 @@ def _open_artifact_content_stream(plane, ref: ArtifactRef) -> ArtifactContentStr
     if ref.size_bytes is not None and stream.size_bytes != ref.size_bytes:
         raise _ShardStageFailure("input_artifact_mismatch")
     return stream
+
+
+def _artifact_ref_is_parquet(ref: ArtifactRef) -> bool:
+    return ref.media_type in _PRIVATE_REPLAY_PARQUET_MEDIA_TYPES
+
+
+def _materialize_verified_parquet_inputs(
+    plane, refs: tuple[ArtifactRef, ...], directory: Path
+) -> list[Path]:
+    if not refs:
+        raise _ShardStageFailure("input_artifact_invalid")
+    if len(refs) > _MAX_REPLAY_PARQUET_INPUTS:
+        raise _ShardStageFailure("input_artifact_invalid")
+    paths: list[Path] = []
+    for index, ref in enumerate(refs):
+        if not _artifact_ref_is_parquet(ref):
+            raise _ShardStageFailure("input_artifact_invalid")
+        destination = directory / f"input-{index}.parquet"
+        _materialize_verified_artifact(plane, ref, destination)
+        paths.append(destination)
+    return paths
 
 
 def _materialize_verified_artifact(
@@ -363,12 +395,17 @@ def execute_private_wave(
         if job.operation_params:
             raise ValueError("closed operation parameters")
         private_pack = "media-batch"
+    elif job.pack == "replay-batch":
+        if job.operation not in _PRIVATE_REPLAY_BATCH_OPS:
+            raise ValueError("private wave operation is not available on the public runner")
+        private_pack = "replay-batch"
     else:
         raise ValueError("private wave operation is not available on the public runner")
     prior = plane.read_attempts(run_id)
     attempts: list[ShardAttemptRecord] = []
     pack = TabularPack()
     media_pack = MediaPack()
+    replay_pack = ReplayReductionPack()
     wave_failures = 0
     for shard in shards:
         current = _matching_current_attempts(prior, shard)
@@ -459,6 +496,80 @@ def execute_private_wave(
                     "output_bytes": len(output),
                 }
                 output_media_type = "audio/flac"
+            elif private_pack == "replay-batch":
+                import polars as pl
+
+                if job.operation == "replay.structural_canonicalize":
+                    with tempfile.TemporaryDirectory() as temporary:
+                        paths = _materialize_verified_parquet_inputs(
+                            plane, tuple(shard.input_refs), Path(temporary)
+                        )
+                        input_rows = sum(_parquet_row_count(path) for path in paths)
+                        try:
+                            result_payload = replay_pack.execute(
+                                job,
+                                shard,
+                                job.operation_params,
+                                {"parquet_paths": paths, "operation": job.operation},
+                            )
+                        except StructuralCanonicalizeError as exc:
+                            raise _ShardStageFailure(
+                                _execution_failure_code(exc, stage="pack")
+                            ) from None
+                        except Exception as exc:  # noqa: BLE001
+                            raise _ShardStageFailure(
+                                _execution_failure_code(exc, stage="pack")
+                            ) from None
+                        output_rows = len(result_payload["canonical_records"]) + len(
+                            result_payload["witness_facts"]
+                        )
+                elif job.operation == "replay.event_window_extract":
+                    if len(shard.input_refs) != 2:
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    if not _artifact_ref_is_parquet(shard.input_refs[0]):
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    request_payload = _read_verified_artifact_bytes(plane, shard.input_refs[1])
+                    try:
+                        request_text = request_payload.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="input_decode")
+                        ) from None
+                    try:
+                        parsed_request = json.loads(request_text)
+                    except ValueError as exc:
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="input_parse")
+                        ) from None
+                    with tempfile.TemporaryDirectory() as temporary:
+                        records_path = Path(temporary) / "canonical.parquet"
+                        _materialize_verified_artifact(
+                            plane, shard.input_refs[0], records_path
+                        )
+                        input_rows = _parquet_row_count(records_path)
+                        records = pl.read_parquet(records_path).to_dicts()
+                        try:
+                            result_payload = replay_pack.execute(
+                                job,
+                                shard,
+                                job.operation_params,
+                                {
+                                    "records": records,
+                                    "request": parsed_request,
+                                    "operation": job.operation,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            raise _ShardStageFailure(
+                                _execution_failure_code(exc, stage="pack")
+                            ) from None
+                        output_rows = len(result_payload["facts"])
+                else:
+                    raise _ShardStageFailure(
+                        _execution_failure_code(ValueError(), stage="pack")
+                    )
+                output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
+                output_media_type = "application/json"
             else:
                 input_ref = shard.input_refs[0]
                 if _private_tabular_single_input_is_parquet(job, input_ref):
