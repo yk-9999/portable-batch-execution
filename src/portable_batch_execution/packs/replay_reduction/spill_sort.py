@@ -75,6 +75,42 @@ def external_sort_lazy_frame(
     )
 
 
+@dataclass(frozen=True)
+class _LogicalSortedRun:
+    """One globally sorted stream that may span multiple on-disk parts."""
+
+    parts: tuple[Path, ...]
+
+    @classmethod
+    def from_path(cls, path: Path) -> _LogicalSortedRun:
+        return cls((path,))
+
+
+@dataclass
+class _LogicalRowStream:
+    """Sequentially stream rows across ordered parts of one logical run."""
+
+    run: _LogicalSortedRun
+    batch_size: int = _ROW_SCAN_BATCH
+    _part_index: int = field(init=False, default=0)
+    _current: _ParquetRowStream | None = field(init=False, default=None)
+
+    def pop(self) -> dict[str, Any] | None:
+        while True:
+            if self._current is None:
+                if self._part_index >= len(self.run.parts):
+                    return None
+                self._current = _ParquetRowStream(
+                    self.run.parts[self._part_index],
+                    batch_size=self.batch_size,
+                )
+                self._part_index += 1
+            row = self._current.pop()
+            if row is not None:
+                return row
+            self._current = None
+
+
 @dataclass
 class _ParquetRowStream:
     path: Path
@@ -110,14 +146,14 @@ class _ParquetRowStream:
                 return None
 
 
-def _iter_k_way_merge_bounded(
-    run_paths: Sequence[Path],
+def _iter_k_way_merge_logical_runs(
+    runs: Sequence[_LogicalSortedRun],
     *,
     sort_keys: Sequence[str],
 ) -> Iterator[dict[str, Any]]:
-    if not run_paths:
+    if not runs:
         return
-    streams = [_ParquetRowStream(path) for path in run_paths]
+    streams = [_LogicalRowStream(run) for run in runs]
     heap: list[tuple[tuple[Any, ...], int, dict[str, Any]]] = []
     for source_id, stream in enumerate(streams):
         row = stream.pop()
@@ -135,15 +171,15 @@ def _iter_k_way_merge_bounded(
 
 
 def _merge_fan_in_group(
-    run_paths: Sequence[Path],
+    runs: Sequence[_LogicalSortedRun],
     *,
     sort_keys: Sequence[str],
     spill_dir: Path,
     run_prefix: str,
-) -> list[Path]:
+) -> _LogicalSortedRun:
     spill_dir.mkdir(parents=True, exist_ok=True)
-    if len(run_paths) == 1:
-        return [run_paths[0]]
+    if len(runs) == 1:
+        return runs[0]
     out_paths: list[Path] = []
     out_batch: list[dict[str, Any]] = []
     part_index = 0
@@ -158,12 +194,14 @@ def _merge_fan_in_group(
         out_batch.clear()
         part_index += 1
 
-    for row in _iter_k_way_merge_bounded(run_paths, sort_keys=sort_keys):
+    for row in _iter_k_way_merge_logical_runs(runs, sort_keys=sort_keys):
         out_batch.append(row)
         if len(out_batch) >= _SORT_RUN_ROWS:
             flush_out()
     flush_out()
-    return out_paths
+    if not out_paths:
+        return _LogicalSortedRun(())
+    return _LogicalSortedRun(tuple(out_paths))
 
 
 def _reduce_sorted_runs(
@@ -172,13 +210,13 @@ def _reduce_sorted_runs(
     sort_keys: Sequence[str],
     spill_dir: Path,
     run_prefix: str,
-) -> list[Path]:
-    current = list(run_paths)
+) -> list[_LogicalSortedRun]:
+    current = [_LogicalSortedRun.from_path(path) for path in run_paths]
     if not current:
         return []
     level = 0
     while len(current) > _MERGE_FAN_IN:
-        next_level: list[Path] = []
+        next_level: list[_LogicalSortedRun] = []
         level_dir = spill_dir / f"merge_level_{level:03d}"
         for group_index, start in enumerate(range(0, len(current), _MERGE_FAN_IN)):
             group = current[start : start + _MERGE_FAN_IN]
@@ -188,7 +226,7 @@ def _reduce_sorted_runs(
                 spill_dir=level_dir / f"group_{group_index:05d}",
                 run_prefix=f"{run_prefix}_l{level}",
             )
-            next_level.extend(merged)
+            next_level.append(merged)
         current = next_level
         level += 1
     return current
@@ -204,8 +242,9 @@ def iter_k_way_merge_dataframes(
     paths = list(run_paths)
     if not paths:
         return
-    if len(paths) == 1:
-        yield from _iter_k_way_merge_bounded(paths, sort_keys=sort_keys)
+    logical = [_LogicalSortedRun.from_path(path) for path in paths]
+    if len(logical) == 1:
+        yield from _iter_k_way_merge_logical_runs(logical, sort_keys=sort_keys)
         return
 
     merge_root = spill_dir
@@ -220,7 +259,7 @@ def iter_k_way_merge_dataframes(
             spill_dir=merge_root,
             run_prefix="reduced",
         )
-        yield from _iter_k_way_merge_bounded(reduced, sort_keys=sort_keys)
+        yield from _iter_k_way_merge_logical_runs(reduced, sort_keys=sort_keys)
     finally:
         if owns_merge_dir:
             shutil.rmtree(merge_root, ignore_errors=True)
