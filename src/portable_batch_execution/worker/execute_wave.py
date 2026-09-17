@@ -520,9 +520,10 @@ def execute_private_wave(
                             raise _ShardStageFailure(
                                 _execution_failure_code(exc, stage="pack")
                             ) from None
-                        output_rows = len(result_payload.get("identity_profiles", ())) + int(
-                            result_payload.get("witness_row_count", 0)
-                        )
+                        output_rows = sum(
+                            int(segment.get("positive_row_count", 0))
+                            for segment in result_payload.get("range_segments", ())
+                        ) + int(result_payload.get("witness_row_count", 0))
                 elif job.operation == "replay.structural_canonicalize_merge":
                     if len(shard.input_refs) != 2:
                         raise _ShardStageFailure("input_artifact_invalid")
@@ -554,7 +555,10 @@ def execute_private_wave(
                         raise _ShardStageFailure(
                             _execution_failure_code(exc, stage="pack")
                         ) from None
-                    input_rows = len(result_payload.get("identity_profiles", ()))
+                    input_rows = sum(
+                        int(segment.get("positive_row_count", 0))
+                        for segment in result_payload.get("range_segments", ())
+                    )
                     output_rows = input_rows
                 elif job.operation == "replay.event_window_extract":
                     if len(shard.input_refs) < 2:

@@ -1,7 +1,8 @@
-"""Structural canonicalization with bounded per-input aggregation."""
+"""Structural canonicalization via compact ordered-range evidence (O(segments) state)."""
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ import polars as pl
 
 from .models import StructuralCanonicalizeParams
 
-RESULT_SCHEMA_VERSION = "pbe.replay.structural-canonicalize-result.v2"
+RESULT_SCHEMA_VERSION = "pbe.replay.structural-canonicalize-result.v3"
 
 
 class StructuralCanonicalizeError(Exception):
@@ -28,11 +29,18 @@ def _require_columns(schema: pl.Schema, columns: tuple[str, ...]) -> None:
         raise StructuralCanonicalizeError(f"missing required columns: {', '.join(missing)}")
 
 
+def _boundary_profile(row: dict[str, Any], core_fields: list[str]) -> dict[str, Any]:
+    return {
+        "identity": int(row["_identity_int"]),
+        "core": {field: row[field] for field in core_fields},
+    }
+
+
 def _summarize_single_input(
     path: str | Path,
     source_index: int,
     model: StructuralCanonicalizeParams,
-) -> tuple[int, list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[int, dict[str, Any]]:
     identity_col = model.identity_source_column
     normalized_col = model.identity_normalized_column
     core_fields = list(model.measurement_core_fields)
@@ -41,7 +49,6 @@ def _summarize_single_input(
     lazy = pl.scan_parquet(str(path))
     _require_columns(lazy.collect_schema(), (identity_col, normalized_col, *core_fields))
     lazy = lazy.with_row_index("_row_index").with_columns(
-        pl.lit(source_index).alias("_source_input_index"),
         pl.col(identity_col).cast(pl.Int64, strict=False).alias("_identity_int"),
     )
 
@@ -62,8 +69,7 @@ def _summarize_single_input(
         invalid_expr = pl.col("_identity_int").is_null() | (
             nonpositive & (pl.col("_identity_int") != sentinel_value)
         )
-    invalid = lazy.filter(invalid_expr)
-    if int(invalid.select(pl.len()).collect().item()) > 0:
+    if int(lazy.filter(invalid_expr).select(pl.len()).collect().item()) > 0:
         raise StructuralCanonicalizeError("identity is missing or not positive")
 
     economic = lazy.filter(pl.col("_identity_int") > 0).filter(
@@ -77,106 +83,167 @@ def _summarize_single_input(
     if int(mismatch.select(pl.len()).collect().item()) > 0:
         raise StructuralCanonicalizeError("identity normalized column mismatch")
 
-    boundary = (
-        economic.group_by("_source_input_index")
-        .agg(
-            pl.col("_identity_int").min().alias("identity_min"),
-            pl.col("_identity_int").max().alias("identity_max"),
-            pl.col("_identity_int").n_unique().alias("identity_count"),
-        )
-        .sort("_source_input_index")
-        .collect()
-    )
-    boundary_evidence = [
-        {
-            "source_input_index": int(row["_source_input_index"]),
-            "identity_min": int(row["identity_min"]),
-            "identity_max": int(row["identity_max"]),
-            "identity_count": int(row["identity_count"]),
+    positive_row_count = int(economic.select(pl.len()).collect().item())
+    if positive_row_count == 0:
+        return witness_count, {
+            "source_input_index": source_index,
+            "positive_row_count": 0,
+            "distinct_identity_count": 0,
         }
-        for row in boundary.iter_rows(named=True)
-    ]
 
-    agg_exprs: list[pl.Expr] = [
-        pl.len().alias("row_count"),
-        pl.col("_source_input_index").sort_by("_row_index").first().alias(
-            "_chosen_source_input_index"
-        ),
-        pl.col("_row_index").min().alias("_chosen_row_index"),
-    ]
+    ordered = economic.sort("_row_index")
+    decreasing = ordered.select(pl.col("_identity_int").diff().lt(0).any()).collect().item()
+    if decreasing:
+        raise StructuralCanonicalizeError("positive identities are not nondecreasing in source order")
+
     for field in core_fields:
-        agg_exprs.append(pl.col(field).n_unique().alias(f"_core_nunique_{field}"))
-        agg_exprs.append(
-            pl.col(field).sort_by("_row_index").first().alias(f"_core_{field}")
+        disagree = (
+            economic.group_by("_identity_int")
+            .agg(pl.col(field).n_unique().alias("_nunique"))
+            .filter(pl.col("_nunique") > 1)
+            .select(pl.len())
+            .collect()
+            .item()
         )
+        if disagree:
+            raise StructuralCanonicalizeError("measurement core fields disagree")
 
-    grouped = economic.group_by("_identity_int").agg(agg_exprs).sort("_identity_int").collect()
-    profiles: list[dict[str, Any]] = []
-    for row in grouped.iter_rows(named=True):
-        core = {field: row[f"_core_{field}"] for field in core_fields}
-        for field in core_fields:
-            if int(row[f"_core_nunique_{field}"]) != 1:
-                raise StructuralCanonicalizeError("measurement core fields disagree")
-        profiles.append(
-            {
-                "identity": int(row["_identity_int"]),
-                "core": core,
-                "source_input_indices": [int(row["_chosen_source_input_index"])],
-                "row_count": int(row["row_count"]),
-            }
+    stats = ordered.select(
+        pl.col("_identity_int").min().alias("identity_min"),
+        pl.col("_identity_int").max().alias("identity_max"),
+        pl.col("_identity_int").n_unique().alias("distinct_identity_count"),
+    ).collect()
+    stat_row = stats.row(0, named=True)
+
+    first_row = ordered.head(1).collect().row(0, named=True)
+    last_row = ordered.tail(1).collect().row(0, named=True)
+
+    segment = {
+        "source_input_index": source_index,
+        "positive_row_count": positive_row_count,
+        "distinct_identity_count": int(stat_row["distinct_identity_count"]),
+        "identity_min": int(stat_row["identity_min"]),
+        "identity_max": int(stat_row["identity_max"]),
+        "first_boundary": _boundary_profile(first_row, core_fields),
+        "last_boundary": _boundary_profile(last_row, core_fields),
+    }
+    return witness_count, segment
+
+
+def _segments_with_positive_data(
+    segments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [segment for segment in segments if int(segment.get("positive_row_count", 0)) > 0]
+
+
+def _link_adjacent_segments(
+    left: dict[str, Any],
+    right: dict[str, Any],
+    *,
+    dedup_shared_boundary_row: bool = False,
+) -> dict[str, Any] | None:
+    """Return coalesced segment when right continues left at a shared boundary identity."""
+    left_max = int(left["identity_max"])
+    right_min = int(right["identity_min"])
+
+    if right_min > left_max:
+        return None
+
+    if right_min != left_max:
+        raise StructuralCanonicalizeError("identity ranges overlap without a shared boundary")
+
+    left_last = left["last_boundary"]
+    right_first = right["first_boundary"]
+    if left_last["identity"] != right_min or right_first["identity"] != right_min:
+        raise StructuralCanonicalizeError("shared boundary identity mismatch")
+
+    if left_last["core"] != right_first["core"]:
+        raise StructuralCanonicalizeError("measurement core fields disagree at range boundary")
+
+    row_count = int(left["positive_row_count"]) + int(right["positive_row_count"])
+    if dedup_shared_boundary_row:
+        row_count -= 1
+
+    return {
+        "source_input_index": int(left["source_input_index"]),
+        "positive_row_count": row_count,
+        "distinct_identity_count": int(left["distinct_identity_count"])
+        + int(right["distinct_identity_count"])
+        - 1,
+        "identity_min": int(left["identity_min"]),
+        "identity_max": int(right["identity_max"]),
+        "first_boundary": deepcopy(left["first_boundary"]),
+        "last_boundary": deepcopy(right["last_boundary"]),
+    }
+
+
+def _validate_and_compact_segment_chain(
+    segments: list[dict[str, Any]],
+    *,
+    dedup_shared_boundary_at_link: int | None = None,
+) -> list[dict[str, Any]]:
+    """Validate cross-input ordering and compact shared-boundary segments."""
+    if not segments:
+        return []
+    positives = _segments_with_positive_data(segments)
+    if not positives:
+        return list(segments)
+
+    compact: list[dict[str, Any]] = []
+    pending = deepcopy(positives[0])
+    for link_index, segment in enumerate(positives[1:]):
+        dedup = dedup_shared_boundary_at_link == link_index
+        coalesced = _link_adjacent_segments(
+            pending, segment, dedup_shared_boundary_row=dedup
         )
-    return witness_count, profiles, boundary_evidence
+        if coalesced is not None:
+            pending = coalesced
+            continue
+        if int(segment["identity_min"]) <= int(pending["identity_max"]):
+            raise StructuralCanonicalizeError("identity ranges overlap without a shared boundary")
+        compact.append(pending)
+        pending = deepcopy(segment)
+    compact.append(pending)
+
+    empty_segments = [
+        segment for segment in segments if int(segment.get("positive_row_count", 0)) == 0
+    ]
+    return empty_segments + compact
 
 
-def _merge_profiles(
-    left: dict[int, dict[str, Any]], profile: dict[str, Any]
-) -> None:
-    identity = int(profile["identity"])
-    if identity not in left:
-        left[identity] = {
-            "identity": identity,
-            "core": dict(profile["core"]),
-            "source_input_indices": list(profile["source_input_indices"]),
-            "row_count": int(profile["row_count"]),
-        }
-        return
-    existing = left[identity]
-    if existing["core"] != profile["core"]:
-        raise StructuralCanonicalizeError("measurement core fields disagree")
-    existing["row_count"] = int(existing["row_count"]) + int(profile["row_count"])
-    merged_indices = sorted(
-        set(existing["source_input_indices"]) | set(profile["source_input_indices"])
+def _merge_segment_lists(
+    left_segments: list[dict[str, Any]], right_segments: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    left_positives = _segments_with_positive_data(left_segments)
+    right_positives = _segments_with_positive_data(right_segments)
+    dedup_link = len(left_positives) - 1 if left_positives and right_positives else None
+    return _validate_and_compact_segment_chain(
+        list(left_segments) + list(right_segments),
+        dedup_shared_boundary_at_link=dedup_link,
     )
-    existing["source_input_indices"] = merged_indices
 
 
 def execute_structural_canonicalize(
     paths: list[str | Path],
     params: dict[str, Any] | StructuralCanonicalizeParams,
 ) -> dict[str, Any]:
-    """Aggregate identities per bounded parquet input without whole-corpus materialization."""
+    """Prove structural order per bounded parquet input without O(distinct identities) state."""
     if not paths:
         raise StructuralCanonicalizeError("at least one parquet input is required")
     model = _validated(params)
-    profiles_by_identity: dict[int, dict[str, Any]] = {}
-    boundary_evidence: list[dict[str, Any]] = []
+    segments: list[dict[str, Any]] = []
     witness_row_count = 0
 
     for source_index, path in enumerate(paths):
-        witness_count, profiles, boundary = _summarize_single_input(path, source_index, model)
+        witness_count, segment = _summarize_single_input(path, source_index, model)
         witness_row_count += witness_count
-        boundary_evidence.extend(boundary)
-        for profile in profiles:
-            _merge_profiles(profiles_by_identity, profile)
+        segments.append(segment)
 
+    range_segments = _validate_and_compact_segment_chain(segments)
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
-        "identity_profiles": [
-            profiles_by_identity[identity]
-            for identity in sorted(profiles_by_identity)
-        ],
+        "range_segments": range_segments,
         "witness_row_count": witness_row_count,
-        "boundary_evidence": boundary_evidence,
     }
 
 
@@ -184,31 +251,19 @@ def merge_structural_canonicalize_states(
     left: dict[str, Any],
     right: dict[str, Any],
 ) -> dict[str, Any]:
-    """Merge two compact canonicalization states exactly across bounded waves."""
+    """Merge two compact ordered-range states exactly across bounded waves."""
     if left.get("schema_version") != RESULT_SCHEMA_VERSION:
         raise StructuralCanonicalizeError("left canonicalization state schema mismatch")
     if right.get("schema_version") != RESULT_SCHEMA_VERSION:
         raise StructuralCanonicalizeError("right canonicalization state schema mismatch")
 
-    profiles_by_identity: dict[int, dict[str, Any]] = {}
-    for profile in left.get("identity_profiles", ()):
-        profiles_by_identity[int(profile["identity"])] = {
-            "identity": int(profile["identity"]),
-            "core": dict(profile["core"]),
-            "source_input_indices": list(profile["source_input_indices"]),
-            "row_count": int(profile["row_count"]),
-        }
-    for profile in right.get("identity_profiles", ()):
-        _merge_profiles(profiles_by_identity, profile)
-
+    merged_segments = _merge_segment_lists(
+        list(left.get("range_segments", ())),
+        list(right.get("range_segments", ())),
+    )
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
-        "identity_profiles": [
-            profiles_by_identity[identity]
-            for identity in sorted(profiles_by_identity)
-        ],
+        "range_segments": merged_segments,
         "witness_row_count": int(left.get("witness_row_count", 0))
         + int(right.get("witness_row_count", 0)),
-        "boundary_evidence": list(left.get("boundary_evidence", ()))
-        + list(right.get("boundary_evidence", ())),
     }

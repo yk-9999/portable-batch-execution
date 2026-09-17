@@ -24,13 +24,13 @@ def test_canonicalize_rejects_whole_corpus_read_and_concat(tmp_path, monkeypatch
     monkeypatch.setattr(pl, "concat", forbid_concat)
 
     result = canonicalize.execute_structural_canonicalize([path], _PARAMS)
-    assert result["identity_profiles"][0]["identity"] == 1
+    assert result["range_segments"][0]["identity_min"] == 1
 
 
 def test_event_window_rejects_whole_history_to_dicts(tmp_path, monkeypatch):
     path = tmp_path / "records.parquet"
     pl.DataFrame(
-        [{"symbol": "AAA", "block": 1, "price": 1.0, "seq": 0}]
+        [{"symbol": "AAA", "block": 1, "timestamp_ms": 1, "price": 1.0, "seq": 0}]
     ).write_parquet(path)
 
     class _Frame:
@@ -43,13 +43,14 @@ def test_event_window_rejects_whole_history_to_dicts(tmp_path, monkeypatch):
     monkeypatch.setattr(pl, "read_parquet", forbid_read)
 
     request = {
-        "schema_version": "pbe.replay.event-window-extract.v1",
+        "schema_version": "pbe.replay.event-window-extract.v2",
         "request_id": "req",
         "symbol": "AAA",
         "symbol_column": "symbol",
         "block_column": "block",
+        "timestamp_column": "timestamp_ms",
+        "decision_timestamp_ms": 1000,
         "causal_cutoff_block": 1,
-        "decision_block": 1,
         "as_of_measurement_field": "price",
     }
     result = event_window.execute_event_window_extract([path], request)

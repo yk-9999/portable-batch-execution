@@ -1,7 +1,10 @@
+import json
+
 import polars as pl
 import pytest
 
 from portable_batch_execution.packs.replay_reduction.canonicalize import (
+    RESULT_SCHEMA_VERSION,
     StructuralCanonicalizeError,
     execute_structural_canonicalize,
     merge_structural_canonicalize_states,
@@ -25,21 +28,106 @@ def _paths(tmp_path, *row_groups):
     return paths
 
 
-def test_structural_canonicalize_collapses_identity_across_inputs(tmp_path):
-    paths = _paths(
-        tmp_path,
-        [
-            {"identity": 1, "identity_norm": "1", "price": 10.0},
-            {"identity": 2, "identity_norm": "2", "price": 20.0},
-        ],
-        [{"identity": 1, "identity_norm": "1", "price": 10.0}],
+def _positive_segments(result):
+    return [
+        segment
+        for segment in result["range_segments"]
+        if int(segment.get("positive_row_count", 0)) > 0
+    ]
+
+
+def test_many_distinct_identities_keep_constant_segment_cardinality(tmp_path):
+    rows = [
+        {"identity": i, "identity_norm": str(i), "price": float(i)} for i in range(1, 5001)
+    ]
+    result = execute_structural_canonicalize(_paths(tmp_path, rows), _PARAMS)
+    assert result["schema_version"] == RESULT_SCHEMA_VERSION
+    assert len(_positive_segments(result)) == 1
+    assert len(json.dumps(result)) < 5000
+
+
+def test_ordered_disjoint_shards_pass(tmp_path):
+    result = execute_structural_canonicalize(
+        _paths(
+            tmp_path,
+            [
+                {"identity": 1, "identity_norm": "1", "price": 1.0},
+                {"identity": 2, "identity_norm": "2", "price": 2.0},
+            ],
+            [{"identity": 3, "identity_norm": "3", "price": 3.0}],
+        ),
+        _PARAMS,
     )
-    result = execute_structural_canonicalize(paths, _PARAMS)
-    assert result["schema_version"] == "pbe.replay.structural-canonicalize-result.v2"
-    profile = next(item for item in result["identity_profiles"] if item["identity"] == 1)
-    assert profile["core"] == {"price": 10.0}
-    assert profile["source_input_indices"] == [0, 1]
-    assert profile["row_count"] == 2
+    assert len(_positive_segments(result)) == 2
+
+
+def test_shared_boundary_split_across_adjacent_shards_passes(tmp_path):
+    result = execute_structural_canonicalize(
+        _paths(
+            tmp_path,
+            [{"identity": 1, "identity_norm": "1", "price": 10.0}],
+            [
+                {"identity": 1, "identity_norm": "1", "price": 10.0},
+                {"identity": 2, "identity_norm": "2", "price": 20.0},
+            ],
+        ),
+        _PARAMS,
+    )
+    segments = _positive_segments(result)
+    assert len(segments) == 1
+    assert segments[0]["positive_row_count"] == 3
+    assert segments[0]["identity_max"] == 2
+
+
+def test_shared_boundary_core_conflict_fails(tmp_path):
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_structural_canonicalize(
+            _paths(
+                tmp_path,
+                [{"identity": 1, "identity_norm": "1", "price": 1.0}],
+                [{"identity": 1, "identity_norm": "1", "price": 2.0}],
+            ),
+            _PARAMS,
+        )
+
+
+def test_overlap_without_shared_boundary_fails(tmp_path):
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_structural_canonicalize(
+            _paths(
+                tmp_path,
+                [
+                    {"identity": 1, "identity_norm": "1", "price": 1.0},
+                    {"identity": 5, "identity_norm": "5", "price": 5.0},
+                ],
+                [
+                    {"identity": 3, "identity_norm": "3", "price": 3.0},
+                    {"identity": 4, "identity_norm": "4", "price": 4.0},
+                ],
+            ),
+            _PARAMS,
+        )
+
+
+def test_non_contiguous_recurrence_across_shards_fails(tmp_path):
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_structural_canonicalize(
+            _paths(
+                tmp_path,
+                [{"identity": 1, "identity_norm": "1", "price": 1.0}],
+                [{"identity": 2, "identity_norm": "2", "price": 2.0}],
+                [{"identity": 1, "identity_norm": "1", "price": 1.0}],
+            ),
+            _PARAMS,
+        )
+
+
+def test_unordered_identities_within_shard_fail_closed(tmp_path):
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_structural_canonicalize(
+            _paths(tmp_path, [{"identity": 2, "identity_norm": "2", "price": 2.0}, {"identity": 1, "identity_norm": "1", "price": 1.0}]),
+            _PARAMS,
+        )
 
 
 def test_structural_canonicalize_counts_sentinel_witness_rows(tmp_path):
@@ -61,7 +149,7 @@ def test_structural_canonicalize_rejects_missing_or_nonpositive(tmp_path, rows):
         execute_structural_canonicalize(_paths(tmp_path, rows), _PARAMS)
 
 
-def test_structural_canonicalize_rejects_core_field_disagreement(tmp_path):
+def test_structural_canonicalize_rejects_core_field_disagreement_within_shard(tmp_path):
     with pytest.raises(StructuralCanonicalizeError):
         execute_structural_canonicalize(
             _paths(
@@ -73,20 +161,6 @@ def test_structural_canonicalize_rejects_core_field_disagreement(tmp_path):
             ),
             _PARAMS,
         )
-
-
-def test_structural_canonicalize_allows_non_contiguous_source_indices(tmp_path):
-    result = execute_structural_canonicalize(
-        _paths(
-            tmp_path,
-            [{"identity": 1, "identity_norm": "1", "price": 1.0}],
-            [{"identity": 2, "identity_norm": "2", "price": 2.0}],
-            [{"identity": 1, "identity_norm": "1", "price": 1.0}],
-        ),
-        _PARAMS,
-    )
-    profile = next(item for item in result["identity_profiles"] if item["identity"] == 1)
-    assert profile["source_input_indices"] == [0, 2]
 
 
 def test_merge_detects_cross_wave_core_conflict(tmp_path):
@@ -102,7 +176,7 @@ def test_merge_detects_cross_wave_core_conflict(tmp_path):
         merge_structural_canonicalize_states(wave_a, wave_b)
 
 
-def test_merge_finalizes_same_identity_across_waves(tmp_path):
+def test_merge_coalesces_shared_boundary_across_waves(tmp_path):
     wave_a = execute_structural_canonicalize(
         _paths(tmp_path, [{"identity": 1, "identity_norm": "1", "price": 5.0}]),
         _PARAMS,
@@ -111,11 +185,15 @@ def test_merge_finalizes_same_identity_across_waves(tmp_path):
         _paths(
             tmp_path,
             [{"identity": 1, "identity_norm": "1", "price": 5.0}],
-            [{"identity": 2, "identity_norm": "2", "price": 6.0}],
+            [
+                {"identity": 1, "identity_norm": "1", "price": 5.0},
+                {"identity": 2, "identity_norm": "2", "price": 6.0},
+            ],
         ),
         _PARAMS,
     )
     merged = merge_structural_canonicalize_states(wave_a, wave_b)
-    profiles = {item["identity"]: item for item in merged["identity_profiles"]}
-    assert profiles[1]["row_count"] == 2
-    assert profiles[2]["core"] == {"price": 6.0}
+    segments = _positive_segments(merged)
+    assert len(segments) == 1
+    assert segments[0]["positive_row_count"] == 3
+    assert segments[0]["identity_max"] == 2
