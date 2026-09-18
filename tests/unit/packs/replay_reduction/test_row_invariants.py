@@ -196,7 +196,9 @@ def test_product_column_with_tolerance_absolute_boundary_passes_at_limit():
     )
     validate_row_invariants({"qty": 1.0, "line_total": 2.0}, profile.row_invariants)
     with pytest.raises(StructuralCanonicalizeError):
-        validate_row_invariants({"qty": 1.0, "line_total": 2.001}, profile.row_invariants)
+        validate_row_invariants(
+            {"qty": 1.0, "line_total": 2.001}, profile.row_invariants
+        )
 
 
 def test_product_column_with_tolerance_relative_boundary_passes_at_limit():
@@ -268,3 +270,83 @@ def test_scalar_product_with_tolerance_invariant_unchanged():
     validate_row_invariants({"qty": 3.0, "unit_price": 4.0}, profile.row_invariants)
     with pytest.raises(StructuralCanonicalizeError):
         validate_row_invariants({"qty": 3.0, "unit_price": 5.0}, profile.row_invariants)
+
+
+_TEXT_COLUMN_INVARIANT = {
+    "schema_version": "pbe.replay.row-invariant.text-column-equivalence.v1",
+    "left_column": "code_a",
+    "right_column": "code_b",
+}
+
+
+def test_text_column_equivalence_discriminated_parsing():
+    profile = _profile_with_invariants(_TEXT_COLUMN_INVARIANT)
+    invariant = profile.row_invariants[0]
+    assert (
+        invariant.schema_version
+        == "pbe.replay.row-invariant.text-column-equivalence.v1"
+    )
+    assert invariant.left_column == "code_a"
+    assert invariant.right_column == "code_b"
+
+
+def test_text_column_equivalence_equal_strings_pass():
+    profile = _profile_with_invariants(_TEXT_COLUMN_INVARIANT)
+    validate_row_invariants(
+        {"code_a": "same", "code_b": "same"},
+        profile.row_invariants,
+    )
+
+
+def test_text_column_equivalence_unequal_strings_fail():
+    profile = _profile_with_invariants(_TEXT_COLUMN_INVARIANT)
+    with pytest.raises(StructuralCanonicalizeError):
+        validate_row_invariants(
+            {"code_a": "left", "code_b": "right"},
+            profile.row_invariants,
+        )
+
+
+def test_text_column_equivalence_missing_side_fails():
+    profile = _profile_with_invariants(_TEXT_COLUMN_INVARIANT)
+    with pytest.raises(StructuralCanonicalizeError):
+        validate_row_invariants({"code_a": "only"}, profile.row_invariants)
+    with pytest.raises(StructuralCanonicalizeError):
+        validate_row_invariants({"code_b": "only"}, profile.row_invariants)
+
+
+def test_text_column_equivalence_non_string_values_fail_without_coercion():
+    profile = _profile_with_invariants(_TEXT_COLUMN_INVARIANT)
+    for left, right in (
+        (None, "x"),
+        ("x", None),
+        (1, "1"),
+        ("1", 1),
+        (True, "True"),
+        (1.5, "1.5"),
+    ):
+        with pytest.raises(StructuralCanonicalizeError):
+            validate_row_invariants(
+                {"code_a": left, "code_b": right}, profile.row_invariants
+            )
+
+
+def test_text_column_invariant_columns_include_both_sides():
+    profile = _profile_with_invariants(_TEXT_COLUMN_INVARIANT)
+    assert invariant_columns(profile.row_invariants) == ("code_a", "code_b")
+
+
+def test_text_column_equivalence_backward_compatible_with_existing_invariants():
+    profile = _profile_with_invariants(
+        _TEXT_COLUMN_INVARIANT, _PRODUCT_COLUMN_INVARIANT
+    )
+    validate_row_invariants(
+        {
+            "code_a": "x",
+            "code_b": "x",
+            "qty": 3.0,
+            "unit_price": 4.0,
+            "line_total": 12.0,
+        },
+        profile.row_invariants,
+    )

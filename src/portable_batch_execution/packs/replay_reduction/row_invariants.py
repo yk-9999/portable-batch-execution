@@ -15,6 +15,7 @@ from .models import (
     ProductColumnWithToleranceRowInvariant,
     ProductWithToleranceRowInvariant,
     RowInvariant,
+    TextColumnEquivalenceRowInvariant,
     TimestampMsEquivalenceRowInvariant,
 )
 
@@ -33,7 +34,12 @@ def invariant_columns(invariants: tuple[RowInvariant, ...]) -> tuple[str, ...]:
         if isinstance(invariant, ExactTextRowInvariant):
             columns.append(invariant.column)
         elif isinstance(
-            invariant, (NumericRowInvariant, TimestampMsEquivalenceRowInvariant)
+            invariant,
+            (
+                NumericRowInvariant,
+                TimestampMsEquivalenceRowInvariant,
+                TextColumnEquivalenceRowInvariant,
+            ),
         ):
             columns.extend((invariant.left_column, invariant.right_column))
         elif isinstance(invariant, PositiveFiniteRowInvariant):
@@ -169,6 +175,13 @@ def validate_row_invariants(
                 absolute_tolerance=invariant.absolute_tolerance,
                 relative_tolerance=invariant.relative_tolerance,
             ):
+                raise StructuralCanonicalizeError("row invariant violated")
+        elif isinstance(invariant, TextColumnEquivalenceRowInvariant):
+            left = row.get(invariant.left_column)
+            right = row.get(invariant.right_column)
+            if not isinstance(left, str) or not isinstance(right, str):
+                raise StructuralCanonicalizeError("row invariant violated")
+            if left != right:
                 raise StructuralCanonicalizeError("row invariant violated")
         else:
             raise StructuralCanonicalizeError("row invariant violated")

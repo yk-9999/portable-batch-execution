@@ -121,13 +121,20 @@ class ProductColumnWithToleranceRowInvariant(Frozen):
     relative_tolerance: float = Field(default=0.0, ge=0)
 
 
+class TextColumnEquivalenceRowInvariant(Frozen):
+    schema_version: Literal["pbe.replay.row-invariant.text-column-equivalence.v1"]
+    left_column: str = Field(min_length=1)
+    right_column: str = Field(min_length=1)
+
+
 RowInvariant = Annotated[
     ExactTextRowInvariant
     | NumericRowInvariant
     | TimestampMsEquivalenceRowInvariant
     | PositiveFiniteRowInvariant
     | ProductWithToleranceRowInvariant
-    | ProductColumnWithToleranceRowInvariant,
+    | ProductColumnWithToleranceRowInvariant
+    | TextColumnEquivalenceRowInvariant,
     Field(discriminator="schema_version"),
 ]
 
