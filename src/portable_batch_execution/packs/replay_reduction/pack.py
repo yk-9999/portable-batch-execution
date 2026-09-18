@@ -10,6 +10,7 @@ from .canonicalize import (
     execute_structural_canonicalize,
     merge_structural_canonicalize_states,
 )
+from .causal_grid import execute_causal_grid_extract
 from .event_window import execute_event_window_extract
 from .models import PARAM_MODELS
 
@@ -42,6 +43,12 @@ class ReplayReductionPack:
             if paths is None:
                 raise TypeError("event window extract requires parquet_paths")
             return execute_event_window_extract(paths, request)
+        if operation == "replay.causal_grid_extract":
+            paths = context.get("parquet_paths")
+            request = context["request"]
+            if paths is None:
+                raise TypeError("causal grid extract requires parquet_paths")
+            return execute_causal_grid_extract(paths, request)
         raise ValueError(f"unsupported replay operation: {operation}")
 
     def finalize(self, job, canonical_attempts, context):
@@ -63,5 +70,7 @@ class ReplayReductionPack:
             return merge_structural_canonicalize_states(left_state, right_state)
         if operation == "replay.event_window_extract":
             return execute_event_window_extract(paths or [], request or {})
+        if operation == "replay.causal_grid_extract":
+            return execute_causal_grid_extract(paths or [], request or {})
         raise ValueError(f"unsupported replay operation: {operation}")
 

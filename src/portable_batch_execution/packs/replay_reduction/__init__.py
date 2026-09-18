@@ -22,6 +22,7 @@ from .canonicalize import (
     state_summary,
     states_equal,
 )
+from .causal_grid import execute_causal_grid_extract
 from .event_window import execute_event_window_extract
 from .pack import ReplayReductionPack
 
@@ -41,6 +42,7 @@ __all__ = [
     "decode_state_from_bucket_payloads",
     "encode_bucket",
     "encode_state_buckets",
+    "execute_causal_grid_extract",
     "execute_event_window_extract",
     "execute_structural_canonicalize",
     "merge_structural_canonicalize_states",

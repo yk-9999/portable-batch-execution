@@ -308,3 +308,108 @@ def test_private_wave_merge_fails_closed_on_mismatched_bucket_state():
     else:
         raise AssertionError("merge must fail closed on malformed bucket state")
 
+
+def test_private_wave_causal_grid_extract_dispatches_typed_request():
+    trade_payload = _parquet_payload(
+        [
+            {
+                "identity": 1,
+                "identity_norm": "1",
+                "symbol": "AAA",
+                "block": 90,
+                "timestamp_ms": 8_000,
+                "price": 1.0,
+                "notional": 10.0,
+                "seq": 0,
+            },
+            {
+                "identity": 2,
+                "identity_norm": "2",
+                "symbol": "AAA",
+                "block": 100,
+                "timestamp_ms": 9_500,
+                "price": 2.0,
+                "notional": 20.0,
+                "seq": 0,
+            },
+        ]
+    )
+    witness_payload = _parquet_payload(
+        [
+            {"block": 90, "timestamp_ms": 8_000},
+            {"block": 110, "timestamp_ms": 10_000},
+        ]
+    )
+    request = {
+        "schema_version": "pbe.replay.causal-grid-extract.v1",
+        "request_id": "worker-grid",
+        "target_symbols": ("AAA",),
+        "input_roles": (
+            {"input_index": 0, "role": "canonical_trade"},
+            {"input_index": 1, "role": "causal_witness"},
+        ),
+        "causal_witness_mapping": {
+            "block_column": "block",
+            "timestamp_column": "timestamp_ms",
+        },
+        "canonical_trade_mapping": {
+            "canonical_trade_profile": {
+                "schema_version": "pbe.replay.canonical-trade-profile.v1",
+                "identity_source_column": "identity",
+                "identity_normalized_column": "identity_norm",
+                "measurement_core_fields": ["price"],
+            },
+            "symbol_column": "symbol",
+            "block_column": "block",
+            "timestamp_column": "timestamp_ms",
+            "price_field": "price",
+            "notional_field": "notional",
+        },
+        "emit_grid": {
+            "start_timestamp_ms": 10_000,
+            "end_timestamp_ms": 10_000,
+            "step_ms": 5_000,
+        },
+        "partition": {
+            "emit_start_ms": 10_000,
+            "emit_end_ms": 10_000,
+            "overlap_ms": 60_000,
+            "hard_gap_missing_dates": (),
+        },
+        "as_of_measurement_field": "price",
+        "as_of_offsets_ms": (0, 5_000),
+        "trailing_windows": (
+            {
+                "fact_id": "trade_notional_60s",
+                "measurement_field": "notional",
+                "trailing_width_ms": 60_000,
+            },
+        ),
+        "tie_break_columns": ("timestamp_ms", "seq"),
+    }
+    request_payload = json.dumps(request).encode("utf-8")
+    refs = [
+        _ref("trades", trade_payload),
+        _ref("witness", witness_payload),
+        ArtifactRef(
+            object_id="request",
+            uri="pbe://private/request",
+            sha256="sha256:" + sha256(request_payload).hexdigest(),
+            size_bytes=len(request_payload),
+            media_type="application/json",
+        ),
+    ]
+    plane = _plane_for_replay(
+        operation="replay.causal_grid_extract",
+        input_refs=refs,
+        operation_params={"schema_version": "pbe.replay.causal-grid-extract-job.v1"},
+    )
+    plane._payloads["trades"] = trade_payload
+    plane._payloads["witness"] = witness_payload
+    plane._payloads["request"] = request_payload
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert attempts[0].status == "succeeded"
+    result = json.loads(plane._payloads[attempts[0].output_refs[0].object_id].decode())
+    assert result["schema_version"] == "pbe.replay.causal-grid-extract-result.v1"
+    assert len(result["rows"]) == 1
+
