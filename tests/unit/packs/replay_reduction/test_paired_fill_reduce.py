@@ -12,7 +12,10 @@ from portable_batch_execution.packs.replay_reduction.models import (
     PairedFillReduceRequest,
 )
 from portable_batch_execution.packs.replay_reduction.paired_fill_reduce import (
+    METADATA_SCHEMA_VERSION,
+    build_paired_fill_metadata,
     execute_paired_fill_reduce,
+    publish_paired_fill_reduce_artifacts,
 )
 
 _ROLE_A = "side_a"
@@ -281,6 +284,67 @@ def test_nullable_json_projection_and_request_parsing(tmp_path):
     )
     result = execute_paired_fill_reduce([path], request)
     assert result["ledger_rows"][0]["classification"] == "singleton"
+
+
+def test_publish_paired_fill_artifacts_metadata_and_parquet_integrity():
+    class _Ref:
+        def __init__(self, object_id, payload, media_type):
+            self.object_id = object_id
+            self.uri = f"pbe://private/{object_id}"
+            self.sha256 = "sha256:" + __import__("hashlib").sha256(payload).hexdigest()
+            self.size_bytes = len(payload)
+            self.media_type = media_type
+
+        def model_dump(self, mode="json"):
+            return {
+                "object_id": self.object_id,
+                "uri": self.uri,
+                "sha256": self.sha256,
+                "size_bytes": self.size_bytes,
+                "media_type": self.media_type,
+            }
+
+    class Plane:
+        def __init__(self):
+            self.payloads = {}
+            self.counter = 0
+
+        def write(self, data, media_type):
+            object_id = f"out-{self.counter}"
+            self.counter += 1
+            self.payloads[object_id] = data
+            return _Ref(object_id, data, media_type)
+
+    plane = Plane()
+    result = {
+        "schema_version": "pbe.replay.paired-fill-reduce-result.v1",
+        "summary": {"ledger_row_count": 1, "content_identity": "sha256:abc"},
+        "exceptions": [],
+        "outgoing_carry": {"schema_version": "pbe.replay.paired-fill-reduce-carry.v1"},
+        "ledger_parquet_bytes": b"PAR1",
+        "ledger_parquet_identity": "sha256:"
+        + __import__("hashlib").sha256(b"PAR1").hexdigest(),
+    }
+
+    def _matches(data, ref):
+        return ref.sha256 == "sha256:" + __import__("hashlib").sha256(data).hexdigest()
+
+    metadata_bytes, refs = publish_paired_fill_reduce_artifacts(
+        plane,
+        result,
+        artifact_ref_matches_bytes=_matches,
+        shard_stage_failure=RuntimeError,
+    )
+    assert len(refs) == 2
+    metadata = __import__("json").loads(metadata_bytes.decode())
+    assert metadata["schema_version"] == METADATA_SCHEMA_VERSION
+    assert metadata["ledger_parquet_ref"]["object_id"] == refs[1].object_id
+    assert (
+        build_paired_fill_metadata(result, ledger_parquet_ref=refs[1])["summary"][
+            "ledger_row_count"
+        ]
+        == 1
+    )
 
 
 def test_carry_non_terminal_partition(tmp_path):

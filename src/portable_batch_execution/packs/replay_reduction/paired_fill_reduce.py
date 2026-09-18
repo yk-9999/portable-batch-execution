@@ -23,10 +23,13 @@ from .nullable_json_projection import apply_nullable_json_projections_to_lazy
 from .row_invariants import invariant_columns, validate_row_invariants
 
 RESULT_SCHEMA_VERSION = "pbe.replay.paired-fill-reduce-result.v1"
+METADATA_SCHEMA_VERSION = "pbe.replay.paired-fill-reduce-metadata.v1"
 CARRY_SCHEMA_VERSION = "pbe.replay.paired-fill-reduce-carry.v1"
+LEDGER_PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
 _SOURCE_INPUT_INDEX = "_source_input_index"
 _SOURCE_ROW_OFFSET = "_source_row_offset"
 _MAX_INPUT_FILES = 64
+_MAX_LEDGER_PARQUET_BYTES = 67_108_864
 
 
 def _validated(
@@ -432,6 +435,8 @@ def execute_paired_fill_reduce(
     if reducer.ledger_rows:
         pl.DataFrame(reducer.ledger_rows).write_parquet(ledger_buffer)
     ledger_bytes = ledger_buffer.getvalue()
+    if len(ledger_bytes) > _MAX_LEDGER_PARQUET_BYTES:
+        raise ValueError("paired fill parquet output exceeds byte limit")
     ledger_parquet_identity = (
         f"sha256:{sha256(ledger_bytes).hexdigest()}" if ledger_bytes else None
     )
@@ -450,3 +455,51 @@ def execute_paired_fill_reduce(
             "pending_identity": None,
         },
     }
+
+
+def build_paired_fill_metadata(
+    result_payload: dict[str, Any],
+    *,
+    ledger_parquet_ref: Any | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": METADATA_SCHEMA_VERSION,
+        "result_schema_version": result_payload["schema_version"],
+        "summary": result_payload["summary"],
+        "exceptions": result_payload["exceptions"],
+        "outgoing_carry": result_payload["outgoing_carry"],
+        "ledger_parquet_ref": (
+            ledger_parquet_ref.model_dump(mode="json")
+            if ledger_parquet_ref is not None
+            else None
+        ),
+        "ledger_parquet_identity": result_payload.get("ledger_parquet_identity"),
+    }
+
+
+def publish_paired_fill_reduce_artifacts(
+    plane,
+    result_payload: dict[str, Any],
+    *,
+    artifact_ref_matches_bytes,
+    shard_stage_failure,
+) -> tuple[bytes, tuple[Any, ...]]:
+    """Publish ledger Parquet (when non-empty) then deterministic metadata JSON."""
+    ledger_bytes = bytes(result_payload.get("ledger_parquet_bytes") or b"")
+    if len(ledger_bytes) > _MAX_LEDGER_PARQUET_BYTES:
+        raise ValueError("paired fill parquet output exceeds byte limit")
+
+    ledger_ref = None
+    output_refs: list[Any] = []
+    if ledger_bytes:
+        ledger_ref = plane.write(ledger_bytes, LEDGER_PARQUET_MEDIA_TYPE)
+        if not artifact_ref_matches_bytes(ledger_bytes, ledger_ref):
+            raise shard_stage_failure("output_artifact_mismatch")
+        output_refs.append(ledger_ref)
+
+    metadata = build_paired_fill_metadata(result_payload, ledger_parquet_ref=ledger_ref)
+    metadata_bytes = json.dumps(metadata, sort_keys=True).encode("utf-8")
+    metadata_ref = plane.write(metadata_bytes, "application/json")
+    if not artifact_ref_matches_bytes(metadata_bytes, metadata_ref):
+        raise shard_stage_failure("output_artifact_mismatch")
+    return metadata_bytes, (metadata_ref, *output_refs)
