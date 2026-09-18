@@ -100,15 +100,12 @@ class _CausalSegmentFrontier:
             self.secondary_block = block
 
     def observe(self, *, exchange_time_ms: int, block_number: int) -> None:
-        if (
-            self.last_time is not None
-            and (
-                exchange_time_ms < self.last_time
-                or (
-                    self.last_block is not None
-                    and block_number < self.last_block
-                    and exchange_time_ms >= self.last_time
-                )
+        if self.last_time is not None and (
+            exchange_time_ms < self.last_time
+            or (
+                self.last_block is not None
+                and block_number < self.last_block
+                and exchange_time_ms >= self.last_time
             )
         ):
             self.monotone_ok = False
@@ -135,7 +132,9 @@ class _CausalSegmentFrontier:
         )
 
     @classmethod
-    def from_compact(cls, row: tuple[int, int, int, int, int, bool]) -> _CausalSegmentFrontier:
+    def from_compact(
+        cls, row: tuple[int, int, int, int, int, bool]
+    ) -> _CausalSegmentFrontier:
         segment_id, primary, secondary, last_time, last_block, monotone_ok = row
         return cls(
             segment_id=int(segment_id),
@@ -243,7 +242,9 @@ class _SymbolRolling:
         self._evict_before(watermark_ms)
         self.events.append(trade)
 
-    def facts_at(self, *, decision_time_ms: int, cutoff: int | None) -> list[dict[str, Any]]:
+    def facts_at(
+        self, *, decision_time_ms: int, cutoff: int | None
+    ) -> list[dict[str, Any]]:
         if cutoff is None:
             facts: list[dict[str, Any]] = []
             for offset_ms in self.as_of_offsets_ms:
@@ -270,7 +271,10 @@ class _SymbolRolling:
                 "price": row.price,
                 "notional": row.notional_usd,
                 "notional_usd": row.notional_usd,
-                **{column: value for column, value in zip(self.tie_break, row.tie_break)},
+                **{
+                    column: value
+                    for column, value in zip(self.tie_break, row.tie_break)
+                },
             }
             for offset_ms in self.as_of_offsets_ms:
                 target_ms = decision_time_ms - int(offset_ms)
@@ -285,7 +289,9 @@ class _SymbolRolling:
                     measurement = row_dict.get(spec.measurement_field)
                     if measurement is None:
                         continue
-                    trailing_sums[key] = trailing_sums.get(key, 0.0) + float(measurement)
+                    trailing_sums[key] = trailing_sums.get(key, 0.0) + float(
+                        measurement
+                    )
                     trailing_counts[key] = trailing_counts.get(key, 0) + 1
 
         facts: list[dict[str, Any]] = []
@@ -349,7 +355,9 @@ def _emit_plan(model: CausalGridExtractRequest) -> list[tuple[int, tuple[str, ..
             point.timestamp_ms,
             tuple(sorted(point.symbols, key=lambda symbol: symbol_order[symbol])),
         )
-        for point in sorted(model.sparse_emit_points, key=lambda point: point.timestamp_ms)
+        for point in sorted(
+            model.sparse_emit_points, key=lambda point: point.timestamp_ms
+        )
     ]
 
 
@@ -389,7 +397,9 @@ def _stream_positive_rows(
 
     lazy = pl.scan_parquet(str(path)).with_row_index(_SOURCE_ROW_OFFSET)
     try:
-        lazy = apply_json_scalar_projections_to_lazy(lazy, profile.json_scalar_projections)
+        lazy = apply_json_scalar_projections_to_lazy(
+            lazy, profile.json_scalar_projections
+        )
     except JsonScalarProjectionError as exc:
         raise StructuralCanonicalizeError(str(exc)) from exc
     invariant_cols = invariant_columns(profile.row_invariants)
@@ -417,11 +427,15 @@ def _stream_positive_rows(
         batch = (
             lazy.slice(offset, batch_size)
             .with_columns(
-                pl.col(trade_map.block_column).cast(pl.Int64, strict=False).alias("_block_int"),
+                pl.col(trade_map.block_column)
+                .cast(pl.Int64, strict=False)
+                .alias("_block_int"),
                 pl.col(trade_map.timestamp_column)
                 .cast(pl.Int64, strict=False)
                 .alias("_timestamp_ms"),
-                pl.col(identity_col).cast(pl.Int64, strict=False).alias("_identity_int"),
+                pl.col(identity_col)
+                .cast(pl.Int64, strict=False)
+                .alias("_identity_int"),
                 pl.col(_SOURCE_ROW_OFFSET).cast(pl.Int64).alias(_SOURCE_ROW_OFFSET),
                 pl.lit(input_index).cast(pl.Int64).alias(_SOURCE_INPUT_INDEX),
             )
@@ -444,7 +458,9 @@ def _stream_positive_rows(
         offset += batch_size
 
 
-def _row_dict_to_trade_event(row: dict[str, Any], model: CausalGridExtractRequest) -> _TradeEvent:
+def _row_dict_to_trade_event(
+    row: dict[str, Any], model: CausalGridExtractRequest
+) -> _TradeEvent:
     tie = row.get("tie_break")
     if tie is None:
         tie = _trade_tie_values(row, model)
@@ -501,7 +517,9 @@ def _collapse_bucket_identity_groups(
     parts = sorted(bucket_dir.glob("part_*.parquet"))
     if not parts:
         return []
-    lazy = pl.concat([pl.scan_parquet(str(path)) for path in parts], how="vertical_relaxed")
+    lazy = pl.concat(
+        [pl.scan_parquet(str(path)) for path in parts], how="vertical_relaxed"
+    )
     sort_keys = _collapse_sort_keys(model)
     sorted_runs = external_sort_lazy_frame(
         lazy,
@@ -523,7 +541,10 @@ def _collapse_bucket_identity_groups(
         collapsed_batch.append(best_row)
         best_row = None
         if len(collapsed_batch) >= _COLLAPSED_RUN_BATCH:
-            run_path = spill_dir / f"collapsed_b{bucket_index_value:05d}_{run_index:05d}.parquet"
+            run_path = (
+                spill_dir
+                / f"collapsed_b{bucket_index_value:05d}_{run_index:05d}.parquet"
+            )
             pl.DataFrame(collapsed_batch).write_parquet(run_path)
             collapsed_runs.append(run_path)
             collapsed_batch.clear()
@@ -558,7 +579,9 @@ def _collapse_bucket_identity_groups(
             best_row = row
     flush_collapsed()
     if collapsed_batch:
-        run_path = spill_dir / f"collapsed_b{bucket_index_value:05d}_{run_index:05d}.parquet"
+        run_path = (
+            spill_dir / f"collapsed_b{bucket_index_value:05d}_{run_index:05d}.parquet"
+        )
         pl.DataFrame(collapsed_batch).write_parquet(run_path)
         collapsed_runs.append(run_path)
     return collapsed_runs
@@ -743,9 +766,10 @@ def _materialize_sorted_witness_runs(
                     )
                     .collect()
                 )
-                invalid = pl.col("exchange_time_ms").is_null() | pl.col(
-                    "block_number"
-                ).is_null()
+                invalid = (
+                    pl.col("exchange_time_ms").is_null()
+                    | pl.col("block_number").is_null()
+                )
                 if suffix_ok is not None:
                     invalid = invalid | ~pl.col("_suffix_ok")
                 if int(batch.filter(invalid).height):
@@ -911,14 +935,18 @@ def execute_causal_grid_extract(
         causal = _CausalIndex.from_carry(
             missing,
             carry_in.causal_observations if carry_in is not None else (),
-            carry_block_first_ms=carry_in.causal_block_first_ms if carry_in is not None else (),
+            carry_block_first_ms=carry_in.causal_block_first_ms
+            if carry_in is not None
+            else (),
             carry_segment_frontiers=(
                 carry_in.causal_segment_frontiers if carry_in is not None else ()
             ),
         )
         lookback = _max_lookback_ms(model)
         if model.partition.overlap_ms < lookback:
-            raise ValueError("partition overlap_ms shorter than required replay lookback")
+            raise ValueError(
+                "partition overlap_ms shorter than required replay lookback"
+            )
         partition_emit_end_ms = model.partition.emit_end_ms
         scan_start = model.partition.emit_start_ms - lookback
         emit_plan = _emit_plan(model)

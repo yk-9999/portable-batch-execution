@@ -413,3 +413,75 @@ def test_private_wave_causal_grid_extract_dispatches_typed_request():
     assert result["schema_version"] == "pbe.replay.causal-grid-extract-result.v1"
     assert len(result["rows"]) == 1
 
+
+def test_private_wave_paired_fill_reduce_dispatches_typed_request():
+    trade_payload = _parquet_payload(
+        [
+            {
+                "identity": 1,
+                "identity_norm": "1",
+                "pair_role": "A",
+                "core_price": 1.0,
+                "core_size": 2.0,
+                "start_pos": 0.0,
+                "signed_qty": 2.0,
+            },
+            {
+                "identity": 1,
+                "identity_norm": "1",
+                "pair_role": "B",
+                "core_price": 1.0,
+                "core_size": 2.0,
+                "start_pos": 0.0,
+                "signed_qty": -2.0,
+            },
+        ]
+    )
+    request = {
+        "schema_version": "pbe.replay.paired-fill-reduce.v1",
+        "request_id": "worker-paired-fill",
+        "identity_mapping": {
+            "identity_source_column": "identity",
+            "identity_normalized_column": "identity_norm",
+        },
+        "pair_mapping": {
+            "pair_role_column": "pair_role",
+            "aggressor_role_value": "A",
+            "passive_role_value": "B",
+            "measurement_core_fields": ["core_price", "core_size"],
+            "start_position_column": "start_pos",
+            "signed_execution_column": "signed_qty",
+        },
+        "partition": {"terminal": True},
+        "max_output_rows": 10,
+        "max_exception_rows": 10,
+    }
+    request_payload = json.dumps(request).encode("utf-8")
+    refs = [
+        _ref("trades", trade_payload),
+        ArtifactRef(
+            object_id="request",
+            uri="pbe://private/request",
+            sha256="sha256:" + sha256(request_payload).hexdigest(),
+            size_bytes=len(request_payload),
+            media_type="application/json",
+        ),
+    ]
+    plane = _plane_for_replay(
+        operation="replay.paired_fill_reduce",
+        input_refs=refs,
+        operation_params={"schema_version": "pbe.replay.paired-fill-reduce-job.v1"},
+    )
+    plane._payloads["trades"] = trade_payload
+    plane._payloads["request"] = request_payload
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert attempts[0].status == "succeeded"
+    output_ref = attempts[0].output_refs[0]
+    result = json.loads(plane._payloads[output_ref.object_id].decode())
+    assert result["schema_version"] == "pbe.replay.paired-fill-reduce-result.v1"
+    assert result["summary"]["ledger_row_count"] == 1
+    assert result["summary"]["content_identity"].startswith("sha256:")
+    assert output_ref.sha256 == "sha256:" + sha256(
+        plane._payloads[output_ref.object_id]
+    ).hexdigest()
+

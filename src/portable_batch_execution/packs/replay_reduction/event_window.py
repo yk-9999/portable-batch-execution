@@ -25,7 +25,9 @@ from .row_invariants import invariant_columns, validate_row_invariants
 RESULT_SCHEMA_VERSION = "pbe.replay.event-window-extract-result.v2"
 
 
-def _validated(request: dict[str, Any] | EventWindowExtractRequest) -> EventWindowExtractRequest:
+def _validated(
+    request: dict[str, Any] | EventWindowExtractRequest,
+) -> EventWindowExtractRequest:
     if isinstance(request, EventWindowExtractRequest):
         return request
     return EventWindowExtractRequest.model_validate(request)
@@ -97,10 +99,9 @@ class _FactAccumulators:
                 lower = decision_ms - int(spec.trailing_width_ms)
                 if timestamp_ms > lower and timestamp_ms <= decision_ms:
                     key = spec.fact_id
-                    self.trailing_sums[key] = (
-                        self.trailing_sums.get(key, 0.0)
-                        + _measurement_value(row, spec.measurement_field)
-                    )
+                    self.trailing_sums[key] = self.trailing_sums.get(
+                        key, 0.0
+                    ) + _measurement_value(row, spec.measurement_field)
                     self.trailing_counts[key] = self.trailing_counts.get(key, 0) + 1
             for offset_ms in model.as_of_offsets_ms:
                 target_ms = decision_ms - int(offset_ms)
@@ -175,7 +176,9 @@ def _validate_positive_row(
     try:
         identity = int(identity_raw)
     except (TypeError, ValueError) as exc:
-        raise StructuralCanonicalizeError("identity is missing or not positive") from exc
+        raise StructuralCanonicalizeError(
+            "identity is missing or not positive"
+        ) from exc
     if identity <= 0:
         raise StructuralCanonicalizeError("identity is missing or not positive")
     normalized = row.get(normalized_col)
@@ -196,7 +199,9 @@ def _symbol_lazy_frame(
     lazy = pl.scan_parquet(str(path)).with_row_index(_SOURCE_ROW_OFFSET)
     profile = model.canonical_trade_profile
     try:
-        lazy = apply_json_scalar_projections_to_lazy(lazy, profile.json_scalar_projections)
+        lazy = apply_json_scalar_projections_to_lazy(
+            lazy, profile.json_scalar_projections
+        )
     except JsonScalarProjectionError as exc:
         raise StructuralCanonicalizeError(str(exc)) from exc
     invariant_cols = invariant_columns(profile.row_invariants)
@@ -217,14 +222,18 @@ def _symbol_lazy_frame(
         ),
     )
     sentinel = profile.sentinel
-    required_sentinel = tuple(sentinel.exact_match_fields) if sentinel is not None else ()
+    required_sentinel = (
+        tuple(sentinel.exact_match_fields) if sentinel is not None else ()
+    )
     if required_sentinel:
         _require_columns(lazy.collect_schema(), required_sentinel)
 
     identity_col = profile.identity_source_column
     lazy = lazy.filter(pl.col(model.symbol_column) == model.symbol).with_columns(
         pl.col(model.block_column).cast(pl.Int64, strict=False).alias("_block_int"),
-        pl.col(model.timestamp_column).cast(pl.Int64, strict=False).alias("_timestamp_ms"),
+        pl.col(model.timestamp_column)
+        .cast(pl.Int64, strict=False)
+        .alias("_timestamp_ms"),
         pl.col(identity_col).cast(pl.Int64, strict=False).alias("_identity_int"),
         pl.col(_SOURCE_ROW_OFFSET).cast(pl.Int64).alias(_SOURCE_ROW_OFFSET),
         pl.lit(input_index).cast(pl.Int64).alias(_SOURCE_INPUT_INDEX),
@@ -297,9 +306,13 @@ def _stream_canonical_rows(
                 if previous_identity is None or identity != previous_identity:
                     finalize_group()
                     previous_identity = identity
-                    group_core = {field_name: row[field_name] for field_name in core_fields}
+                    group_core = {
+                        field_name: row[field_name] for field_name in core_fields
+                    }
                 elif group_core is None:
-                    raise StructuralCanonicalizeError("measurement core fields disagree")
+                    raise StructuralCanonicalizeError(
+                        "measurement core fields disagree"
+                    )
                 else:
                     for field_name in core_fields:
                         if row[field_name] != group_core[field_name]:

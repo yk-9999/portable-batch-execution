@@ -318,9 +318,83 @@ class StructuralCanonicalizeMergeParams(Frozen):
     schema_version: Literal["pbe.replay.structural-canonicalize-merge.v1"]
 
 
+class NullableJsonScalarProjection(Frozen):
+    schema_version: Literal["pbe.replay.nullable-json-scalar-projection.v1"]
+    source_column: str = Field(min_length=1)
+    key_path: tuple[str, ...] = Field(min_length=1)
+    scalar_type: Literal["integer", "string", "float"]
+    output_column: str = Field(min_length=1)
+
+
+class AdministrativeRowHandling(Frozen):
+    schema_version: Literal["pbe.replay.administrative-row-handling.v1"]
+    predicate: SentinelPredicate
+
+
+class PairedFillIdentityMapping(Frozen):
+    identity_source_column: str = Field(min_length=1)
+    identity_normalized_column: str = Field(min_length=1)
+
+
+class PairedFillPairMapping(Frozen):
+    pair_role_column: str = Field(min_length=1)
+    aggressor_role_value: SentinelScalar
+    passive_role_value: SentinelScalar
+    measurement_core_fields: tuple[str, ...] = Field(min_length=1)
+    start_position_column: str = Field(min_length=1)
+    signed_execution_column: str = Field(min_length=1)
+
+
+class PairedFillCarryState(Frozen):
+    schema_version: Literal["pbe.replay.paired-fill-reduce-carry.v1"]
+    pending_row: dict[str, Any] | None = None
+    pending_identity: int | None = None
+
+
+class PairedFillPartitionSpec(Frozen):
+    terminal: bool = True
+    incoming_carry: PairedFillCarryState | None = None
+
+
+class PairedFillReduceJobParams(Frozen):
+    schema_version: Literal["pbe.replay.paired-fill-reduce-job.v1"]
+
+
+class PairedFillReduceRequest(Frozen):
+    schema_version: Literal["pbe.replay.paired-fill-reduce.v1"]
+    request_id: str
+    identity_mapping: PairedFillIdentityMapping
+    pair_mapping: PairedFillPairMapping
+    partition: PairedFillPartitionSpec = PairedFillPartitionSpec()
+    nullable_json_scalar_projections: tuple[NullableJsonScalarProjection, ...] = ()
+    row_invariants: tuple[RowInvariant, ...] = ()
+    administrative_row_handling: AdministrativeRowHandling | None = None
+    max_output_rows: int = Field(default=500_000, ge=1, le=10_000_000)
+    max_exception_rows: int = Field(default=10_000, ge=0, le=1_000_000)
+
+    @model_validator(mode="after")
+    def _validate_nullable_projections(self) -> PairedFillReduceRequest:
+        from .nullable_json_projection import (
+            validate_nullable_json_scalar_projection_bundle,
+        )
+
+        validate_nullable_json_scalar_projection_bundle(
+            self.nullable_json_scalar_projections
+        )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_row_invariants(self) -> PairedFillReduceRequest:
+        from .row_invariants import validate_row_invariant_bundle
+
+        validate_row_invariant_bundle(self.row_invariants)
+        return self
+
+
 PARAM_MODELS = {
     "replay.structural_canonicalize": StructuralCanonicalizeParams,
     "replay.event_window_extract": EventWindowExtractJobParams,
     "replay.causal_grid_extract": CausalGridExtractJobParams,
     "replay.structural_canonicalize_merge": StructuralCanonicalizeMergeParams,
+    "replay.paired_fill_reduce": PairedFillReduceJobParams,
 }

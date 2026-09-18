@@ -13,6 +13,7 @@ from .canonicalize import (
 from .causal_grid import execute_causal_grid_extract
 from .event_window import execute_event_window_extract
 from .models import PARAM_MODELS
+from .paired_fill_reduce import execute_paired_fill_reduce
 
 
 class ReplayReductionPack:
@@ -49,6 +50,12 @@ class ReplayReductionPack:
             if paths is None:
                 raise TypeError("causal grid extract requires parquet_paths")
             return execute_causal_grid_extract(paths, request)
+        if operation == "replay.paired_fill_reduce":
+            paths = context.get("parquet_paths")
+            request = context["request"]
+            if paths is None:
+                raise TypeError("paired fill reduce requires parquet_paths")
+            return execute_paired_fill_reduce(paths, request)
         raise ValueError(f"unsupported replay operation: {operation}")
 
     def finalize(self, job, canonical_attempts, context):
@@ -72,5 +79,6 @@ class ReplayReductionPack:
             return execute_event_window_extract(paths or [], request or {})
         if operation == "replay.causal_grid_extract":
             return execute_causal_grid_extract(paths or [], request or {})
+        if operation == "replay.paired_fill_reduce":
+            return execute_paired_fill_reduce(paths or [], request or {})
         raise ValueError(f"unsupported replay operation: {operation}")
-

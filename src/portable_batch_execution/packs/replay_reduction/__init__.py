@@ -51,4 +51,3 @@ __all__ = [
     "state_summary",
     "states_equal",
 ]
-
