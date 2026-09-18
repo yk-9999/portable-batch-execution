@@ -12,6 +12,7 @@ from .models import (
     ExactTextRowInvariant,
     NumericRowInvariant,
     PositiveFiniteRowInvariant,
+    ProductColumnWithToleranceRowInvariant,
     ProductWithToleranceRowInvariant,
     RowInvariant,
     TimestampMsEquivalenceRowInvariant,
@@ -39,6 +40,8 @@ def invariant_columns(invariants: tuple[RowInvariant, ...]) -> tuple[str, ...]:
             columns.append(invariant.column)
         elif isinstance(invariant, ProductWithToleranceRowInvariant):
             columns.extend(invariant.factor_columns)
+        elif isinstance(invariant, ProductColumnWithToleranceRowInvariant):
+            columns.extend((*invariant.factor_columns, invariant.expected_column))
     return tuple(dict.fromkeys(columns))
 
 
@@ -49,7 +52,9 @@ def _timestamp_to_epoch_ms(value: Any, mode: Literal["integer_ms", "iso8601"]) -
         try:
             return int(value)
         except (TypeError, ValueError) as exc:
-            raise StructuralCanonicalizeError("row invariant timestamp invalid") from exc
+            raise StructuralCanonicalizeError(
+                "row invariant timestamp invalid"
+            ) from exc
     if not isinstance(value, str):
         raise StructuralCanonicalizeError("row invariant timestamp invalid")
     if not _ISO_EXPLICIT_OFFSET.search(value):
@@ -87,7 +92,39 @@ def _positive_finite(value: Any) -> bool:
     return math.isfinite(number) and number > 0.0
 
 
-def validate_row_invariants(row: dict[str, Any], invariants: tuple[RowInvariant, ...]) -> None:
+def _finite_numeric(value: Any) -> float:
+    if value is None:
+        raise StructuralCanonicalizeError("row invariant violated")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise StructuralCanonicalizeError("row invariant violated")
+    if not math.isfinite(number):
+        raise StructuralCanonicalizeError("row invariant violated")
+    return number
+
+
+def _product_of_columns(row: dict[str, Any], factor_columns: tuple[str, ...]) -> float:
+    product = 1.0
+    for column in factor_columns:
+        product *= _finite_numeric(row.get(column))
+    return product
+
+
+def _within_product_tolerance(
+    product: float,
+    expected: float,
+    *,
+    absolute_tolerance: float,
+    relative_tolerance: float,
+) -> bool:
+    tolerance = absolute_tolerance + (relative_tolerance * abs(expected))
+    return abs(product - expected) <= tolerance
+
+
+def validate_row_invariants(
+    row: dict[str, Any], invariants: tuple[RowInvariant, ...]
+) -> None:
     if not invariants:
         return
     validate_row_invariant_bundle(invariants)
@@ -97,10 +134,14 @@ def validate_row_invariants(row: dict[str, Any], invariants: tuple[RowInvariant,
             if actual is None or str(actual) != invariant.expected:
                 raise StructuralCanonicalizeError("row invariant violated")
         elif isinstance(invariant, NumericRowInvariant):
-            if not _numeric_equal(row.get(invariant.left_column), row.get(invariant.right_column)):
+            if not _numeric_equal(
+                row.get(invariant.left_column), row.get(invariant.right_column)
+            ):
                 raise StructuralCanonicalizeError("row invariant violated")
         elif isinstance(invariant, TimestampMsEquivalenceRowInvariant):
-            left_ms = _timestamp_to_epoch_ms(row.get(invariant.left_column), invariant.left_mode)
+            left_ms = _timestamp_to_epoch_ms(
+                row.get(invariant.left_column), invariant.left_mode
+            )
             right_ms = _timestamp_to_epoch_ms(
                 row.get(invariant.right_column), invariant.right_mode
             )
@@ -110,23 +151,24 @@ def validate_row_invariants(row: dict[str, Any], invariants: tuple[RowInvariant,
             if not _positive_finite(row.get(invariant.column)):
                 raise StructuralCanonicalizeError("row invariant violated")
         elif isinstance(invariant, ProductWithToleranceRowInvariant):
-            product = 1.0
-            for column in invariant.factor_columns:
-                raw = row.get(column)
-                if raw is None:
-                    raise StructuralCanonicalizeError("row invariant violated")
-                try:
-                    factor = float(raw)
-                except (TypeError, ValueError):
-                    raise StructuralCanonicalizeError("row invariant violated")
-                if not math.isfinite(factor):
-                    raise StructuralCanonicalizeError("row invariant violated")
-                product *= factor
+            product = _product_of_columns(row, invariant.factor_columns)
             expected = float(invariant.expected)
-            tolerance = invariant.absolute_tolerance + (
-                invariant.relative_tolerance * abs(expected)
-            )
-            if abs(product - expected) > tolerance:
+            if not _within_product_tolerance(
+                product,
+                expected,
+                absolute_tolerance=invariant.absolute_tolerance,
+                relative_tolerance=invariant.relative_tolerance,
+            ):
+                raise StructuralCanonicalizeError("row invariant violated")
+        elif isinstance(invariant, ProductColumnWithToleranceRowInvariant):
+            product = _product_of_columns(row, invariant.factor_columns)
+            expected = _finite_numeric(row.get(invariant.expected_column))
+            if not _within_product_tolerance(
+                product,
+                expected,
+                absolute_tolerance=invariant.absolute_tolerance,
+                relative_tolerance=invariant.relative_tolerance,
+            ):
                 raise StructuralCanonicalizeError("row invariant violated")
         else:
             raise StructuralCanonicalizeError("row invariant violated")
