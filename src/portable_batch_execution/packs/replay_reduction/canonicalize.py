@@ -86,12 +86,16 @@ def bucket_index(value: int, bucket_count: int) -> int:
 
 def _assert_bounded_materialization(count: int) -> None:
     if count > _MAX_IDENTITY_MATERIALIZATION:
-        raise StructuralCanonicalizeError("identity materialization exceeds bounded limit")
+        raise StructuralCanonicalizeError(
+            "identity materialization exceeds bounded limit"
+        )
 
 
 def _assert_bucket_payload_bounded(payload_size: int) -> None:
     if payload_size > _MAX_BUCKET_PAYLOAD_BYTES:
-        raise StructuralCanonicalizeError("bucket payload materialization exceeds bounded limit")
+        raise StructuralCanonicalizeError(
+            "bucket payload materialization exceeds bounded limit"
+        )
 
 
 def _validated(
@@ -135,7 +139,9 @@ def _positive_null_core_expr(core_fields: list[str]) -> pl.Expr:
     return pl.any_horizontal([pl.col(field).is_null() for field in core_fields])
 
 
-def _source_identity_malformed_expr(identity_col: str, identity_dtype: pl.DataType) -> pl.Expr:
+def _source_identity_malformed_expr(
+    identity_col: str, identity_dtype: pl.DataType
+) -> pl.Expr:
     if identity_dtype == pl.Boolean:
         return pl.lit(True)
     source = pl.col(identity_col)
@@ -267,7 +273,9 @@ def _stream_validate_and_spill_positive_rows(
     core_fields: list[str],
 ) -> tuple[int, tuple[int, ...], dict[str, Any], dict[str, Any]]:
     _init_empty_spill(bucket_count, spill_dir)
-    handles = [_bucket_file(spill_dir, index).open("ab") for index in range(bucket_count)]
+    handles = [
+        _bucket_file(spill_dir, index).open("ab") for index in range(bucket_count)
+    ]
     previous_identity: int | None = None
     group_core: dict[str, Any] | None = None
     group_count = 0
@@ -283,7 +291,9 @@ def _stream_validate_and_spill_positive_rows(
             for row in batch.iter_rows(named=True):
                 for field in core_fields:
                     if row[field] is None:
-                        raise StructuralCanonicalizeError("measurement core fields disagree")
+                        raise StructuralCanonicalizeError(
+                            "measurement core fields disagree"
+                        )
                 identity = int(row["_identity_int"])
                 if previous_identity is None or identity != previous_identity:
                     index = bucket_index(identity, bucket_count)
@@ -296,7 +306,9 @@ def _stream_validate_and_spill_positive_rows(
                     last_boundary = profile
                 else:
                     if group_core is None:
-                        raise StructuralCanonicalizeError("measurement core fields disagree")
+                        raise StructuralCanonicalizeError(
+                            "measurement core fields disagree"
+                        )
                     for field in core_fields:
                         if row[field] != group_core[field]:
                             raise StructuralCanonicalizeError(
@@ -407,7 +419,9 @@ def _single_input_state(
 
     lazy = pl.scan_parquet(str(path))
     try:
-        lazy = apply_json_scalar_projections_to_lazy(lazy, model.json_scalar_projections)
+        lazy = apply_json_scalar_projections_to_lazy(
+            lazy, model.json_scalar_projections
+        )
     except JsonScalarProjectionError as exc:
         raise StructuralCanonicalizeError(str(exc)) from exc
     required = (identity_col, normalized_col, *core_fields)
@@ -503,8 +517,13 @@ def _validate_state(state: CanonicalizeState) -> None:
             raise StructuralCanonicalizeError("bucket count metadata mismatch")
         total_identities += count
     if total_identities != state.positive_group_count:
-        raise StructuralCanonicalizeError("bucket identity total does not match group count")
-    if state.positive_row_count < state.positive_group_count or state.witness_row_count < 0:
+        raise StructuralCanonicalizeError(
+            "bucket identity total does not match group count"
+        )
+    if (
+        state.positive_row_count < state.positive_group_count
+        or state.witness_row_count < 0
+    ):
         raise StructuralCanonicalizeError("invalid positive or witness counts")
     if state.positive_group_count == 0:
         if state.positive_row_count != 0:
@@ -516,14 +535,24 @@ def _validate_state(state: CanonicalizeState) -> None:
         ("first", state.first_boundary),
         ("last", state.last_boundary),
     ):
-        if not isinstance(boundary, dict) or "identity" not in boundary or "core" not in boundary:
+        if (
+            not isinstance(boundary, dict)
+            or "identity" not in boundary
+            or "core" not in boundary
+        ):
             raise StructuralCanonicalizeError(f"{name} boundary is missing")
         identity = boundary["identity"]
         if not isinstance(identity, int) or isinstance(identity, bool) or identity <= 0:
-            raise StructuralCanonicalizeError(f"{name} boundary identity is not positive")
-        bucket_path = _bucket_file(state.spill_dir, bucket_index(identity, state.bucket_count))
+            raise StructuralCanonicalizeError(
+                f"{name} boundary identity is not positive"
+            )
+        bucket_path = _bucket_file(
+            state.spill_dir, bucket_index(identity, state.bucket_count)
+        )
         if not _bucket_contains_identity(bucket_path, state.bucket_count, identity):
-            raise StructuralCanonicalizeError(f"{name} boundary identity is not in its bucket")
+            raise StructuralCanonicalizeError(
+                f"{name} boundary identity is not in its bucket"
+            )
 
 
 def _merge_states(
@@ -572,8 +601,10 @@ def _merge_states(
 
     if shared_boundary:
         group_count = left.positive_group_count + right.positive_group_count - 1
-        row_count = left.positive_row_count + right.positive_row_count - (
-            1 if subtract_boundary_row else 0
+        row_count = (
+            left.positive_row_count
+            + right.positive_row_count
+            - (1 if subtract_boundary_row else 0)
         )
     else:
         group_count = left.positive_group_count + right.positive_group_count
@@ -605,7 +636,11 @@ def execute_structural_canonicalize(
     state: CanonicalizeState | None = None
     for path in paths:
         part = _single_input_state(path, model)
-        state = part if state is None else _merge_states(state, part, subtract_boundary_row=False)
+        state = (
+            part
+            if state is None
+            else _merge_states(state, part, subtract_boundary_row=False)
+        )
     assert state is not None
     return state
 
@@ -651,9 +686,10 @@ def states_equal(left: CanonicalizeState, right: CanonicalizeState) -> bool:
     if fields != other_fields:
         return False
     for index in range(left.bucket_count):
-        if _bucket_file(left.spill_dir, index).read_bytes() != _bucket_file(
-            right.spill_dir, index
-        ).read_bytes():
+        if (
+            _bucket_file(left.spill_dir, index).read_bytes()
+            != _bucket_file(right.spill_dir, index).read_bytes()
+        ):
             return False
     return True
 
@@ -715,11 +751,13 @@ def encode_state_buckets(state: CanonicalizeState) -> tuple[bytes, ...]:
     return tuple(iter_state_bucket_payloads(state))
 
 
-def decode_bucket(payload: bytes, bucket_count: int, expected_index: int) -> tuple[int, ...]:
+def decode_bucket(
+    payload: bytes, bucket_count: int, expected_index: int
+) -> tuple[int, ...]:
     if len(payload) < _BUCKET_HEADER.size:
         raise StructuralCanonicalizeError("bucket artifact is truncated")
-    magic, version, encoded_count, encoded_index, value_count = _BUCKET_HEADER.unpack_from(
-        payload, 0
+    magic, version, encoded_count, encoded_index, value_count = (
+        _BUCKET_HEADER.unpack_from(payload, 0)
     )
     if magic != BUCKET_MAGIC:
         raise StructuralCanonicalizeError("bucket artifact magic mismatch")
@@ -739,18 +777,22 @@ def decode_bucket(payload: bytes, bucket_count: int, expected_index: int) -> tup
     previous = 0
     for value in values:
         if value <= previous:
-            raise StructuralCanonicalizeError("bucket artifact values are not sorted unique")
+            raise StructuralCanonicalizeError(
+                "bucket artifact values are not sorted unique"
+            )
         previous = value
     _assert_bounded_materialization(len(values))
     return values
 
 
-def _write_bucket_payload(path: Path, payload: bytes, bucket_count: int, index: int) -> int:
+def _write_bucket_payload(
+    path: Path, payload: bytes, bucket_count: int, index: int
+) -> int:
     _assert_bucket_payload_bounded(len(payload))
     if len(payload) < _BUCKET_HEADER.size:
         raise StructuralCanonicalizeError("bucket artifact is truncated")
-    magic, version, encoded_count, encoded_index, value_count = _BUCKET_HEADER.unpack_from(
-        payload, 0
+    magic, version, encoded_count, encoded_index, value_count = (
+        _BUCKET_HEADER.unpack_from(payload, 0)
     )
     if magic != BUCKET_MAGIC:
         raise StructuralCanonicalizeError("bucket artifact magic mismatch")
@@ -765,7 +807,9 @@ def _write_bucket_payload(path: Path, payload: bytes, bucket_count: int, index: 
         for offset in range(_BUCKET_HEADER.size, len(payload), 8):
             value = _UINT64_PACK.unpack_from(payload, offset)[0]
             if value <= previous:
-                raise StructuralCanonicalizeError("bucket artifact values are not sorted unique")
+                raise StructuralCanonicalizeError(
+                    "bucket artifact values are not sorted unique"
+                )
             if bucket_index(value, bucket_count) != index:
                 raise StructuralCanonicalizeError("bucket value is not in its bucket")
             handle.write(_UINT64_PACK.pack(value & _UINT64_MASK))
@@ -802,7 +846,9 @@ def attach_bucket_refs(
     return enriched
 
 
-def _validated_summary_for_decode(summary: dict[str, Any]) -> tuple[int, tuple[int, ...]]:
+def _validated_summary_for_decode(
+    summary: dict[str, Any],
+) -> tuple[int, tuple[int, ...]]:
     if not isinstance(summary, dict):
         raise StructuralCanonicalizeError("canonicalization summary must be an object")
     if summary.get("schema_version") != STATE_SCHEMA_VERSION:
@@ -810,7 +856,9 @@ def _validated_summary_for_decode(summary: dict[str, Any]) -> tuple[int, tuple[i
     if summary.get("bucket_format") != BUCKET_FORMAT:
         raise StructuralCanonicalizeError("canonicalization bucket format mismatch")
     if summary.get("bucket_format_version") != BUCKET_FORMAT_VERSION:
-        raise StructuralCanonicalizeError("canonicalization bucket format version mismatch")
+        raise StructuralCanonicalizeError(
+            "canonicalization bucket format version mismatch"
+        )
     bucket_count = summary.get("bucket_count")
     if (
         not isinstance(bucket_count, int)
@@ -857,7 +905,9 @@ def decode_state_from_bucket_payloads(
             raise StructuralCanonicalizeError("canonicalization bucket count mismatch")
         written_counts.append(written)
     if next(bucket_payloads, None) is not None:
-        raise StructuralCanonicalizeError("canonicalization bucket artifacts are incomplete")
+        raise StructuralCanonicalizeError(
+            "canonicalization bucket artifacts are incomplete"
+        )
     state = CanonicalizeState(
         bucket_count=bucket_count,
         spill_dir=spill_dir,
@@ -877,5 +927,7 @@ def decode_state(
 ) -> CanonicalizeState:
     """Test helper: decode from a fully materialized bucket payload tuple."""
     if len(bucket_payloads) != int(summary.get("bucket_count", -1)):
-        raise StructuralCanonicalizeError("canonicalization bucket artifacts are incomplete")
+        raise StructuralCanonicalizeError(
+            "canonicalization bucket artifacts are incomplete"
+        )
     return decode_state_from_bucket_payloads(summary, iter(bucket_payloads))

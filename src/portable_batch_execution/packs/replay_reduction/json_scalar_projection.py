@@ -161,7 +161,9 @@ def project_json_scalar_batch(
     new_columns: dict[str, list[Any]] = {
         projection.output_column: [] for projection in projections
     }
-    unique_sources = list(dict.fromkeys(projection.source_column for projection in projections))
+    unique_sources = list(
+        dict.fromkeys(projection.source_column for projection in projections)
+    )
     for row in batch.select(unique_sources).iter_rows():
         source_by_column = dict(zip(unique_sources, row, strict=True))
         for projection in projections:

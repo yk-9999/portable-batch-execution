@@ -199,6 +199,57 @@ def test_bucket_payload_bound_enforced(tmp_path, monkeypatch):
             pass
 
 
+def test_structural_canonicalize_bucket_count_1024_publish_read_merge(tmp_path):
+    from hashlib import sha256
+
+    from portable_batch_execution.contracts import ArtifactRef
+    from portable_batch_execution.worker import execute_wave as ew
+
+    params = {**_PARAMS, "bucket_count": 1024}
+    rows = [
+        {"identity": i, "identity_norm": str(i), "price": float(i)} for i in range(1, 51)
+    ]
+    path = tmp_path / "part.parquet"
+    pl.DataFrame(rows).write_parquet(path)
+    state = canonicalize.execute_structural_canonicalize([path], params)
+    assert state.bucket_count == 1024
+
+    payloads: dict[str, bytes] = {}
+
+    class Plane:
+        def write(self, data, media_type):
+            object_id = f"obj-{len(payloads)}"
+            payloads[object_id] = data
+            return ArtifactRef(
+                object_id=object_id,
+                uri=f"pbe://private/{object_id}",
+                sha256="sha256:" + sha256(data).hexdigest(),
+                size_bytes=len(data),
+                media_type=media_type,
+            )
+
+        def read(self, ref):
+            return payloads[ref.object_id]
+
+    plane = Plane()
+    summary_bytes, refs = ew._write_canonicalize_state(plane, state)
+    assert len(refs) == 1 + 1024
+    summary = json.loads(summary_bytes.decode())
+    assert summary["bucket_count"] == 1024
+    decoded = ew._read_canonicalize_state(plane, refs[0])
+    assert decoded.positive_group_count == state.positive_group_count
+    assert decoded.bucket_count == 1024
+
+    right_path = tmp_path / "right.parquet"
+    pl.DataFrame([{"identity": 1000, "identity_norm": "1000", "price": 1.0}]).write_parquet(
+        right_path
+    )
+    right = canonicalize.execute_structural_canonicalize([right_path], params)
+    merged = canonicalize.merge_structural_canonicalize_states(state, right)
+    assert merged.bucket_count == 1024
+    assert merged.positive_group_count == state.positive_group_count + 1
+
+
 def test_read_canonicalize_state_consumes_one_bucket_payload_at_a_time(tmp_path, monkeypatch):
     from hashlib import sha256
 

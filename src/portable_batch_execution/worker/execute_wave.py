@@ -41,6 +41,9 @@ from portable_batch_execution.packs.replay_reduction.canonicalize import (
 from portable_batch_execution.packs.replay_reduction.models import (
     BUCKET_COUNT_MAX,
 )
+from portable_batch_execution.packs.replay_reduction.paired_fill_reduce import (
+    publish_paired_fill_reduce_artifacts,
+)
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})
@@ -82,6 +85,7 @@ _PRIVATE_REPLAY_BATCH_OPS = frozenset(
         "replay.structural_canonicalize_merge",
         "replay.event_window_extract",
         "replay.causal_grid_extract",
+        "replay.paired_fill_reduce",
     }
 )
 _MAX_REPLAY_PARQUET_INPUTS = 64
@@ -129,9 +133,7 @@ def _private_attempt_id(
     execution_fingerprint: str,
     current_attempt_count: int,
 ) -> str:
-    generation = _private_generation_discriminator(
-        input_digest, execution_fingerprint
-    )
+    generation = _private_generation_discriminator(input_digest, execution_fingerprint)
     ordinal = current_attempt_count + 1
     return f"{wave_id}-{shard_id}-{generation}-{ordinal}"
 
@@ -205,9 +207,7 @@ def _materialize_verified_parquet_inputs(
     return paths
 
 
-def _materialize_verified_artifact(
-    plane, ref: ArtifactRef, destination: Path
-) -> None:
+def _materialize_verified_artifact(plane, ref: ArtifactRef, destination: Path) -> None:
     stream = _open_artifact_content_stream(plane, ref)
     expected_size = stream.size_bytes
     digest = sha256()
@@ -246,9 +246,7 @@ def _parquet_row_count(path: Path) -> int:
     return int(pl.scan_parquet(str(path)).select(pl.len()).collect().item())
 
 
-def _write_canonicalize_state(
-    plane, state
-) -> tuple[bytes, tuple[ArtifactRef, ...]]:
+def _write_canonicalize_state(plane, state) -> tuple[bytes, tuple[ArtifactRef, ...]]:
     """Publish one summary JSON plus bucket artifacts in deterministic bucket order."""
     bucket_refs: list[ArtifactRef] = []
     for payload in iter_state_bucket_payloads(state):
@@ -284,24 +282,26 @@ def _read_canonicalize_state(plane, summary_ref: ArtifactRef):
         raise _ShardStageFailure("input_artifact_invalid") from None
     if any(ref.media_type != BUCKET_MEDIA_TYPE for ref in bucket_refs):
         raise _ShardStageFailure("input_artifact_invalid")
+
     def _iter_verified_bucket_payloads():
         for ref in bucket_refs:
             yield _read_verified_artifact_bytes(plane, ref)
 
     try:
-        return decode_state_from_bucket_payloads(summary, _iter_verified_bucket_payloads())
+        return decode_state_from_bucket_payloads(
+            summary, _iter_verified_bucket_payloads()
+        )
     except StructuralCanonicalizeError:
         raise _ShardStageFailure("input_artifact_invalid") from None
 
 
-def _private_tabular_single_input_is_parquet(
-    job, input_ref: ArtifactRef
-) -> bool:
+def _private_tabular_single_input_is_parquet(job, input_ref: ArtifactRef) -> bool:
     return (
         job.pack == "tabular-batch"
         and job.operation in _PRIVATE_TABULAR_SINGLE_INPUT_OPS
         and input_ref.media_type in _PRIVATE_TABULAR_PARQUET_MEDIA_TYPES
     )
+
 
 def _execution_failure_code(exc: BaseException, *, stage: str) -> str:
     if stage == "input_read":
@@ -424,38 +424,56 @@ def execute_private_wave(
         wave = WaveSpec.model_validate(payload["wave"])
         shards = tuple(ShardSpec.model_validate(item) for item in payload["shards"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("private data plane returned invalid closed wave contracts") from exc
-    if job.logical_run_id != run_id or wave.logical_run_id != run_id or wave.wave_id != wave_id:
+        raise ValueError(
+            "private data plane returned invalid closed wave contracts"
+        ) from exc
+    if (
+        job.logical_run_id != run_id
+        or wave.logical_run_id != run_id
+        or wave.wave_id != wave_id
+    ):
         raise ValueError("private data plane resolved a different run or wave")
-    if tuple(shard.shard_id for shard in shards) != wave.shard_ids or any(shard.logical_run_id != run_id for shard in shards):
+    if tuple(shard.shard_id for shard in shards) != wave.shard_ids or any(
+        shard.logical_run_id != run_id for shard in shards
+    ):
         raise ValueError("private data plane returned mismatched shards")
     if job.pack == "tabular-batch":
         if job.operation in _PRIVATE_TABULAR_UNAVAILABLE_MULTI_INPUT_OPS:
-            raise ValueError("private wave operation requires a typed multi-input contract")
+            raise ValueError(
+                "private wave operation requires a typed multi-input contract"
+            )
         if (
             job.operation not in _PRIVATE_TABULAR_SINGLE_INPUT_OPS
             and job.operation not in _PRIVATE_TABULAR_TWO_TABLE_OPS
         ):
-            raise ValueError("private wave operation is not available on the public runner")
+            raise ValueError(
+                "private wave operation is not available on the public runner"
+            )
         private_pack = "tabular-batch"
     elif job.pack == "ml-batch":
         if (
             job.operation not in _PRIVATE_ML_SINGLE_INPUT_OPS
             and job.operation not in _PRIVATE_ML_FIVE_INPUT_OPS
         ):
-            raise ValueError("private wave operation is not available on the public runner")
+            raise ValueError(
+                "private wave operation is not available on the public runner"
+            )
         if job.operation in _PRIVATE_ML_FIVE_INPUT_OPS and job.operation_params:
             raise ValueError("closed operation parameters")
         private_pack = "ml-batch"
     elif job.pack == "media-batch":
         if job.operation not in _PRIVATE_MEDIA_SINGLE_INPUT_OPS:
-            raise ValueError("private wave operation is not available on the public runner")
+            raise ValueError(
+                "private wave operation is not available on the public runner"
+            )
         if job.operation_params:
             raise ValueError("closed operation parameters")
         private_pack = "media-batch"
     elif job.pack == "replay-batch":
         if job.operation not in _PRIVATE_REPLAY_BATCH_OPS:
-            raise ValueError("private wave operation is not available on the public runner")
+            raise ValueError(
+                "private wave operation is not available on the public runner"
+            )
         private_pack = "replay-batch"
     else:
         raise ValueError("private wave operation is not available on the public runner")
@@ -686,6 +704,49 @@ def execute_private_wave(
                                 _execution_failure_code(exc, stage="pack")
                             ) from None
                         output_rows = len(result_payload["rows"])
+                elif job.operation == "replay.paired_fill_reduce":
+                    if len(shard.input_refs) < 2:
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    parquet_refs = shard.input_refs[:-1]
+                    request_ref = shard.input_refs[-1]
+                    if not all(_artifact_ref_is_parquet(ref) for ref in parquet_refs):
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    request_payload = _read_verified_artifact_bytes(plane, request_ref)
+                    try:
+                        parsed_request = json.loads(request_payload.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError) as exc:
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="input_parse")
+                        ) from None
+                    with tempfile.TemporaryDirectory() as temporary:
+                        paths = _materialize_verified_parquet_inputs(
+                            plane, tuple(parquet_refs), Path(temporary)
+                        )
+                        input_rows = sum(_parquet_row_count(path) for path in paths)
+                        try:
+                            result_payload = replay_pack.execute(
+                                job,
+                                shard,
+                                job.operation_params,
+                                {
+                                    "parquet_paths": paths,
+                                    "request": parsed_request,
+                                    "operation": job.operation,
+                                },
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            raise _ShardStageFailure(
+                                _execution_failure_code(exc, stage="pack")
+                            ) from None
+                        output_rows = int(result_payload["summary"]["ledger_row_count"])
+                        output, output_refs = publish_paired_fill_reduce_artifacts(
+                            plane,
+                            result_payload,
+                            artifact_ref_matches_bytes=_artifact_ref_matches_bytes,
+                            shard_stage_failure=_ShardStageFailure,
+                        )
+                        output_digest_value = sha256(output).hexdigest()
+                        publish_single_output = False
                 else:
                     raise _ShardStageFailure(
                         _execution_failure_code(ValueError(), stage="pack")
@@ -711,9 +772,9 @@ def execute_private_wave(
                             raise _ShardStageFailure(
                                 _execution_failure_code(exc, stage="pack")
                             ) from None
-                        output = json.dumps(
-                            result.to_dicts(), sort_keys=True
-                        ).encode("utf-8")
+                        output = json.dumps(result.to_dicts(), sort_keys=True).encode(
+                            "utf-8"
+                        )
                         output_rows = result.height
                     output_media_type = "application/json"
                 else:
@@ -756,11 +817,16 @@ def execute_private_wave(
                         else:
                             if not isinstance(parsed_input, list):
                                 raise _ShardStageFailure(
-                                    _execution_failure_code(TypeError(), stage="input_parse")
+                                    _execution_failure_code(
+                                        TypeError(), stage="input_parse"
+                                    )
                                 )
                             try:
                                 result = pack.execute(
-                                    job, shard, job.operation_params, {"data": parsed_input}
+                                    job,
+                                    shard,
+                                    job.operation_params,
+                                    {"data": parsed_input},
                                 )
                             except Exception as exc:  # noqa: BLE001
                                 raise _ShardStageFailure(
@@ -774,7 +840,9 @@ def execute_private_wave(
                     else:
                         if not isinstance(parsed_input, dict):
                             raise _ShardStageFailure(
-                                _execution_failure_code(TypeError(), stage="input_parse")
+                                _execution_failure_code(
+                                    TypeError(), stage="input_parse"
+                                )
                             )
                         try:
                             if job.operation == "ml.cosine_similarity_matrix":
@@ -801,7 +869,9 @@ def execute_private_wave(
                             raise _ShardStageFailure(
                                 _execution_failure_code(exc, stage="pack")
                             ) from None
-                        output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
+                        output = json.dumps(result_payload, sort_keys=True).encode(
+                            "utf-8"
+                        )
             if output_refs is None:
                 try:
                     single_ref = plane.write(output, output_media_type)
@@ -851,6 +921,7 @@ def execute_private_wave(
         raise PrivateWaveExecutionError(tuple(attempts))
     return tuple(attempts)
 
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Execute one approved wave.")
     parser.add_argument("--wave-id", required=True)
@@ -876,7 +947,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 1
-    print(json.dumps({"wave_id": args.wave_id, "attempt_ids": [item.attempt_id for item in attempts]}))
+    print(
+        json.dumps(
+            {
+                "wave_id": args.wave_id,
+                "attempt_ids": [item.attempt_id for item in attempts],
+            }
+        )
+    )
     return 0
 
 

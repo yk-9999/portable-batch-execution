@@ -54,7 +54,11 @@ def _plane_for_replay(*, operation, input_refs, operation_params):
                     "sharding": {},
                     "execution": {"max_parallel": 1, "max_attempts_per_shard": 4},
                     "security_profile": "offline",
-                    "provenance": {"producer": "test", "revision": "1", "created_at": now},
+                    "provenance": {
+                        "producer": "test",
+                        "revision": "1",
+                        "created_at": now,
+                    },
                     "operation_params": operation_params,
                 },
                 "wave": {
@@ -70,7 +74,9 @@ def _plane_for_replay(*, operation, input_refs, operation_params):
                         "shard_id": "opaque-shard",
                         "ordinal": 0,
                         "correctness": {},
-                        "input_refs": [ref.model_dump(mode="json") for ref in input_refs],
+                        "input_refs": [
+                            ref.model_dump(mode="json") for ref in input_refs
+                        ],
                         "input_digest": "current",
                         "execution_fingerprint": "fixed",
                     }
@@ -117,10 +123,26 @@ def _plane_for_replay(*, operation, input_refs, operation_params):
 
 def test_private_wave_materializes_multiple_parquet_inputs_for_canonicalize():
     payload_a = _parquet_payload(
-        [{"identity": 1, "identity_norm": "1", "price": 1.0, "symbol": "AAA", "block": 1}]
+        [
+            {
+                "identity": 1,
+                "identity_norm": "1",
+                "price": 1.0,
+                "symbol": "AAA",
+                "block": 1,
+            }
+        ]
     )
     payload_b = _parquet_payload(
-        [{"identity": 2, "identity_norm": "2", "price": 2.0, "symbol": "AAA", "block": 2}]
+        [
+            {
+                "identity": 2,
+                "identity_norm": "2",
+                "price": 2.0,
+                "symbol": "AAA",
+                "block": 2,
+            }
+        ]
     )
     refs = [_ref("a", payload_a), _ref("b", payload_b)]
     plane = _plane_for_replay(
@@ -160,7 +182,15 @@ def test_private_wave_materializes_multiple_parquet_inputs_for_canonicalize():
 
 def test_private_wave_merge_reads_and_republishes_multi_artifact_state():
     payload = _parquet_payload(
-        [{"identity": 1, "identity_norm": "1", "price": 5.0, "symbol": "AAA", "block": 1}]
+        [
+            {
+                "identity": 1,
+                "identity_norm": "1",
+                "price": 5.0,
+                "symbol": "AAA",
+                "block": 1,
+            }
+        ]
     )
     refs = [_ref("seed", payload)]
     params = {
@@ -180,8 +210,20 @@ def test_private_wave_merge_reads_and_republishes_multi_artifact_state():
 
     payload_right = _parquet_payload(
         [
-            {"identity": 1, "identity_norm": "1", "price": 5.0, "symbol": "AAA", "block": 1},
-            {"identity": 2, "identity_norm": "2", "price": 6.0, "symbol": "AAA", "block": 2},
+            {
+                "identity": 1,
+                "identity_norm": "1",
+                "price": 5.0,
+                "symbol": "AAA",
+                "block": 1,
+            },
+            {
+                "identity": 2,
+                "identity_norm": "2",
+                "price": 6.0,
+                "symbol": "AAA",
+                "block": 2,
+            },
         ]
     )
     right_plane = _plane_for_replay(
@@ -190,7 +232,9 @@ def test_private_wave_merge_reads_and_republishes_multi_artifact_state():
         operation_params=params,
     )
     right_plane._payloads["seed2"] = payload_right
-    right_attempts = execute_private_wave("opaque-run", "opaque-wave", plane=right_plane)
+    right_attempts = execute_private_wave(
+        "opaque-run", "opaque-wave", plane=right_plane
+    )
     right_refs = right_attempts[0].output_refs
 
     merge_plane = _plane_for_replay(
@@ -236,9 +280,7 @@ def test_private_wave_merge_fails_closed_on_non_contiguous_recurrence():
         plane._payloads[name] = payload
         return plane, execute_private_wave("opaque-run", "opaque-wave", plane=plane)[0]
 
-    left_plane, left = seed(
-        [{"identity": 1, "identity_norm": "1", "price": 1.0}], "l"
-    )
+    left_plane, left = seed([{"identity": 1, "identity_norm": "1", "price": 1.0}], "l")
     right_plane, right = seed(
         [
             {"identity": 2, "identity_norm": "2", "price": 2.0},
@@ -269,9 +311,7 @@ def test_private_wave_merge_fails_closed_on_non_contiguous_recurrence():
 
 
 def test_private_wave_merge_fails_closed_on_mismatched_bucket_state():
-    payload = _parquet_payload(
-        [{"identity": 1, "identity_norm": "1", "price": 1.0}]
-    )
+    payload = _parquet_payload([{"identity": 1, "identity_norm": "1", "price": 1.0}])
     plane = _plane_for_replay(
         operation="replay.structural_canonicalize",
         input_refs=[_ref("seed", payload)],
@@ -413,3 +453,150 @@ def test_private_wave_causal_grid_extract_dispatches_typed_request():
     assert result["schema_version"] == "pbe.replay.causal-grid-extract-result.v1"
     assert len(result["rows"]) == 1
 
+
+def test_private_wave_paired_fill_reduce_dispatches_typed_request():
+    trade_payload = _parquet_payload(
+        [
+            {
+                "identity": 1,
+                "identity_norm": "1",
+                "pair_role": "A",
+                "core_price": 1.0,
+                "core_size": 2.0,
+                "start_pos": 0.0,
+                "signed_qty": 2.0,
+            },
+            {
+                "identity": 1,
+                "identity_norm": "1",
+                "pair_role": "B",
+                "core_price": 1.0,
+                "core_size": 2.0,
+                "start_pos": 0.0,
+                "signed_qty": -2.0,
+            },
+        ]
+    )
+    request = {
+        "schema_version": "pbe.replay.paired-fill-reduce.v1",
+        "request_id": "worker-paired-fill",
+        "identity_mapping": {
+            "identity_source_column": "identity",
+            "identity_normalized_column": "identity_norm",
+        },
+        "pair_mapping": {
+            "pair_role_column": "pair_role",
+            "aggressor_role_value": "A",
+            "passive_role_value": "B",
+            "measurement_core_fields": ["core_price", "core_size"],
+            "start_position_column": "start_pos",
+            "signed_execution_column": "signed_qty",
+        },
+        "partition": {"terminal": True},
+        "max_output_rows": 10,
+        "max_exception_rows": 10,
+    }
+    request_payload = json.dumps(request).encode("utf-8")
+    refs = [
+        _ref("trades", trade_payload),
+        ArtifactRef(
+            object_id="request",
+            uri="pbe://private/request",
+            sha256="sha256:" + sha256(request_payload).hexdigest(),
+            size_bytes=len(request_payload),
+            media_type="application/json",
+        ),
+    ]
+    plane = _plane_for_replay(
+        operation="replay.paired_fill_reduce",
+        input_refs=refs,
+        operation_params={"schema_version": "pbe.replay.paired-fill-reduce-job.v1"},
+    )
+    plane._payloads["trades"] = trade_payload
+    plane._payloads["request"] = request_payload
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert attempts[0].status == "succeeded"
+    assert len(attempts[0].output_refs) == 2
+    metadata_ref, ledger_ref = attempts[0].output_refs
+    metadata = json.loads(plane._payloads[metadata_ref.object_id].decode())
+    assert metadata["schema_version"] == "pbe.replay.paired-fill-reduce-metadata.v1"
+    assert metadata["summary"]["ledger_row_count"] == 1
+    assert metadata["summary"]["content_identity"].startswith("sha256:")
+    assert metadata["ledger_parquet_ref"]["object_id"] == ledger_ref.object_id
+    assert metadata["ledger_parquet_identity"] == ledger_ref.sha256
+    assert ledger_ref.media_type == "application/vnd.apache.parquet"
+    ledger_bytes = plane._payloads[ledger_ref.object_id]
+    assert ledger_ref.sha256 == "sha256:" + sha256(ledger_bytes).hexdigest()
+    assert (
+        metadata_ref.sha256
+        == "sha256:" + sha256(plane._payloads[metadata_ref.object_id]).hexdigest()
+    )
+
+
+def test_private_wave_paired_fill_reduce_zero_rows_publishes_metadata_only():
+    admin_payload = _parquet_payload(
+        [
+            {
+                "identity": 0,
+                "identity_norm": None,
+                "pair_role": "A",
+                "core_price": 1.0,
+                "core_size": 1.0,
+                "start_pos": 0.0,
+                "signed_qty": 0.0,
+            }
+        ]
+    )
+    request = {
+        "schema_version": "pbe.replay.paired-fill-reduce.v1",
+        "request_id": "worker-paired-fill-empty",
+        "identity_mapping": {
+            "identity_source_column": "identity",
+            "identity_normalized_column": "identity_norm",
+        },
+        "pair_mapping": {
+            "pair_role_column": "pair_role",
+            "aggressor_role_value": "A",
+            "passive_role_value": "B",
+            "measurement_core_fields": ["core_price", "core_size"],
+            "start_position_column": "start_pos",
+            "signed_execution_column": "signed_qty",
+        },
+        "administrative_row_handling": {
+            "schema_version": "pbe.replay.administrative-row-handling.v1",
+            "predicate": {
+                "identity_equals": 0,
+                "exact_match_fields": {"identity_norm": None},
+            },
+        },
+        "partition": {"terminal": True},
+        "max_output_rows": 10,
+        "max_exception_rows": 10,
+    }
+    request_payload = json.dumps(request).encode("utf-8")
+    refs = [
+        _ref("admin", admin_payload),
+        ArtifactRef(
+            object_id="request",
+            uri="pbe://private/request",
+            sha256="sha256:" + sha256(request_payload).hexdigest(),
+            size_bytes=len(request_payload),
+            media_type="application/json",
+        ),
+    ]
+    plane = _plane_for_replay(
+        operation="replay.paired_fill_reduce",
+        input_refs=refs,
+        operation_params={"schema_version": "pbe.replay.paired-fill-reduce-job.v1"},
+    )
+    plane._payloads["admin"] = admin_payload
+    plane._payloads["request"] = request_payload
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert attempts[0].status == "succeeded"
+    assert len(attempts[0].output_refs) == 1
+    metadata_ref = attempts[0].output_refs[0]
+    metadata = json.loads(plane._payloads[metadata_ref.object_id].decode())
+    assert metadata["summary"]["ledger_row_count"] == 0
+    assert metadata["summary"]["administrative_row_count"] == 1
+    assert metadata["ledger_parquet_ref"] is None
+    assert metadata["ledger_parquet_identity"] is None
