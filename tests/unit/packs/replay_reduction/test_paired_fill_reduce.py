@@ -405,19 +405,19 @@ def test_identity_namespace_separates_same_numeric_id(tmp_path):
     }
 
 
-def test_side_size_signed_execution_flip(tmp_path):
+def test_signed_execution_mapping_flip(tmp_path):
     pair_mapping = {
         "pair_role_column": "pair_role",
         "aggressor_role_value": _ROLE_A,
         "passive_role_value": _ROLE_B,
         "measurement_core_fields": ["core_price", "core_size"],
         "start_position_column": "start_pos",
-        "side_size_signed_execution": {
-            "schema_version": "pbe.replay.side-size-signed-execution.v1",
+        "signed_execution_mapping": {
+            "schema_version": "pbe.replay.signed-execution-mapping.v1",
+            "quantity_column": "trade_qty",
             "side_column": "side",
-            "size_column": "trade_size",
-            "buy_side_value": "BUY",
-            "sell_side_value": "SELL",
+            "positive_side_value": "BUY",
+            "negative_side_value": "SELL",
         },
     }
     request = _request(pair_mapping=pair_mapping)
@@ -425,7 +425,7 @@ def test_side_size_signed_execution_flip(tmp_path):
         {
             **_row(identity=12, identity_norm="12", start_pos=10.0),
             "side": "SELL",
-            "trade_size": 15.0,
+            "trade_qty": 15.0,
         },
         {
             **_row(
@@ -435,7 +435,7 @@ def test_side_size_signed_execution_flip(tmp_path):
                 start_pos=-5.0,
             ),
             "side": "BUY",
-            "trade_size": 5.0,
+            "trade_qty": 5.0,
         },
     ]
     result = execute_paired_fill_reduce(
@@ -447,31 +447,74 @@ def test_side_size_signed_execution_flip(tmp_path):
     assert aggressor["opening_quantity"] == 5.0
 
 
-def test_participant_field_passthrough_including_null(tmp_path):
+def test_signed_execution_mapping_rejects_non_positive_quantity(tmp_path):
     pair_mapping = {
         "pair_role_column": "pair_role",
         "aggressor_role_value": _ROLE_A,
         "passive_role_value": _ROLE_B,
         "measurement_core_fields": ["core_price", "core_size"],
         "start_position_column": "start_pos",
-        "signed_execution_column": "signed_qty",
-        "participant_field_bindings": [
-            {"output_field": "audit_ref", "source_column": "audit_ref"},
-        ],
+        "signed_execution_mapping": {
+            "schema_version": "pbe.replay.signed-execution-mapping.v1",
+            "quantity_column": "trade_qty",
+            "side_column": "side",
+            "positive_side_value": "BUY",
+            "negative_side_value": "SELL",
+        },
+    }
+    with pytest.raises(StructuralCanonicalizeError):
+        execute_paired_fill_reduce(
+            [
+                _write(
+                    tmp_path / "p.parquet",
+                    [
+                        {
+                            **_row(identity=12, identity_norm="12"),
+                            "side": "BUY",
+                            "trade_qty": 0.0,
+                        }
+                    ],
+                )
+            ],
+            _request(pair_mapping=pair_mapping),
+        )
+
+
+def test_participant_passthrough_columns_nested_including_null(tmp_path):
+    pair_mapping = {
+        "pair_role_column": "pair_role",
+        "aggressor_role_value": _ROLE_A,
+        "passive_role_value": _ROLE_B,
+        "measurement_core_fields": ["core_price", "core_size"],
+        "start_position_column": "start_pos",
+        "signed_execution_mapping": {
+            "schema_version": "pbe.replay.signed-execution-mapping.v1",
+            "quantity_column": "trade_qty",
+            "side_column": "side",
+            "positive_side_value": "BUY",
+            "negative_side_value": "SELL",
+        },
+        "participant_passthrough_columns": ["audit_ref"],
     }
     result = execute_paired_fill_reduce(
         [
             _write(
                 tmp_path / "p.parquet",
                 [
-                    {**_row(identity=13, identity_norm="13"), "audit_ref": "x1"},
+                    {
+                        **_row(identity=13, identity_norm="13"),
+                        "side": "BUY",
+                        "trade_qty": 2.0,
+                        "audit_ref": "x1",
+                    },
                     {
                         **_row(
                             identity=13,
                             identity_norm="13",
                             pair_role=_ROLE_B,
-                            signed_qty=-2.0,
                         ),
+                        "side": "SELL",
+                        "trade_qty": 2.0,
                         "audit_ref": None,
                     },
                 ],
@@ -480,7 +523,7 @@ def test_participant_field_passthrough_including_null(tmp_path):
         _request(pair_mapping=pair_mapping),
     )
     parts = result["ledger_rows"][0]["participants"]
-    refs = {item["role"]: item["audit_ref"] for item in parts}
+    refs = {item["role"]: item["passthrough"]["audit_ref"] for item in parts}
     assert refs["aggressor"] == "x1"
     assert refs["passive"] is None
 
@@ -527,6 +570,14 @@ def test_complete_pair_lineage_and_same_participant_flag(tmp_path):
     assert row["first_source_row_offset"] == 0
     assert row["last_source_input_index"] == 1
     assert row["last_source_row_offset"] == 0
+    assert row["source_cursor_first"] == {
+        "source_input_index": 0,
+        "source_row_offset": 0,
+    }
+    assert row["source_cursor_last"] == {
+        "source_input_index": 1,
+        "source_row_offset": 0,
+    }
     assert row["participants_same_identity"] is True
 
 
@@ -588,13 +639,115 @@ def test_signed_execution_mapping_requires_exactly_one_mode():
                     "measurement_core_fields": ["core_price", "core_size"],
                     "start_position_column": "start_pos",
                     "signed_execution_column": "signed_qty",
-                    "side_size_signed_execution": {
-                        "schema_version": "pbe.replay.side-size-signed-execution.v1",
+                    "signed_execution_mapping": {
+                        "schema_version": "pbe.replay.signed-execution-mapping.v1",
+                        "quantity_column": "trade_qty",
                         "side_column": "side",
-                        "size_column": "trade_size",
-                        "buy_side_value": "BUY",
-                        "sell_side_value": "SELL",
+                        "positive_side_value": "BUY",
+                        "negative_side_value": "SELL",
                     },
                 }
             )
         )
+
+
+def test_generic_executable_contract_integration_fixture(tmp_path):
+    """Single fixture covering namespace, boolean roles, mapping, passthrough, cursors."""
+    pair_mapping = {
+        "pair_role_column": "is_aggressor",
+        "aggressor_role_value": True,
+        "passive_role_value": False,
+        "measurement_core_fields": ["core_price", "core_size"],
+        "start_position_column": "start_pos",
+        "signed_execution_mapping": {
+            "schema_version": "pbe.replay.signed-execution-mapping.v1",
+            "quantity_column": "trade_qty",
+            "side_column": "side",
+            "positive_side_value": 1,
+            "negative_side_value": -1,
+        },
+        "participant_passthrough_columns": ["audit_ref", "note"],
+        "participant_identity_column": "participant_key",
+    }
+    request = _request(
+        identity_mapping={
+            "identity_source_column": "identity",
+            "identity_normalized_column": "identity_norm",
+            "namespace_columns": ["book_id"],
+        },
+        pair_mapping=pair_mapping,
+        nullable_json_scalar_projections=[
+            {
+                "schema_version": "pbe.replay.nullable-json-scalar-projection.v1",
+                "source_column": "raw_json",
+                "key_path": ["flags", "active"],
+                "scalar_type": "boolean",
+                "output_column": "proj_active",
+            }
+        ],
+    )
+    first = _write(
+        tmp_path / "a.parquet",
+        [
+            {
+                "identity": 99,
+                "identity_norm": "99",
+                "book_id": "ledger-a",
+                "is_aggressor": True,
+                "core_price": 50.0,
+                "core_size": 3.0,
+                "start_pos": 10.0,
+                "side": -1,
+                "trade_qty": 15.0,
+                "audit_ref": "ref-1",
+                "note": "open",
+                "participant_key": "actor-1",
+                "raw_json": json.dumps({"flags": {"active": True}}),
+            }
+        ],
+    )
+    second = _write(
+        tmp_path / "b.parquet",
+        [
+            {
+                "identity": 99,
+                "identity_norm": "99",
+                "book_id": "ledger-a",
+                "is_aggressor": False,
+                "core_price": 50.0,
+                "core_size": 3.0,
+                "start_pos": -5.0,
+                "side": 1,
+                "trade_qty": 5.0,
+                "audit_ref": None,
+                "note": "close",
+                "participant_key": "actor-1",
+                "raw_json": json.dumps({"flags": {"active": False}}),
+            }
+        ],
+    )
+    result = execute_paired_fill_reduce([first, second], request)
+    row = result["ledger_rows"][0]
+    assert row["classification"] == "complete_pair"
+    assert row["identity_namespace"] == {"book_id": "ledger-a"}
+    assert row["ledger_identity"] == 99
+    assert row["participants_same_identity"] is True
+    assert row["source_cursor_first"] == {
+        "source_input_index": 0,
+        "source_row_offset": 0,
+    }
+    assert row["source_cursor_last"] == {
+        "source_input_index": 1,
+        "source_row_offset": 0,
+    }
+    aggressor = _participant(row, "aggressor")
+    passive = _participant(row, "passive")
+    assert aggressor["source_input_index"] == 0
+    assert aggressor["source_row_offset"] == 0
+    assert passive["source_input_index"] == 1
+    assert passive["source_row_offset"] == 0
+    assert aggressor["signed_execution"] == -15.0
+    assert aggressor["closing_quantity"] == 10.0
+    assert aggressor["opening_quantity"] == 5.0
+    assert aggressor["passthrough"] == {"audit_ref": "ref-1", "note": "open"}
+    assert passive["passthrough"] == {"audit_ref": None, "note": "close"}

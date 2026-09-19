@@ -89,6 +89,25 @@ def _resolve_signed_execution(row: dict[str, Any], pair_mapping) -> float:
         if not math.isfinite(value):
             raise StructuralCanonicalizeError("signed execution invalid")
         return value
+    mapping = pair_mapping.signed_execution_mapping
+    if mapping is not None:
+        side = row.get(mapping.side_column)
+        if side is None:
+            raise StructuralCanonicalizeError("signed execution side missing")
+        raw_qty = row.get(mapping.quantity_column)
+        if raw_qty is None:
+            raise StructuralCanonicalizeError("signed execution quantity missing")
+        try:
+            quantity = float(raw_qty)
+        except (TypeError, ValueError):
+            raise StructuralCanonicalizeError("signed execution quantity invalid")
+        if not math.isfinite(quantity) or quantity <= 0.0:
+            raise StructuralCanonicalizeError("signed execution quantity invalid")
+        if side == mapping.positive_side_value:
+            return quantity
+        if side == mapping.negative_side_value:
+            return -quantity
+        raise StructuralCanonicalizeError("signed execution side invalid")
     spec = pair_mapping.side_size_signed_execution
     if spec is None:
         raise StructuralCanonicalizeError("signed execution mapping missing")
@@ -144,6 +163,15 @@ def _participant_record(
         "source_input_index": int(row[_SOURCE_INPUT_INDEX]),
         "source_row_offset": int(row[_SOURCE_ROW_OFFSET]),
     }
+    if pair_mapping.participant_passthrough_columns:
+        passthrough: dict[str, Any] = {}
+        for column in pair_mapping.participant_passthrough_columns:
+            if column not in row:
+                raise StructuralCanonicalizeError(
+                    "participant passthrough column missing"
+                )
+            passthrough[column] = row[column]
+        record["passthrough"] = passthrough
     for binding in pair_mapping.participant_field_bindings:
         record[binding.output_field] = row.get(binding.source_column)
     return record
@@ -164,14 +192,27 @@ def _cores_match(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> bool:
     return True
 
 
-def _source_lineage(rows: list[dict[str, Any]]) -> dict[str, int]:
-    first = rows[0]
-    last = rows[-1]
+def _source_cursor(row: dict[str, Any]) -> dict[str, int]:
+    return {
+        "source_input_index": int(row[_SOURCE_INPUT_INDEX]),
+        "source_row_offset": int(row[_SOURCE_ROW_OFFSET]),
+    }
+
+
+def _source_lineage(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    ordered = sorted(
+        rows,
+        key=lambda row: (int(row[_SOURCE_INPUT_INDEX]), int(row[_SOURCE_ROW_OFFSET])),
+    )
+    first = ordered[0]
+    last = ordered[-1]
     return {
         "first_source_input_index": int(first[_SOURCE_INPUT_INDEX]),
         "first_source_row_offset": int(first[_SOURCE_ROW_OFFSET]),
         "last_source_input_index": int(last[_SOURCE_INPUT_INDEX]),
         "last_source_row_offset": int(last[_SOURCE_ROW_OFFSET]),
+        "source_cursor_first": _source_cursor(first),
+        "source_cursor_last": _source_cursor(last),
     }
 
 
@@ -416,10 +457,16 @@ def _required_columns(model: PairedFillReduceRequest) -> tuple[str, ...]:
     signed_columns: list[str] = []
     if pair.signed_execution_column is not None:
         signed_columns.append(pair.signed_execution_column)
+    if pair.signed_execution_mapping is not None:
+        spec = pair.signed_execution_mapping
+        signed_columns.extend((spec.quantity_column, spec.side_column))
     if pair.side_size_signed_execution is not None:
         spec = pair.side_size_signed_execution
         signed_columns.extend((spec.side_column, spec.size_column))
-    passthrough = [binding.source_column for binding in pair.participant_field_bindings]
+    passthrough = [
+        *pair.participant_passthrough_columns,
+        *(binding.source_column for binding in pair.participant_field_bindings),
+    ]
     participant_identity = (
         (pair.participant_identity_column,)
         if pair.participant_identity_column is not None

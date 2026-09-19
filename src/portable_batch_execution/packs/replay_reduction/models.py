@@ -378,6 +378,14 @@ class PairedFillIdentityMapping(Frozen):
     namespace_columns: tuple[str, ...] = ()
 
 
+class SignedExecutionMapping(Frozen):
+    schema_version: Literal["pbe.replay.signed-execution-mapping.v1"]
+    quantity_column: str = Field(min_length=1)
+    side_column: str = Field(min_length=1)
+    positive_side_value: SentinelScalar
+    negative_side_value: SentinelScalar
+
+
 class SideSizeSignedExecutionSpec(Frozen):
     schema_version: Literal["pbe.replay.side-size-signed-execution.v1"]
     side_column: str = Field(min_length=1)
@@ -398,16 +406,32 @@ class PairedFillPairMapping(Frozen):
     measurement_core_fields: tuple[str, ...] = Field(min_length=1)
     start_position_column: str = Field(min_length=1)
     signed_execution_column: str | None = None
+    signed_execution_mapping: SignedExecutionMapping | None = None
     side_size_signed_execution: SideSizeSignedExecutionSpec | None = None
+    participant_passthrough_columns: tuple[str, ...] = ()
     participant_field_bindings: tuple[ParticipantFieldBinding, ...] = ()
     participant_identity_column: str | None = None
 
     @model_validator(mode="after")
     def _signed_execution_mode(self) -> PairedFillPairMapping:
-        has_column = self.signed_execution_column is not None
-        has_side_size = self.side_size_signed_execution is not None
-        if has_column == has_side_size:
+        mode_count = sum(
+            1
+            for enabled in (
+                self.signed_execution_column is not None,
+                self.signed_execution_mapping is not None,
+                self.side_size_signed_execution is not None,
+            )
+            if enabled
+        )
+        if mode_count != 1:
             raise ValueError("exactly one signed execution mapping mode is required")
+        passthrough_columns: set[str] = set()
+        for column in self.participant_passthrough_columns:
+            if not column:
+                raise ValueError("participant passthrough column name is empty")
+            if column in passthrough_columns:
+                raise ValueError("duplicate participant passthrough column")
+            passthrough_columns.add(column)
         outputs: set[str] = set()
         for binding in self.participant_field_bindings:
             if binding.output_field in _PARTICIPANT_RESERVED_OUTPUT_FIELDS:
