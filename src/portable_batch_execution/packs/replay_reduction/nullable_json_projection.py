@@ -102,6 +102,10 @@ def _extract_nullable_scalar(
             number = float(current)
             return number if math.isfinite(number) else None
         return None
+    if projection.scalar_type == "boolean":
+        if isinstance(current, bool):
+            return current
+        return None
     if isinstance(current, str):
         return current
     return None
@@ -119,6 +123,7 @@ def project_nullable_json_scalar_batch(
             "integer": pl.Int64,
             "float": pl.Float64,
             "string": pl.Utf8,
+            "boolean": pl.Boolean,
         }
         extra = {
             projection.output_column: pl.Series(
@@ -147,6 +152,7 @@ def project_nullable_json_scalar_batch(
         "integer": pl.Int64,
         "float": pl.Float64,
         "string": pl.Utf8,
+        "boolean": pl.Boolean,
     }
     series = [
         pl.Series(
@@ -169,6 +175,7 @@ def _schema_with_nullable_projections(
         "integer": pl.Int64,
         "float": pl.Float64,
         "string": pl.Utf8,
+        "boolean": pl.Boolean,
     }
     for projection in projections:
         fields[projection.output_column] = dtypes[projection.scalar_type]

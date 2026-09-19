@@ -9,7 +9,10 @@ from typing import Any, Literal
 
 from .canonicalize import StructuralCanonicalizeError
 from .models import (
+    BooleanRowInvariant,
     ExactTextRowInvariant,
+    FiniteNumericRowInvariant,
+    NonEmptyTextRowInvariant,
     NumericRowInvariant,
     PositiveFiniteRowInvariant,
     ProductColumnWithToleranceRowInvariant,
@@ -42,7 +45,15 @@ def invariant_columns(invariants: tuple[RowInvariant, ...]) -> tuple[str, ...]:
             ),
         ):
             columns.extend((invariant.left_column, invariant.right_column))
-        elif isinstance(invariant, PositiveFiniteRowInvariant):
+        elif isinstance(
+            invariant,
+            (
+                PositiveFiniteRowInvariant,
+                NonEmptyTextRowInvariant,
+                BooleanRowInvariant,
+                FiniteNumericRowInvariant,
+            ),
+        ):
             columns.append(invariant.column)
         elif isinstance(invariant, ProductWithToleranceRowInvariant):
             columns.extend(invariant.factor_columns)
@@ -183,5 +194,15 @@ def validate_row_invariants(
                 raise StructuralCanonicalizeError("row invariant violated")
             if left != right:
                 raise StructuralCanonicalizeError("row invariant violated")
+        elif isinstance(invariant, NonEmptyTextRowInvariant):
+            value = row.get(invariant.column)
+            if not isinstance(value, str) or value == "":
+                raise StructuralCanonicalizeError("row invariant violated")
+        elif isinstance(invariant, BooleanRowInvariant):
+            value = row.get(invariant.column)
+            if not isinstance(value, bool):
+                raise StructuralCanonicalizeError("row invariant violated")
+        elif isinstance(invariant, FiniteNumericRowInvariant):
+            _finite_numeric(row.get(invariant.column))
         else:
             raise StructuralCanonicalizeError("row invariant violated")

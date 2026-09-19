@@ -350,3 +350,40 @@ def test_text_column_equivalence_backward_compatible_with_existing_invariants():
         },
         profile.row_invariants,
     )
+
+
+def test_non_empty_text_boolean_and_finite_numeric_invariants():
+    invariants = (
+        {
+            "schema_version": "pbe.replay.row-invariant.non-empty-text.v1",
+            "column": "label",
+        },
+        {
+            "schema_version": "pbe.replay.row-invariant.boolean.v1",
+            "column": "flag",
+        },
+        {
+            "schema_version": "pbe.replay.row-invariant.finite-numeric.v1",
+            "column": "amount",
+        },
+    )
+    profile = _profile_with_invariants(*invariants)
+    validate_row_invariants(
+        {"label": "ok", "flag": True, "amount": 1.5},
+        profile.row_invariants,
+    )
+    with pytest.raises(StructuralCanonicalizeError):
+        validate_row_invariants(
+            {"label": "", "flag": True, "amount": 1.5},
+            profile.row_invariants,
+        )
+    with pytest.raises(StructuralCanonicalizeError):
+        validate_row_invariants(
+            {"label": "ok", "flag": 1, "amount": 1.5},
+            profile.row_invariants,
+        )
+    with pytest.raises(StructuralCanonicalizeError):
+        validate_row_invariants(
+            {"label": "ok", "flag": True, "amount": float("nan")},
+            profile.row_invariants,
+        )

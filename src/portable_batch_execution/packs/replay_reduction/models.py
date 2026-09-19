@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -127,6 +128,21 @@ class TextColumnEquivalenceRowInvariant(Frozen):
     right_column: str = Field(min_length=1)
 
 
+class NonEmptyTextRowInvariant(Frozen):
+    schema_version: Literal["pbe.replay.row-invariant.non-empty-text.v1"]
+    column: str = Field(min_length=1)
+
+
+class BooleanRowInvariant(Frozen):
+    schema_version: Literal["pbe.replay.row-invariant.boolean.v1"]
+    column: str = Field(min_length=1)
+
+
+class FiniteNumericRowInvariant(Frozen):
+    schema_version: Literal["pbe.replay.row-invariant.finite-numeric.v1"]
+    column: str = Field(min_length=1)
+
+
 RowInvariant = Annotated[
     ExactTextRowInvariant
     | NumericRowInvariant
@@ -134,7 +150,10 @@ RowInvariant = Annotated[
     | PositiveFiniteRowInvariant
     | ProductWithToleranceRowInvariant
     | ProductColumnWithToleranceRowInvariant
-    | TextColumnEquivalenceRowInvariant,
+    | TextColumnEquivalenceRowInvariant
+    | NonEmptyTextRowInvariant
+    | BooleanRowInvariant
+    | FiniteNumericRowInvariant,
     Field(discriminator="schema_version"),
 ]
 
@@ -322,7 +341,7 @@ class NullableJsonScalarProjection(Frozen):
     schema_version: Literal["pbe.replay.nullable-json-scalar-projection.v1"]
     source_column: str = Field(min_length=1)
     key_path: tuple[str, ...] = Field(min_length=1)
-    scalar_type: Literal["integer", "string", "float"]
+    scalar_type: Literal["integer", "string", "float", "boolean"]
     output_column: str = Field(min_length=1)
 
 
@@ -331,9 +350,45 @@ class AdministrativeRowHandling(Frozen):
     predicate: SentinelPredicate
 
 
+PAIRED_FILL_MAX_INPUT_FILES = 64
+PAIRED_FILL_MAX_INPUT_BYTES = 1_610_612_736
+PAIRED_FILL_MAX_OUTPUT_ROWS = 12_000_000
+PAIRED_FILL_MAX_OUTPUT_BYTES = 1_073_741_824
+PAIRED_FILL_MAX_EXCEPTION_ROWS = 100_000
+PAIRED_FILL_MAX_CARRY_ROWS = 1
+PAIRED_FILL_MAX_PAIR_SIZE = 2
+_PARTICIPANT_FIELD_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_PARTICIPANT_RESERVED_OUTPUT_FIELDS = frozenset(
+    {
+        "role",
+        "start_position",
+        "signed_execution",
+        "opening_quantity",
+        "closing_quantity",
+        "post_position",
+        "source_input_index",
+        "source_row_offset",
+    }
+)
+
+
 class PairedFillIdentityMapping(Frozen):
     identity_source_column: str = Field(min_length=1)
     identity_normalized_column: str = Field(min_length=1)
+    namespace_columns: tuple[str, ...] = ()
+
+
+class SideSizeSignedExecutionSpec(Frozen):
+    schema_version: Literal["pbe.replay.side-size-signed-execution.v1"]
+    side_column: str = Field(min_length=1)
+    size_column: str = Field(min_length=1)
+    buy_side_value: SentinelScalar
+    sell_side_value: SentinelScalar
+
+
+class ParticipantFieldBinding(Frozen):
+    output_field: str = Field(min_length=1)
+    source_column: str = Field(min_length=1)
 
 
 class PairedFillPairMapping(Frozen):
@@ -342,13 +397,34 @@ class PairedFillPairMapping(Frozen):
     passive_role_value: SentinelScalar
     measurement_core_fields: tuple[str, ...] = Field(min_length=1)
     start_position_column: str = Field(min_length=1)
-    signed_execution_column: str = Field(min_length=1)
+    signed_execution_column: str | None = None
+    side_size_signed_execution: SideSizeSignedExecutionSpec | None = None
+    participant_field_bindings: tuple[ParticipantFieldBinding, ...] = ()
+    participant_identity_column: str | None = None
+
+    @model_validator(mode="after")
+    def _signed_execution_mode(self) -> PairedFillPairMapping:
+        has_column = self.signed_execution_column is not None
+        has_side_size = self.side_size_signed_execution is not None
+        if has_column == has_side_size:
+            raise ValueError("exactly one signed execution mapping mode is required")
+        outputs: set[str] = set()
+        for binding in self.participant_field_bindings:
+            if binding.output_field in _PARTICIPANT_RESERVED_OUTPUT_FIELDS:
+                raise ValueError("participant field output name is reserved")
+            if not _PARTICIPANT_FIELD_PATTERN.fullmatch(binding.output_field):
+                raise ValueError("participant field output name is unsafe")
+            if binding.output_field in outputs:
+                raise ValueError("duplicate participant field output name")
+            outputs.add(binding.output_field)
+        return self
 
 
 class PairedFillCarryState(Frozen):
     schema_version: Literal["pbe.replay.paired-fill-reduce-carry.v1"]
     pending_row: dict[str, Any] | None = None
     pending_identity: int | None = None
+    pending_group_key: tuple[Any, ...] | None = None
 
 
 class PairedFillPartitionSpec(Frozen):
@@ -369,8 +445,31 @@ class PairedFillReduceRequest(Frozen):
     nullable_json_scalar_projections: tuple[NullableJsonScalarProjection, ...] = ()
     row_invariants: tuple[RowInvariant, ...] = ()
     administrative_row_handling: AdministrativeRowHandling | None = None
-    max_output_rows: int = Field(default=500_000, ge=1, le=10_000_000)
-    max_exception_rows: int = Field(default=10_000, ge=0, le=1_000_000)
+    max_input_files: int = Field(
+        default=PAIRED_FILL_MAX_INPUT_FILES,
+        ge=1,
+        le=PAIRED_FILL_MAX_INPUT_FILES,
+    )
+    max_input_bytes: int = Field(
+        default=PAIRED_FILL_MAX_INPUT_BYTES,
+        ge=1,
+        le=PAIRED_FILL_MAX_INPUT_BYTES,
+    )
+    max_output_rows: int = Field(
+        default=500_000,
+        ge=1,
+        le=PAIRED_FILL_MAX_OUTPUT_ROWS,
+    )
+    max_output_bytes: int = Field(
+        default=PAIRED_FILL_MAX_OUTPUT_BYTES,
+        ge=1,
+        le=PAIRED_FILL_MAX_OUTPUT_BYTES,
+    )
+    max_exception_rows: int = Field(
+        default=10_000,
+        ge=0,
+        le=PAIRED_FILL_MAX_EXCEPTION_ROWS,
+    )
 
     @model_validator(mode="after")
     def _validate_nullable_projections(self) -> PairedFillReduceRequest:

@@ -8,6 +8,11 @@ from portable_batch_execution.packs.replay_reduction.canonicalize import (
     StructuralCanonicalizeError,
 )
 from portable_batch_execution.packs.replay_reduction.models import (
+    PAIRED_FILL_MAX_EXCEPTION_ROWS,
+    PAIRED_FILL_MAX_INPUT_BYTES,
+    PAIRED_FILL_MAX_INPUT_FILES,
+    PAIRED_FILL_MAX_OUTPUT_BYTES,
+    PAIRED_FILL_MAX_OUTPUT_ROWS,
     AdministrativeRowHandling,
     PairedFillReduceRequest,
 )
@@ -371,3 +376,225 @@ def test_carry_non_terminal_partition(tmp_path):
     )
     final = execute_paired_fill_reduce([second], request_cont)
     assert final["ledger_rows"][0]["classification"] == "complete_pair"
+    assert mid["outgoing_carry"]["pending_group_key"] == [110]
+
+
+def test_identity_namespace_separates_same_numeric_id(tmp_path):
+    rows = [
+        {**_row(identity=5, identity_norm="5"), "book_id": "a"},
+        {
+            **_row(identity=5, identity_norm="5", pair_role=_ROLE_B),
+            "book_id": "b",
+        },
+    ]
+    result = execute_paired_fill_reduce(
+        [_write(tmp_path / "p.parquet", rows)],
+        _request(
+            identity_mapping={
+                "identity_source_column": "identity",
+                "identity_normalized_column": "identity_norm",
+                "namespace_columns": ["book_id"],
+            }
+        ),
+    )
+    assert len(result["ledger_rows"]) == 2
+    assert all(item["classification"] == "singleton" for item in result["ledger_rows"])
+    assert {item["identity_namespace"]["book_id"] for item in result["ledger_rows"]} == {
+        "a",
+        "b",
+    }
+
+
+def test_side_size_signed_execution_flip(tmp_path):
+    pair_mapping = {
+        "pair_role_column": "pair_role",
+        "aggressor_role_value": _ROLE_A,
+        "passive_role_value": _ROLE_B,
+        "measurement_core_fields": ["core_price", "core_size"],
+        "start_position_column": "start_pos",
+        "side_size_signed_execution": {
+            "schema_version": "pbe.replay.side-size-signed-execution.v1",
+            "side_column": "side",
+            "size_column": "trade_size",
+            "buy_side_value": "BUY",
+            "sell_side_value": "SELL",
+        },
+    }
+    request = _request(pair_mapping=pair_mapping)
+    rows = [
+        {
+            **_row(identity=12, identity_norm="12", start_pos=10.0),
+            "side": "SELL",
+            "trade_size": 15.0,
+        },
+        {
+            **_row(
+                identity=12,
+                identity_norm="12",
+                pair_role=_ROLE_B,
+                start_pos=-5.0,
+            ),
+            "side": "BUY",
+            "trade_size": 5.0,
+        },
+    ]
+    result = execute_paired_fill_reduce(
+        [_write(tmp_path / "p.parquet", rows)], request
+    )
+    aggressor = _participant(result["ledger_rows"][0], "aggressor")
+    assert aggressor["signed_execution"] == -15.0
+    assert aggressor["closing_quantity"] == 10.0
+    assert aggressor["opening_quantity"] == 5.0
+
+
+def test_participant_field_passthrough_including_null(tmp_path):
+    pair_mapping = {
+        "pair_role_column": "pair_role",
+        "aggressor_role_value": _ROLE_A,
+        "passive_role_value": _ROLE_B,
+        "measurement_core_fields": ["core_price", "core_size"],
+        "start_position_column": "start_pos",
+        "signed_execution_column": "signed_qty",
+        "participant_field_bindings": [
+            {"output_field": "audit_ref", "source_column": "audit_ref"},
+        ],
+    }
+    result = execute_paired_fill_reduce(
+        [
+            _write(
+                tmp_path / "p.parquet",
+                [
+                    {**_row(identity=13, identity_norm="13"), "audit_ref": "x1"},
+                    {
+                        **_row(
+                            identity=13,
+                            identity_norm="13",
+                            pair_role=_ROLE_B,
+                            signed_qty=-2.0,
+                        ),
+                        "audit_ref": None,
+                    },
+                ],
+            )
+        ],
+        _request(pair_mapping=pair_mapping),
+    )
+    parts = result["ledger_rows"][0]["participants"]
+    refs = {item["role"]: item["audit_ref"] for item in parts}
+    assert refs["aggressor"] == "x1"
+    assert refs["passive"] is None
+
+
+def test_complete_pair_lineage_and_same_participant_flag(tmp_path):
+    first = _write(
+        tmp_path / "a.parquet",
+        [
+            {
+                **_row(identity=14, identity_norm="14", start_pos=0.0, signed_qty=1.0),
+                "participant_key": "p1",
+            }
+        ],
+    )
+    second = _write(
+        tmp_path / "b.parquet",
+        [
+            {
+                **_row(
+                    identity=14,
+                    identity_norm="14",
+                    pair_role=_ROLE_B,
+                    start_pos=0.0,
+                    signed_qty=-1.0,
+                ),
+                "participant_key": "p1",
+            }
+        ],
+    )
+    pair_mapping = {
+        "pair_role_column": "pair_role",
+        "aggressor_role_value": _ROLE_A,
+        "passive_role_value": _ROLE_B,
+        "measurement_core_fields": ["core_price", "core_size"],
+        "start_position_column": "start_pos",
+        "signed_execution_column": "signed_qty",
+        "participant_identity_column": "participant_key",
+    }
+    result = execute_paired_fill_reduce(
+        [first, second], _request(pair_mapping=pair_mapping)
+    )
+    row = result["ledger_rows"][0]
+    assert row["first_source_input_index"] == 0
+    assert row["first_source_row_offset"] == 0
+    assert row["last_source_input_index"] == 1
+    assert row["last_source_row_offset"] == 0
+    assert row["participants_same_identity"] is True
+
+
+def test_request_accepts_frozen_upper_bounds():
+    PairedFillReduceRequest.model_validate(
+        {
+            **_request(),
+            "max_input_files": PAIRED_FILL_MAX_INPUT_FILES,
+            "max_input_bytes": PAIRED_FILL_MAX_INPUT_BYTES,
+            "max_output_rows": PAIRED_FILL_MAX_OUTPUT_ROWS,
+            "max_output_bytes": PAIRED_FILL_MAX_OUTPUT_BYTES,
+            "max_exception_rows": PAIRED_FILL_MAX_EXCEPTION_ROWS,
+        }
+    )
+
+
+def test_request_rejects_bounds_above_ceiling():
+    with pytest.raises(ValidationError):
+        PairedFillReduceRequest.model_validate(
+            {**_request(), "max_input_files": PAIRED_FILL_MAX_INPUT_FILES + 1}
+        )
+
+
+def test_input_bytes_limit_enforced(tmp_path):
+    path = _write(tmp_path / "p.parquet", [_row(identity=15, identity_norm="15")])
+    size = path.stat().st_size
+    with pytest.raises(ValueError, match="input bytes exceed limit"):
+        execute_paired_fill_reduce(
+            [path],
+            _request(max_input_bytes=max(1, size - 1)),
+        )
+
+
+def test_output_bytes_limit_enforced(tmp_path):
+    with pytest.raises(ValueError, match="parquet output exceeds byte limit"):
+        _run(
+            tmp_path,
+            [
+                _row(identity=16, identity_norm="16"),
+                _row(
+                    identity=16,
+                    identity_norm="16",
+                    pair_role=_ROLE_B,
+                    signed_qty=-2.0,
+                ),
+            ],
+            max_output_bytes=32,
+        )
+
+
+def test_signed_execution_mapping_requires_exactly_one_mode():
+    with pytest.raises(ValidationError):
+        PairedFillReduceRequest.model_validate(
+            _request(
+                pair_mapping={
+                    "pair_role_column": "pair_role",
+                    "aggressor_role_value": _ROLE_A,
+                    "passive_role_value": _ROLE_B,
+                    "measurement_core_fields": ["core_price", "core_size"],
+                    "start_position_column": "start_pos",
+                    "signed_execution_column": "signed_qty",
+                    "side_size_signed_execution": {
+                        "schema_version": "pbe.replay.side-size-signed-execution.v1",
+                        "side_column": "side",
+                        "size_column": "trade_size",
+                        "buy_side_value": "BUY",
+                        "sell_side_value": "SELL",
+                    },
+                }
+            )
+        )

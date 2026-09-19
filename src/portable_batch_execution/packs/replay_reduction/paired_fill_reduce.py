@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import io
 import json
+import math
 from dataclasses import dataclass, field
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Literal
 
 import polars as pl
@@ -17,6 +19,7 @@ from .canonicalize import (
 )
 from .event_window import _row_is_sentinel, _validate_positive_row
 from .models import (
+    PAIRED_FILL_MAX_PAIR_SIZE,
     PairedFillReduceRequest,
 )
 from .nullable_json_projection import apply_nullable_json_projections_to_lazy
@@ -28,8 +31,6 @@ CARRY_SCHEMA_VERSION = "pbe.replay.paired-fill-reduce-carry.v1"
 LEDGER_PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
 _SOURCE_INPUT_INDEX = "_source_input_index"
 _SOURCE_ROW_OFFSET = "_source_row_offset"
-_MAX_INPUT_FILES = 64
-_MAX_LEDGER_PARQUET_BYTES = 67_108_864
 
 
 def _validated(
@@ -38,6 +39,26 @@ def _validated(
     if isinstance(request, PairedFillReduceRequest):
         return request
     return PairedFillReduceRequest.model_validate(request)
+
+
+def _group_key(row: dict[str, Any], model: PairedFillReduceRequest) -> tuple[Any, ...]:
+    mapping = model.identity_mapping
+    identity_col = mapping.identity_source_column
+    identity = int(row[identity_col])
+    return (*tuple(row[column] for column in mapping.namespace_columns), identity)
+
+
+def _ledger_identity(group_key: tuple[Any, ...]) -> int:
+    return int(group_key[-1])
+
+
+def _identity_namespace(
+    group_key: tuple[Any, ...], model: PairedFillReduceRequest
+) -> dict[str, Any] | None:
+    columns = model.identity_mapping.namespace_columns
+    if not columns:
+        return None
+    return {column: group_key[index] for index, column in enumerate(columns)}
 
 
 def _mechanical_quantities(
@@ -54,6 +75,39 @@ def _mechanical_quantities(
     opening = abs(qty) - closing
     post = pre + qty
     return opening, closing, post
+
+
+def _resolve_signed_execution(row: dict[str, Any], pair_mapping) -> float:
+    if pair_mapping.signed_execution_column is not None:
+        raw = row.get(pair_mapping.signed_execution_column)
+        if raw is None:
+            raise StructuralCanonicalizeError("signed execution missing")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise StructuralCanonicalizeError("signed execution invalid")
+        if not math.isfinite(value):
+            raise StructuralCanonicalizeError("signed execution invalid")
+        return value
+    spec = pair_mapping.side_size_signed_execution
+    if spec is None:
+        raise StructuralCanonicalizeError("signed execution mapping missing")
+    side = row.get(spec.side_column)
+    raw_size = row.get(spec.size_column)
+    if raw_size is None:
+        raise StructuralCanonicalizeError("signed execution size missing")
+    try:
+        size = float(raw_size)
+    except (TypeError, ValueError):
+        raise StructuralCanonicalizeError("signed execution size invalid")
+    if not math.isfinite(size):
+        raise StructuralCanonicalizeError("signed execution size invalid")
+    magnitude = abs(size)
+    if side == spec.buy_side_value:
+        return magnitude
+    if side == spec.sell_side_value:
+        return -magnitude
+    raise StructuralCanonicalizeError("signed execution side invalid")
 
 
 def _role_name(
@@ -75,13 +129,12 @@ def _participant_record(
     row: dict[str, Any],
     *,
     role: Literal["aggressor", "passive"],
-    start_position_column: str,
-    signed_execution_column: str,
+    pair_mapping,
 ) -> dict[str, Any]:
-    start_position = float(row[start_position_column])
-    signed_execution = float(row[signed_execution_column])
+    start_position = float(row[pair_mapping.start_position_column])
+    signed_execution = _resolve_signed_execution(row, pair_mapping)
     opening, closing, post = _mechanical_quantities(start_position, signed_execution)
-    return {
+    record: dict[str, Any] = {
         "role": role,
         "start_position": start_position,
         "signed_execution": signed_execution,
@@ -91,6 +144,9 @@ def _participant_record(
         "source_input_index": int(row[_SOURCE_INPUT_INDEX]),
         "source_row_offset": int(row[_SOURCE_ROW_OFFSET]),
     }
+    for binding in pair_mapping.participant_field_bindings:
+        record[binding.output_field] = row.get(binding.source_column)
+    return record
 
 
 def _measurement_core(row: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
@@ -108,13 +164,36 @@ def _cores_match(rows: list[dict[str, Any]], fields: tuple[str, ...]) -> bool:
     return True
 
 
+def _source_lineage(rows: list[dict[str, Any]]) -> dict[str, int]:
+    first = rows[0]
+    last = rows[-1]
+    return {
+        "first_source_input_index": int(first[_SOURCE_INPUT_INDEX]),
+        "first_source_row_offset": int(first[_SOURCE_ROW_OFFSET]),
+        "last_source_input_index": int(last[_SOURCE_INPUT_INDEX]),
+        "last_source_row_offset": int(last[_SOURCE_ROW_OFFSET]),
+    }
+
+
+def _participants_same_identity(rows: list[dict[str, Any]], pair_mapping) -> bool | None:
+    column = pair_mapping.participant_identity_column
+    if column is None:
+        return None
+    left = rows[0].get(column)
+    right = rows[1].get(column)
+    if left is None or right is None:
+        raise StructuralCanonicalizeError("participant identity missing")
+    return left == right
+
+
 def _ledger_row(
     rows: list[dict[str, Any]],
     *,
     classification: Literal["complete_pair", "singleton"],
-    identity: int,
-    pair_mapping,
+    group_key: tuple[Any, ...],
+    model: PairedFillReduceRequest,
 ) -> dict[str, Any]:
+    pair_mapping = model.pair_mapping
     if not _cores_match(rows, pair_mapping.measurement_core_fields):
         raise StructuralCanonicalizeError("measurement core fields disagree")
     participants: list[dict[str, Any]] = []
@@ -127,48 +206,50 @@ def _ledger_row(
         )
         if role is None:
             raise StructuralCanonicalizeError("pair role invalid")
-        participants.append(
-            _participant_record(
-                row,
-                role=role,
-                start_position_column=pair_mapping.start_position_column,
-                signed_execution_column=pair_mapping.signed_execution_column,
-            )
-        )
+        participants.append(_participant_record(row, role=role, pair_mapping=pair_mapping))
     if classification == "complete_pair":
         roles = {item["role"] for item in participants}
         if roles != {"aggressor", "passive"}:
             raise StructuralCanonicalizeError("pair role invalid")
-    return {
-        "ledger_identity": identity,
+    lineage = _source_lineage(rows)
+    payload: dict[str, Any] = {
+        "identity_namespace": _identity_namespace(group_key, model),
+        "ledger_identity": _ledger_identity(group_key),
         "classification": classification,
         "measurement_core": _measurement_core(
             rows[0], pair_mapping.measurement_core_fields
         ),
-        "source_input_index": int(rows[0][_SOURCE_INPUT_INDEX]),
-        "source_row_offset": int(rows[0][_SOURCE_ROW_OFFSET]),
+        **lineage,
         "participants": participants,
     }
+    if classification == "complete_pair":
+        payload["participants_same_identity"] = _participants_same_identity(
+            rows, pair_mapping
+        )
+    return payload
 
 
 @dataclass
 class _Reducer:
     model: PairedFillReduceRequest
-    closed_identities: set[int] = field(default_factory=set)
+    closed_group_keys: set[tuple[Any, ...]] = field(default_factory=set)
     pending: list[dict[str, Any]] = field(default_factory=list)
-    pending_identity: int | None = None
+    pending_group_key: tuple[Any, ...] | None = None
     boundary_carry: dict[str, Any] | None = None
-    boundary_carry_identity: int | None = None
+    boundary_carry_group_key: tuple[Any, ...] | None = None
     ledger_rows: list[dict[str, Any]] = field(default_factory=list)
     administrative_row_count: int = 0
 
     def __post_init__(self) -> None:
         carry = self.model.partition.incoming_carry
         if carry is not None and carry.pending_row is not None:
-            if carry.pending_identity is None:
-                raise StructuralCanonicalizeError("carry identity missing")
+            if carry.pending_group_key is not None:
+                self.boundary_carry_group_key = tuple(carry.pending_group_key)
+            elif carry.pending_identity is not None:
+                self.boundary_carry_group_key = (carry.pending_identity,)
+            else:
+                raise StructuralCanonicalizeError("carry group key missing")
             self.boundary_carry = dict(carry.pending_row)
-            self.boundary_carry_identity = int(carry.pending_identity)
 
     def _check_output_bounds(self) -> None:
         if len(self.ledger_rows) > self.model.max_output_rows:
@@ -180,74 +261,76 @@ class _Reducer:
 
     def _clear_pending(self) -> None:
         self.pending = []
-        self.pending_identity = None
+        self.pending_group_key = None
 
-    def _finalize_singleton(self, identity: int) -> None:
+    def _finalize_singleton(self, group_key: tuple[Any, ...]) -> None:
         if len(self.pending) != 1:
             raise StructuralCanonicalizeError("singleton group size invalid")
         self._append_ledger(
             _ledger_row(
                 self.pending,
                 classification="singleton",
-                identity=identity,
-                pair_mapping=self.model.pair_mapping,
+                group_key=group_key,
+                model=self.model,
             )
         )
-        self.closed_identities.add(identity)
+        self.closed_group_keys.add(group_key)
         self._clear_pending()
 
-    def _finalize_pair(self, identity: int) -> None:
-        if len(self.pending) != 2:
+    def _finalize_pair(self, group_key: tuple[Any, ...]) -> None:
+        if len(self.pending) != PAIRED_FILL_MAX_PAIR_SIZE:
             raise StructuralCanonicalizeError("pair group size invalid")
         self._append_ledger(
             _ledger_row(
                 self.pending,
                 classification="complete_pair",
-                identity=identity,
-                pair_mapping=self.model.pair_mapping,
+                group_key=group_key,
+                model=self.model,
             )
         )
-        self.closed_identities.add(identity)
+        self.closed_group_keys.add(group_key)
         self._clear_pending()
 
-    def _ingest_economic_row(self, row: dict[str, Any], identity: int) -> None:
-        if identity in self.closed_identities:
+    def _ingest_economic_row(self, row: dict[str, Any], group_key: tuple[Any, ...]) -> None:
+        if group_key in self.closed_group_keys:
             raise StructuralCanonicalizeError("identity is not contiguous")
 
         if self.boundary_carry is not None:
             carry = self.boundary_carry
-            carry_identity = self.boundary_carry_identity
+            carry_key = self.boundary_carry_group_key
             self.boundary_carry = None
-            self.boundary_carry_identity = None
-            if carry_identity is None:
-                raise StructuralCanonicalizeError("carry identity missing")
-            if identity == carry_identity:
+            self.boundary_carry_group_key = None
+            if carry_key is None:
+                raise StructuralCanonicalizeError("carry group key missing")
+            if group_key == carry_key:
                 self.pending = [carry, row]
-                self.pending_identity = identity
-                self._finalize_pair(identity)
+                self.pending_group_key = group_key
+                self._finalize_pair(group_key)
                 return
             self.pending = [carry]
-            self.pending_identity = carry_identity
-            self._finalize_singleton(carry_identity)
+            self.pending_group_key = carry_key
+            self._finalize_singleton(carry_key)
 
         if not self.pending:
             self.pending = [row]
-            self.pending_identity = identity
+            self.pending_group_key = group_key
             return
 
-        if identity != self.pending_identity:
-            self._finalize_singleton(int(self.pending_identity))
+        if group_key != self.pending_group_key:
+            if self.pending_group_key is None:
+                raise StructuralCanonicalizeError("pending group key missing")
+            self._finalize_singleton(self.pending_group_key)
             self.pending = [row]
-            self.pending_identity = identity
+            self.pending_group_key = group_key
             return
 
         self.pending.append(row)
-        if len(self.pending) > 2:
+        if len(self.pending) > PAIRED_FILL_MAX_PAIR_SIZE:
             raise StructuralCanonicalizeError(
                 "adjacent identity group exceeds pair size"
             )
-        if len(self.pending) == 2:
-            self._finalize_pair(identity)
+        if len(self.pending) == PAIRED_FILL_MAX_PAIR_SIZE:
+            self._finalize_pair(group_key)
 
     def ingest(self, row: dict[str, Any]) -> None:
         admin = self.model.administrative_row_handling
@@ -257,29 +340,30 @@ class _Reducer:
 
         identity_col = self.model.identity_mapping.identity_source_column
         normalized_col = self.model.identity_mapping.identity_normalized_column
-        identity = _validate_positive_row(
+        _validate_positive_row(
             row,
             identity_col=identity_col,
             normalized_col=normalized_col,
             core_fields=self.model.pair_mapping.measurement_core_fields,
         )
         validate_row_invariants(row, self.model.row_invariants)
-        self._ingest_economic_row(row, identity)
+        group_key = _group_key(row, self.model)
+        self._ingest_economic_row(row, group_key)
 
     def end_input_boundary(self) -> None:
-        if len(self.pending) == 2:
-            if self.pending_identity is None:
-                raise StructuralCanonicalizeError("pending identity missing")
-            self._finalize_pair(int(self.pending_identity))
+        if len(self.pending) == PAIRED_FILL_MAX_PAIR_SIZE:
+            if self.pending_group_key is None:
+                raise StructuralCanonicalizeError("pending group key missing")
+            self._finalize_pair(self.pending_group_key)
         elif len(self.pending) == 1:
             if self.boundary_carry is not None:
                 raise StructuralCanonicalizeError("carry overflow")
-            if self.pending_identity is None:
-                raise StructuralCanonicalizeError("pending identity missing")
+            if self.pending_group_key is None:
+                raise StructuralCanonicalizeError("pending group key missing")
             self.boundary_carry = dict(self.pending[0])
-            self.boundary_carry_identity = int(self.pending_identity)
+            self.boundary_carry_group_key = self.pending_group_key
             self._clear_pending()
-        elif len(self.pending) > 2:
+        elif len(self.pending) > PAIRED_FILL_MAX_PAIR_SIZE:
             raise StructuralCanonicalizeError(
                 "adjacent identity group exceeds pair size"
             )
@@ -290,24 +374,29 @@ class _Reducer:
                 return {
                     "schema_version": CARRY_SCHEMA_VERSION,
                     "pending_row": self.boundary_carry,
-                    "pending_identity": self.boundary_carry_identity,
+                    "pending_identity": _ledger_identity(self.boundary_carry_group_key)
+                    if self.boundary_carry_group_key
+                    else None,
+                    "pending_group_key": list(self.boundary_carry_group_key)
+                    if self.boundary_carry_group_key is not None
+                    else None,
                 }
-            if self.boundary_carry_identity is None:
-                raise StructuralCanonicalizeError("carry identity missing")
+            if self.boundary_carry_group_key is None:
+                raise StructuralCanonicalizeError("carry group key missing")
             self.pending = [self.boundary_carry]
-            self.pending_identity = int(self.boundary_carry_identity)
+            self.pending_group_key = self.boundary_carry_group_key
             self.boundary_carry = None
-            self.boundary_carry_identity = None
+            self.boundary_carry_group_key = None
 
         if len(self.pending) == 1:
-            if self.pending_identity is None:
-                raise StructuralCanonicalizeError("pending identity missing")
-            self._finalize_singleton(int(self.pending_identity))
-        elif len(self.pending) == 2:
-            if self.pending_identity is None:
-                raise StructuralCanonicalizeError("pending identity missing")
-            self._finalize_pair(int(self.pending_identity))
-        elif len(self.pending) > 2:
+            if self.pending_group_key is None:
+                raise StructuralCanonicalizeError("pending group key missing")
+            self._finalize_singleton(self.pending_group_key)
+        elif len(self.pending) == PAIRED_FILL_MAX_PAIR_SIZE:
+            if self.pending_group_key is None:
+                raise StructuralCanonicalizeError("pending group key missing")
+            self._finalize_pair(self.pending_group_key)
+        elif len(self.pending) > PAIRED_FILL_MAX_PAIR_SIZE:
             raise StructuralCanonicalizeError(
                 "adjacent identity group exceeds pair size"
             )
@@ -324,15 +413,30 @@ def _required_columns(model: PairedFillReduceRequest) -> tuple[str, ...]:
     admin_fields = ()
     if admin is not None:
         admin_fields = tuple(admin.predicate.exact_match_fields)
+    signed_columns: list[str] = []
+    if pair.signed_execution_column is not None:
+        signed_columns.append(pair.signed_execution_column)
+    if pair.side_size_signed_execution is not None:
+        spec = pair.side_size_signed_execution
+        signed_columns.extend((spec.side_column, spec.size_column))
+    passthrough = [binding.source_column for binding in pair.participant_field_bindings]
+    participant_identity = (
+        (pair.participant_identity_column,)
+        if pair.participant_identity_column is not None
+        else ()
+    )
     return tuple(
         dict.fromkeys(
             [
                 identity.identity_source_column,
                 identity.identity_normalized_column,
+                *identity.namespace_columns,
                 pair.pair_role_column,
                 pair.start_position_column,
-                pair.signed_execution_column,
+                *signed_columns,
                 *pair.measurement_core_fields,
+                *passthrough,
+                *participant_identity,
                 *invariant_columns(model.row_invariants),
                 *admin_fields,
                 *(
@@ -411,15 +515,22 @@ def _content_identity(
     return f"sha256:{digest}"
 
 
+def _total_input_bytes(paths: list[str | Any]) -> int:
+    return sum(Path(path).stat().st_size for path in paths)
+
+
 def execute_paired_fill_reduce(
     paths: list[str | Any],
     request: dict[str, Any] | PairedFillReduceRequest,
 ) -> dict[str, Any]:
     if not paths:
         raise ValueError("at least one parquet input is required")
-    if len(paths) > _MAX_INPUT_FILES:
-        raise ValueError("replay parquet input count exceeds limit")
     model = _validated(request)
+    if len(paths) > model.max_input_files:
+        raise ValueError("replay parquet input count exceeds limit")
+    input_bytes = _total_input_bytes(paths)
+    if input_bytes > model.max_input_bytes:
+        raise ValueError("replay parquet input bytes exceed limit")
     reducer, outgoing_carry = _stream_rows(paths, model)
     exceptions: list[dict[str, Any]] = []
     summary = {
@@ -427,6 +538,7 @@ def execute_paired_fill_reduce(
         "ledger_row_count": len(reducer.ledger_rows),
         "administrative_row_count": reducer.administrative_row_count,
         "exception_row_count": len(exceptions),
+        "input_bytes": input_bytes,
     }
     content_identity = _content_identity(reducer.ledger_rows, summary, exceptions)
     summary["content_identity"] = content_identity
@@ -435,7 +547,7 @@ def execute_paired_fill_reduce(
     if reducer.ledger_rows:
         pl.DataFrame(reducer.ledger_rows).write_parquet(ledger_buffer)
     ledger_bytes = ledger_buffer.getvalue()
-    if len(ledger_bytes) > _MAX_LEDGER_PARQUET_BYTES:
+    if len(ledger_bytes) > model.max_output_bytes:
         raise ValueError("paired fill parquet output exceeds byte limit")
     ledger_parquet_identity = (
         f"sha256:{sha256(ledger_bytes).hexdigest()}" if ledger_bytes else None
@@ -448,11 +560,13 @@ def execute_paired_fill_reduce(
         "ledger_rows": reducer.ledger_rows,
         "ledger_parquet_bytes": ledger_bytes,
         "ledger_parquet_identity": ledger_parquet_identity,
+        "max_output_bytes": model.max_output_bytes,
         "outgoing_carry": outgoing_carry
         or {
             "schema_version": CARRY_SCHEMA_VERSION,
             "pending_row": None,
             "pending_identity": None,
+            "pending_group_key": None,
         },
     }
 
@@ -485,8 +599,9 @@ def publish_paired_fill_reduce_artifacts(
     shard_stage_failure,
 ) -> tuple[bytes, tuple[Any, ...]]:
     """Publish ledger Parquet (when non-empty) then deterministic metadata JSON."""
+    max_output_bytes = int(result_payload.get("max_output_bytes", 0))
     ledger_bytes = bytes(result_payload.get("ledger_parquet_bytes") or b"")
-    if len(ledger_bytes) > _MAX_LEDGER_PARQUET_BYTES:
+    if max_output_bytes > 0 and len(ledger_bytes) > max_output_bytes:
         raise ValueError("paired fill parquet output exceeds byte limit")
 
     ledger_ref = None
