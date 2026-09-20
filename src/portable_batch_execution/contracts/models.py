@@ -59,6 +59,7 @@ PACK_OPS = {
         "replay.event_window_extract",
         "replay.causal_grid_extract",
         "replay.structural_canonicalize_merge",
+        "replay.trade_path_scenario_evaluate",
     },
     "media-batch": {
         "media.decode",

@@ -41,6 +41,9 @@ from portable_batch_execution.packs.replay_reduction.canonicalize import (
 from portable_batch_execution.packs.replay_reduction.models import (
     BUCKET_COUNT_MAX,
 )
+from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate import (
+    REQUEST_SCHEMA_VERSION as TRADE_PATH_REQUEST_SCHEMA_VERSION,
+)
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})
@@ -82,6 +85,7 @@ _PRIVATE_REPLAY_BATCH_OPS = frozenset(
         "replay.structural_canonicalize_merge",
         "replay.event_window_extract",
         "replay.causal_grid_extract",
+        "replay.trade_path_scenario_evaluate",
     }
 )
 _MAX_REPLAY_PARQUET_INPUTS = 64
@@ -686,12 +690,58 @@ def execute_private_wave(
                                 _execution_failure_code(exc, stage="pack")
                             ) from None
                         output_rows = len(result_payload["rows"])
+                elif job.operation == "replay.trade_path_scenario_evaluate":
+                    if len(shard.input_refs) != 1:
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    batch_ref = shard.input_refs[0]
+                    if batch_ref.media_type != "application/json":
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    batch_payload = _read_verified_artifact_bytes(plane, batch_ref)
+                    try:
+                        parsed_batch = json.loads(batch_payload.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError) as exc:
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="input_parse")
+                        ) from None
+                    if parsed_batch.get("schema_version") != TRADE_PATH_REQUEST_SCHEMA_VERSION:
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    input_rows = len(parsed_batch.get("records") or [])
+                    try:
+                        result_payload = replay_pack.execute(
+                            job,
+                            shard,
+                            job.operation_params,
+                            {
+                                "batch": parsed_batch,
+                                "encoded_size": len(batch_payload),
+                                "operation": job.operation,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="pack")
+                        ) from None
+                    output = bytes(result_payload.get("result_json_bytes") or b"")
+                    if not output:
+                        output = json.dumps(
+                            {
+                                "schema_version": result_payload["schema_version"],
+                                "batch_id": result_payload["batch_id"],
+                                "records": result_payload["records"],
+                                "event_summary": result_payload["event_summary"],
+                            },
+                            sort_keys=True,
+                        ).encode("utf-8")
+                    output_rows = int(result_payload["summary"]["record_count"])
+                    output_digest_value = sha256(output).hexdigest()
+                    publish_single_output = True
                 else:
                     raise _ShardStageFailure(
                         _execution_failure_code(ValueError(), stage="pack")
                     )
                 if publish_single_output:
-                    output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
+                    if job.operation != "replay.trade_path_scenario_evaluate":
+                        output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
                     output_media_type = "application/json"
             else:
                 input_ref = shard.input_refs[0]
