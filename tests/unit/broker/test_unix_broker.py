@@ -22,6 +22,7 @@ from portable_batch_execution.broker.planning import (
     opaque_run_id,
     register_broker_private_run,
 )
+from portable_batch_execution.broker.protocol import BrokerExecuteResponse
 from portable_batch_execution.broker.server import _handle_connection, serve_unix_broker
 from portable_batch_execution.broker.service import UnixBrokerService
 from portable_batch_execution.broker.state import (
@@ -49,6 +50,10 @@ def _config(tmp_path, *, max_input_bytes: int = 1_048_576) -> BrokerConfig:
                     str(_UID): [
                         ["tabular-batch", "tabular.sort"],
                         ["ml-batch", "ml.cosine_similarity_matrix"],
+                        [
+                            "replay-batch",
+                            "replay.trade_path_scenario_evaluate",
+                        ],
                     ]
                 },
             }
@@ -196,6 +201,73 @@ def test_operation_not_in_allowlist(tmp_path):
     )
     assert response.status == "failed"
     assert response.error_code == "peer_not_authorized"
+
+
+_REPLAY_TRADE_PATH_JOB_PARAMS = {
+    "schema_version": "pbe.replay.trade-path-scenario-evaluate-job.v1",
+}
+
+
+def _replay_trade_path_request(**overrides) -> dict:
+    body = overrides.pop("payload", json.dumps({"batch_id": "b1", "records": []}).encode())
+    request = {
+        "schema_version": "pbe.a1-unix-broker.request.v1",
+        "request_id": overrides.pop("request_id", "req-replay-trade-path"),
+        "pack": "replay-batch",
+        "operation": "replay.trade_path_scenario_evaluate",
+        "operation_params": overrides.pop(
+            "operation_params", _REPLAY_TRADE_PATH_JOB_PARAMS
+        ),
+        "input_media_type": "application/json",
+        "input_b64": base64.b64encode(body).decode("ascii"),
+    }
+    request.update(overrides)
+    return request
+
+
+def test_replay_batch_trade_path_service_accepts_closed_request(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    stub = BrokerExecuteResponse(
+        request_id="req-replay-trade-path", status="succeeded"
+    )
+    with patch.object(UnixBrokerService, "_drive_to_terminal", return_value=stub):
+        response = service.handle_payload(_UID, _replay_trade_path_request())
+    assert response.error_code != "operation_params_invalid"
+    assert response.error_code != "operation_not_allowed"
+    assert response.status == "succeeded"
+
+
+def test_replay_batch_unknown_operation_rejected_before_authorization(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    response = service.handle_payload(
+        _UID,
+        _replay_trade_path_request(
+            operation="replay.structural_canonicalize",
+            operation_params={
+                "schema_version": "pbe.replay.structural-canonicalize.v1",
+            },
+        ),
+    )
+    assert response.status == "failed"
+    assert response.error_code == "operation_not_allowed"
+
+
+def test_replay_batch_invalid_operation_params_rejected(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    response = service.handle_payload(
+        _UID,
+        _replay_trade_path_request(
+            operation_params={
+                **_REPLAY_TRADE_PATH_JOB_PARAMS,
+                "batch_id": "forbidden-extra",
+            }
+        ),
+    )
+    assert response.status == "failed"
+    assert response.error_code == "operation_params_invalid"
 
 
 def test_malformed_base64_and_payload_bound(tmp_path):

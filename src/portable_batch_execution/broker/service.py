@@ -14,12 +14,13 @@ from portable_batch_execution.backends.github_actions import (
     GitHubActionsAPIError,
     GitHubActionsBackend,
 )
-from portable_batch_execution.contracts import PACK_OPS, ShardAttemptRecord, ShardSpec
+from portable_batch_execution.contracts import ShardAttemptRecord, ShardSpec
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.kernel import completeness, exhausted_shards
 
 from .config import BrokerConfig
 from .planning import (
+    broker_allows_operation,
     broker_execution_fingerprint,
     broker_shard_input_digest,
     canonical_operation_params,
@@ -62,9 +63,7 @@ class UnixBrokerService:
                 status="failed",
                 error_code="request_invalid",
             )
-        if request.pack not in {"tabular-batch", "ml-batch", "media-batch"}:
-            return self._failed(request.request_id, "operation_not_allowed")
-        if request.operation not in PACK_OPS[request.pack]:
+        if not broker_allows_operation(request.pack, request.operation):
             return self._failed(request.request_id, "operation_not_allowed")
         if not self.config.authorize(peer_uid, request.pack, request.operation):
             return self._failed(request.request_id, "peer_not_authorized")

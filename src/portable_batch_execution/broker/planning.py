@@ -17,11 +17,15 @@ from portable_batch_execution.contracts import (
     ShardSpec,
     WaveSpec,
 )
+from portable_batch_execution.contracts.models import PACK_OPS
 from portable_batch_execution.controller.a1_controller import job_spec_digest
 from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
 from portable_batch_execution.data_plane.base import RevisionConflictError
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
 from portable_batch_execution.packs import MLPack, TabularPack
+from portable_batch_execution.packs.replay_reduction.models import (
+    TradePathScenarioEvaluateJobParams,
+)
 
 _BINDING_CONFLICT = "request_binding_conflict"
 
@@ -32,6 +36,18 @@ _CLOSED_ML_BATCH_OPERATIONS = frozenset(
         "ml.distilbert_pair_binary_scores",
     }
 )
+_BROKER_REPLAY_BATCH_OPERATIONS = frozenset({"replay.trade_path_scenario_evaluate"})
+_BROKER_PACKS = frozenset(
+    {"tabular-batch", "ml-batch", "media-batch", "replay-batch"},
+)
+
+
+def broker_allows_operation(pack: str, operation: str) -> bool:
+    if pack not in _BROKER_PACKS:
+        return False
+    if pack == "replay-batch":
+        return operation in _BROKER_REPLAY_BATCH_OPERATIONS
+    return operation in PACK_OPS[pack]
 
 
 def canonical_operation_params(pack: str, operation: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -47,6 +63,10 @@ def canonical_operation_params(pack: str, operation: str, params: dict[str, Any]
         if params:
             raise ValueError("closed operation parameters")
         return {}
+    if pack == "replay-batch":
+        if operation not in _BROKER_REPLAY_BATCH_OPERATIONS:
+            raise ValueError("unsupported broker operation")
+        return TradePathScenarioEvaluateJobParams.model_validate(params).model_dump(mode="json")
     raise ValueError("unsupported broker pack")
 
 
