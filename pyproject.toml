@@ -18,6 +18,10 @@ distilbert = [
   "transformers==5.16.1",
   "safetensors==0.8.0",
 ]
+replay = [
+  "portable-batch-execution[tabular]",
+  "numpy>=2.0",
+]
 all = ["portable-batch-execution[tabular,ml,distilbert]"]
 
 [dependency-groups]

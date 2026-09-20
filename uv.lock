@@ -834,6 +834,12 @@ distilbert = [
 ml = [
     { name = "scikit-learn" },
 ]
+replay = [
+    { name = "duckdb" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "polars" },
+]
 tabular = [
     { name = "duckdb" },
     { name = "polars" },
@@ -852,7 +858,9 @@ dev = [
 requires-dist = [
     { name = "duckdb", marker = "extra == 'tabular'", specifier = ">=1.1" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "numpy", marker = "extra == 'replay'", specifier = ">=2.0" },
     { name = "polars", marker = "extra == 'tabular'", specifier = ">=1.0" },
+    { name = "portable-batch-execution", extras = ["tabular"], marker = "extra == 'replay'" },
     { name = "portable-batch-execution", extras = ["tabular", "ml", "distilbert"], marker = "extra == 'all'" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "safetensors", marker = "extra == 'distilbert'", specifier = "==0.8.0" },
@@ -860,7 +868,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'distilbert'", specifier = "==2.11.0" },
     { name = "transformers", marker = "extra == 'distilbert'", specifier = "==5.16.1" },
 ]
-provides-extras = ["tabular", "ml", "distilbert", "all"]
+provides-extras = ["tabular", "ml", "distilbert", "replay", "all"]
 
 [package.metadata.requires-dev]
 dev = [

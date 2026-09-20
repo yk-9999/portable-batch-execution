@@ -20,16 +20,9 @@ from portable_batch_execution.contracts import (
 )
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
 from portable_batch_execution.data_plane.base import ArtifactContentStream
-from portable_batch_execution.packs import MediaPack, ReplayReductionPack, TabularPack
-from portable_batch_execution.packs.ml.char_wb_tfidf_logistic_score import (
-    execute_char_wb_tfidf_logistic_score,
-)
-from portable_batch_execution.packs.ml.cosine_similarity_matrix import (
-    execute_cosine_similarity_matrix,
-)
-from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
-    execute_distilbert_pair_binary_scores,
-)
+from portable_batch_execution.packs.media.pack import MediaPack
+from portable_batch_execution.packs.replay_reduction.pack import ReplayReductionPack
+from portable_batch_execution.packs.tabular.pack import TabularPack
 from portable_batch_execution.packs.replay_reduction.canonicalize import (
     BUCKET_MEDIA_TYPE,
     StructuralCanonicalizeError,
@@ -513,6 +506,10 @@ def execute_private_wave(
                         _execution_failure_code(exc, stage="input_parse")
                     ) from None
                 try:
+                    from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
+                        execute_distilbert_pair_binary_scores,
+                    )
+
                     result_payload = execute_distilbert_pair_binary_scores(
                         parsed_input,
                         model_a_config=model_a_config,
@@ -828,6 +825,10 @@ def execute_private_wave(
                             )
                         try:
                             if job.operation == "ml.cosine_similarity_matrix":
+                                from portable_batch_execution.packs.ml.cosine_similarity_matrix import (
+                                    execute_cosine_similarity_matrix,
+                                )
+
                                 result_payload = execute_cosine_similarity_matrix(
                                     parsed_input
                                 )
@@ -838,6 +839,10 @@ def execute_private_wave(
                                     result_payload["scores"][0]
                                 )
                             elif job.operation == "ml.char_wb_tfidf_logistic_score":
+                                from portable_batch_execution.packs.ml.char_wb_tfidf_logistic_score import (
+                                    execute_char_wb_tfidf_logistic_score,
+                                )
+
                                 result_payload = execute_char_wb_tfidf_logistic_score(
                                     parsed_input
                                 )
