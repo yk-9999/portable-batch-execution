@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .peers import read_peer_credentials
@@ -17,7 +18,10 @@ def serve_unix_broker(
     socket_path: Path,
     service: UnixBrokerService,
     socket_mode: int | None = None,
+    max_concurrent_requests: int = 1,
 ) -> None:
+    if max_concurrent_requests < 1:
+        raise ValueError("max_concurrent_requests must be at least 1")
     socket_path = socket_path.resolve()
     socket_path.parent.mkdir(parents=True, exist_ok=True)
     if socket_path.exists():
@@ -26,10 +30,29 @@ def serve_unix_broker(
     listener.bind(str(socket_path))
     os.chmod(socket_path, socket_mode or service.config.socket_mode)
     listener.listen(8)
-    while True:
-        connection, _address = listener.accept()
+    _serve_accept_loop(listener, service, max_concurrent_requests)
+
+
+def _serve_accept_loop(
+    listener: socket.socket,
+    service: UnixBrokerService,
+    max_concurrent_requests: int,
+) -> None:
+    if max_concurrent_requests == 1:
+        while True:
+            connection, _address = listener.accept()
+            with connection:
+                _handle_connection(connection, service)
+        return
+
+    def _run_connection(connection: socket.socket) -> None:
         with connection:
             _handle_connection(connection, service)
+
+    with ThreadPoolExecutor(max_workers=max_concurrent_requests) as executor:
+        while True:
+            connection, _address = listener.accept()
+            executor.submit(_run_connection, connection)
 
 
 def _handle_connection(connection: socket.socket, service: UnixBrokerService) -> None:

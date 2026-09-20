@@ -108,6 +108,13 @@ def main(argv: list[str] | None = None) -> int:
     broker.add_argument("--github-workflow", required=True)
     broker.add_argument("--github-ref", default="main")
     broker.add_argument("--github-token-file")
+    broker.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Maximum in-flight broker requests (default: 1, serial)",
+    )
     broker.set_defaults(command="serve-unix-broker")
 
     args = parser.parse_args(argv)
@@ -169,10 +176,13 @@ def main(argv: list[str] | None = None) -> int:
             backend=backend,
             poll_interval_seconds=args.poll_interval_seconds,
         )
+        if args.max_concurrent_requests < 1:
+            parser.error("--max-concurrent-requests must be at least 1")
         serve_unix_broker(
             socket_path=Path(args.socket_path),
             service=service,
             socket_mode=service.config.socket_mode,
+            max_concurrent_requests=args.max_concurrent_requests,
         )
         return 0
 

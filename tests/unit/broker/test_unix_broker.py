@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import threading
+import time
 from datetime import UTC, datetime
 from hashlib import sha256
 from unittest.mock import patch
@@ -23,7 +24,11 @@ from portable_batch_execution.broker.planning import (
     register_broker_private_run,
 )
 from portable_batch_execution.broker.protocol import BrokerExecuteResponse
-from portable_batch_execution.broker.server import _handle_connection, serve_unix_broker
+from portable_batch_execution.broker.server import (
+    _handle_connection,
+    _serve_accept_loop,
+    serve_unix_broker,
+)
 from portable_batch_execution.broker.service import UnixBrokerService
 from portable_batch_execution.broker.state import (
     BrokerRequestState,
@@ -1036,3 +1041,159 @@ def test_execution_fingerprint_binds_public_sha(tmp_path):
         public_sha="different-sha",
     )
     assert fingerprint != other
+
+
+class _QueuedListener:
+    def __init__(self, connections: list[socket.socket]) -> None:
+        self._connections = list(connections)
+        self.accept_count = 0
+
+    def accept(self) -> tuple[socket.socket, object]:
+        self.accept_count += 1
+        if self._connections:
+            return self._connections.pop(0), None
+        threading.Event().wait()
+        raise RuntimeError("unreachable queued listener wait")
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair required")
+def test_max_concurrent_requests_must_be_positive(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    with pytest.raises(ValueError, match="at least 1"):
+        serve_unix_broker(
+            socket_path=tmp_path / "broker.sock",
+            service=service,
+            max_concurrent_requests=0,
+        )
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair required")
+def test_serve_accept_loop_serial_waits_for_handle_before_next_accept(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    pairs = [socket.socketpair() for _ in range(2)]
+    clients = [pair[0] for pair in pairs]
+    servers = [pair[1] for pair in pairs]
+    for index, client in enumerate(clients):
+        request = _request(request_id=f"req-serial-{index}")
+        client.sendall((json.dumps(request) + "\n").encode())
+
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    handle_calls = 0
+
+    def gated_handle(connection: socket.socket, broker_service: UnixBrokerService) -> None:
+        nonlocal handle_calls
+        handle_calls += 1
+        if handle_calls == 1:
+            entered_first.set()
+            assert release_first.wait(5)
+        _handle_connection(connection, broker_service)
+
+    listener = _QueuedListener(servers)
+
+    def run_loop() -> None:
+        with patch(
+            "portable_batch_execution.broker.server.read_peer_credentials",
+            return_value=(1, _UID, 1),
+        ), patch(
+            "portable_batch_execution.broker.server._handle_connection",
+            side_effect=gated_handle,
+        ):
+            _serve_accept_loop(listener, service, 1)
+
+    loop_thread = threading.Thread(target=run_loop, daemon=True)
+    loop_thread.start()
+    assert entered_first.wait(5)
+    assert listener.accept_count == 1
+    release_first.set()
+    deadline = time.monotonic() + 5
+    while listener.accept_count < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert listener.accept_count == 2
+    for client in clients:
+        client.close()
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair required")
+def test_serve_accept_loop_bounded_concurrency_overlaps_handles(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    pairs = [socket.socketpair() for _ in range(2)]
+    clients = [pair[0] for pair in pairs]
+    servers = [pair[1] for pair in pairs]
+    for index, client in enumerate(clients):
+        request = _request(request_id=f"req-parallel-{index}")
+        client.sendall((json.dumps(request) + "\n").encode())
+
+    overlap_barrier = threading.Barrier(2, timeout=5)
+
+    def gated_handle(connection: socket.socket, broker_service: UnixBrokerService) -> None:
+        overlap_barrier.wait()
+        _handle_connection(connection, broker_service)
+
+    listener = _QueuedListener(servers)
+    loop_error: list[BaseException] = []
+
+    def run_loop() -> None:
+        try:
+            with patch(
+                "portable_batch_execution.broker.server.read_peer_credentials",
+                return_value=(1, _UID, 1),
+            ), patch(
+                "portable_batch_execution.broker.server._handle_connection",
+                side_effect=gated_handle,
+            ):
+                _serve_accept_loop(listener, service, 2)
+        except BaseException as exc:  # pragma: no cover - surfaced in test
+            loop_error.append(exc)
+
+    loop_thread = threading.Thread(target=run_loop, daemon=True)
+    loop_thread.start()
+    overlap_barrier.wait(5)
+    assert listener.accept_count == 2
+    assert not loop_error
+    for client in clients:
+        client.close()
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair required")
+def test_serve_accept_loop_responses_match_request_ids(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    pairs = [socket.socketpair() for _ in range(2)]
+    clients = [pair[0] for pair in pairs]
+    servers = [pair[1] for pair in pairs]
+    request_ids = ("req-resp-a", "req-resp-b")
+    for client, request_id in zip(clients, request_ids, strict=True):
+        request = _request(request_id=request_id)
+        client.sendall((json.dumps(request) + "\n").encode())
+
+    release = threading.Event()
+
+    def gated_handle(connection: socket.socket, broker_service: UnixBrokerService) -> None:
+        release.wait(5)
+        _handle_connection(connection, broker_service)
+
+    listener = _QueuedListener(servers)
+
+    def run_loop() -> None:
+        with patch(
+            "portable_batch_execution.broker.server.read_peer_credentials",
+            return_value=(1, _UID, 1),
+        ), patch(
+            "portable_batch_execution.broker.server._handle_connection",
+            side_effect=gated_handle,
+        ):
+            _serve_accept_loop(listener, service, 2)
+
+    loop_thread = threading.Thread(target=run_loop, daemon=True)
+    loop_thread.start()
+    release.set()
+    responses: list[str] = []
+    for client in clients:
+        payload = json.loads(client.recv(65536).decode())
+        responses.append(payload["request_id"])
+        client.close()
+    assert responses == list(request_ids)
