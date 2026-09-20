@@ -212,9 +212,14 @@ class StructuralCanonicalizeMergeParams(Frozen):
     schema_version: Literal["pbe.replay.structural-canonicalize-merge.v1"]
 
 
+class TradePathScenarioEvaluateJobParams(Frozen):
+    schema_version: Literal["pbe.replay.trade-path-scenario-evaluate-job.v1"]
+
+
 PARAM_MODELS = {
     "replay.structural_canonicalize": StructuralCanonicalizeParams,
     "replay.event_window_extract": EventWindowExtractJobParams,
     "replay.causal_grid_extract": CausalGridExtractJobParams,
     "replay.structural_canonicalize_merge": StructuralCanonicalizeMergeParams,
+    "replay.trade_path_scenario_evaluate": TradePathScenarioEvaluateJobParams,
 }

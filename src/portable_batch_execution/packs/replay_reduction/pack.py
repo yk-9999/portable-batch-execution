@@ -13,6 +13,7 @@ from .canonicalize import (
 from .causal_grid import execute_causal_grid_extract
 from .event_window import execute_event_window_extract
 from .models import PARAM_MODELS
+from .trade_path_scenario_evaluate import execute_trade_path_scenario_evaluate
 
 
 class ReplayReductionPack:
@@ -49,6 +50,14 @@ class ReplayReductionPack:
             if paths is None:
                 raise TypeError("causal grid extract requires parquet_paths")
             return execute_causal_grid_extract(paths, request)
+        if operation == "replay.trade_path_scenario_evaluate":
+            batch = context.get("batch")
+            if batch is None:
+                raise TypeError("trade path scenario evaluate requires batch")
+            encoded_size = context.get("encoded_size")
+            return execute_trade_path_scenario_evaluate(
+                batch, encoded_size=encoded_size
+            )
         raise ValueError(f"unsupported replay operation: {operation}")
 
     def finalize(self, job, canonical_attempts, context):
@@ -72,5 +81,10 @@ class ReplayReductionPack:
             return execute_event_window_extract(paths or [], request or {})
         if operation == "replay.causal_grid_extract":
             return execute_causal_grid_extract(paths or [], request or {})
+        if operation == "replay.trade_path_scenario_evaluate":
+            batch = params or request
+            if batch is None:
+                raise TypeError("trade path scenario evaluate requires batch payload")
+            return execute_trade_path_scenario_evaluate(batch)
         raise ValueError(f"unsupported replay operation: {operation}")
 
