@@ -29,6 +29,7 @@ from portable_batch_execution.broker.server import (
     _serve_accept_loop,
     serve_unix_broker,
 )
+from portable_batch_execution.broker.artifact_reader import build_broker_artifact_reader
 from portable_batch_execution.broker.service import UnixBrokerService
 from portable_batch_execution.broker.state import (
     BrokerRequestState,
@@ -228,6 +229,73 @@ def _replay_trade_path_request(**overrides) -> dict:
     }
     request.update(overrides)
     return request
+
+
+def test_completion_reads_output_via_configured_http_artifact_reader(tmp_path):
+    config = _config(tmp_path)
+    output = b"[{\"id\":1}]"
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(201, json={"workflow_run_id": 1, "html_url": "https://run"})
+        return httpx.Response(
+            200,
+            json={"status": "completed", "conclusion": "success", "updated_at": "t"},
+        )
+
+    service = _service(tmp_path, config, handler)
+    token_path = tmp_path / "artifact-token"
+    token_path.write_text("reader-token", encoding="utf-8")
+    output_ref_holder: dict[str, object] = {}
+
+    def artifact_handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer reader-token"
+        ref = output_ref_holder["ref"]
+        assert request.url.path.endswith(f"/{ref.object_id}/content")
+        return httpx.Response(200, content=output)
+
+    artifact_client = httpx.Client(
+        base_url="http://127.0.0.1:18090",
+        transport=httpx.MockTransport(artifact_handler),
+    )
+    service._artifact_reader = build_broker_artifact_reader(
+        service.controller.data_plane,
+        artifact_read_base_url="http://127.0.0.1:18090",
+        artifact_read_token_file=token_path,
+        client=artifact_client,
+    )
+    real_dispatch = service.controller.dispatch_private_wave
+
+    def dispatch_with_success(run_id, wave_id):
+        ref = real_dispatch(run_id, wave_id)
+        _append_success_attempt(service.controller, "req-http-read", output)
+        attempt = list(service.controller.data_plane.read_attempts(run_id))[-1]
+        output_ref_holder["ref"] = attempt.output_refs[0]
+        digest = attempt.output_refs[0].sha256.removeprefix("sha256:")
+        local_artifact = tmp_path / "artifacts" / digest
+        if local_artifact.exists():
+            local_artifact.unlink()
+        return ref
+
+    original_read = service.controller.data_plane.read
+
+    def guarded_read(ref):
+        held = output_ref_holder.get("ref")
+        if held is not None and ref.object_id == held.object_id:
+            raise FileNotFoundError("local artifact missing")
+        return original_read(ref)
+
+    with (
+        patch.object(service.controller.data_plane, "read", side_effect=guarded_read),
+        patch.object(service.controller, "dispatch_private_wave", dispatch_with_success),
+    ):
+        response = service.handle_payload(_UID, _request(request_id="req-http-read"))
+    assert response.status == "succeeded"
+    assert response.request_id == "req-http-read"
+    assert base64.b64decode(response.output_b64) == output
 
 
 def test_replay_batch_trade_path_service_accepts_closed_request(tmp_path):

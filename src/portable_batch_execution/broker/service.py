@@ -18,6 +18,7 @@ from portable_batch_execution.contracts import ShardAttemptRecord, ShardSpec
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.kernel import completeness, exhausted_shards
 
+from .artifact_reader import BrokerArtifactReader, build_broker_artifact_reader
 from .config import BrokerConfig
 from .planning import (
     broker_allows_operation,
@@ -46,6 +47,7 @@ class UnixBrokerService:
         controller: A1Controller,
         poll_interval_seconds: float = 1.0,
         sleeper: Callable[[float], None] | None = None,
+        artifact_reader: BrokerArtifactReader | None = None,
     ):
         self.state_root = state_root.resolve()
         self.config = config
@@ -53,6 +55,9 @@ class UnixBrokerService:
         self.poll_interval_seconds = poll_interval_seconds
         self._sleep = sleeper or time.sleep
         self._store = BrokerRequestStore(self.state_root / "controller")
+        self._artifact_reader = artifact_reader or build_broker_artifact_reader(
+            controller.data_plane
+        )
 
     def handle_payload(self, peer_uid: int, payload: object) -> BrokerExecuteResponse:
         try:
@@ -307,7 +312,7 @@ class UnixBrokerService:
         if not attempt.output_refs:
             raise ValueError("successful attempt missing output")
         ref = attempt.output_refs[0]
-        payload = self.controller.data_plane.read(ref)
+        payload = self._artifact_reader.read(ref)
         digest = sha256(payload).hexdigest()
         media_type = ref.media_type or "application/octet-stream"
         return payload, media_type, f"sha256:{digest}"
@@ -447,14 +452,22 @@ def build_service_from_environment(
     state_root: Path,
     backend: GitHubActionsBackend | None,
     poll_interval_seconds: float,
+    artifact_read_base_url: str | None = None,
+    artifact_read_token_file: Path | None = None,
 ) -> UnixBrokerService:
     config = BrokerConfig.load(Path(_required_env("PBE_BROKER_CONFIG")))
     controller = A1Controller(state_root, backend=backend)
+    artifact_reader = build_broker_artifact_reader(
+        controller.data_plane,
+        artifact_read_base_url=artifact_read_base_url,
+        artifact_read_token_file=artifact_read_token_file,
+    )
     return UnixBrokerService(
         state_root=state_root,
         config=config,
         controller=controller,
         poll_interval_seconds=poll_interval_seconds,
+        artifact_reader=artifact_reader,
     )
 
 
