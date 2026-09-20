@@ -21,7 +21,7 @@ from portable_batch_execution.controller.a1_controller import job_spec_digest
 from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
 from portable_batch_execution.data_plane.base import RevisionConflictError
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
-from portable_batch_execution.packs import MLPack, TabularPack
+from portable_batch_execution.packs import MLPack, ReplayReductionPack, TabularPack
 
 _BINDING_CONFLICT = "request_binding_conflict"
 
@@ -47,6 +47,8 @@ def canonical_operation_params(pack: str, operation: str, params: dict[str, Any]
         if params:
             raise ValueError("closed operation parameters")
         return {}
+    if pack == "replay-batch":
+        return ReplayReductionPack().validate_params(operation, params)
     raise ValueError("unsupported broker pack")
 
 

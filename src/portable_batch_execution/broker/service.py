@@ -62,7 +62,12 @@ class UnixBrokerService:
                 status="failed",
                 error_code="request_invalid",
             )
-        if request.pack not in {"tabular-batch", "ml-batch", "media-batch"}:
+        if request.pack not in {
+            "tabular-batch",
+            "ml-batch",
+            "media-batch",
+            "replay-batch",
+        }:
             return self._failed(request.request_id, "operation_not_allowed")
         if request.operation not in PACK_OPS[request.pack]:
             return self._failed(request.request_id, "operation_not_allowed")
