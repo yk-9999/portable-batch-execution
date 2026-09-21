@@ -383,6 +383,82 @@ class PairedFillStateTransitionHandling(Frozen):
         return self
 
 
+class PairedFillStateTransitionValueZeroBranch(Frozen):
+    schema_version: Literal["pbe.replay.paired-fill-state-transition-value-zero.v1"]
+    zero_numeric_fields: tuple[str, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_zero_fields(self) -> PairedFillStateTransitionValueZeroBranch:
+        if len(self.zero_numeric_fields) != len(set(self.zero_numeric_fields)):
+            raise ValueError("invalid zero_numeric_fields")
+        if any(not value for value in self.zero_numeric_fields):
+            raise ValueError("invalid zero_numeric_fields")
+        return self
+
+
+class PairedFillStateTransitionOutcomeTerminalOneBranch(Frozen):
+    schema_version: Literal[
+        "pbe.replay.paired-fill-state-transition-value-outcome-terminal-one.v1"
+    ]
+    symbol_column: str = Field(min_length=1)
+    price_column: str = Field(min_length=1)
+    raw_event_px_column: str = Field(min_length=1)
+    notional_column: str = Field(min_length=1)
+    size_column: str = Field(min_length=1)
+    terminal_price: float = 1.0
+
+
+PairedFillStateTransitionValueBranch = Annotated[
+    PairedFillStateTransitionValueZeroBranch
+    | PairedFillStateTransitionOutcomeTerminalOneBranch,
+    Field(discriminator="schema_version"),
+]
+
+
+class PairedFillStateTransitionHandlingV2(Frozen):
+    schema_version: Literal["pbe.replay.paired-fill-state-transition.v2"]
+    marker_exact_match_fields: dict[str, SentinelScalar] = Field(min_length=1)
+    value_branches: tuple[PairedFillStateTransitionValueBranch, ...] = Field(
+        min_length=1
+    )
+    shared_fields: tuple[str, ...] = Field(min_length=1)
+    state_owner_role_value: SentinelScalar
+    protocol_counterparty_role_value: SentinelScalar
+    bypass_row_invariant_columns: tuple[str, ...] = Field(min_length=1)
+    absolute_tolerance: float = Field(default=1e-12, ge=0.0)
+    relative_tolerance: float = Field(default=1e-12, ge=0.0)
+
+    @model_validator(mode="after")
+    def _validate_transition_fields(self) -> PairedFillStateTransitionHandlingV2:
+        if self.state_owner_role_value == self.protocol_counterparty_role_value:
+            raise ValueError("state transition role values must differ")
+        for values, label in (
+            (self.shared_fields, "shared_fields"),
+            (self.bypass_row_invariant_columns, "bypass_row_invariant_columns"),
+        ):
+            if len(values) != len(set(values)) or any(not value for value in values):
+                raise ValueError(f"invalid {label}")
+        if any(not key for key in self.marker_exact_match_fields):
+            raise ValueError("state transition marker field name is empty")
+        zero_fields: set[str] = set()
+        for branch in self.value_branches:
+            if isinstance(branch, PairedFillStateTransitionValueZeroBranch):
+                zero_fields.update(branch.zero_numeric_fields)
+        if zero_fields and not set(self.bypass_row_invariant_columns).issubset(
+            zero_fields
+        ):
+            raise ValueError(
+                "state transition invariant bypass columns must be zero numeric fields"
+            )
+        return self
+
+
+PairedFillStateTransitionSpec = Annotated[
+    PairedFillStateTransitionHandling | PairedFillStateTransitionHandlingV2,
+    Field(discriminator="schema_version"),
+]
+
+
 PAIRED_FILL_MAX_INPUT_FILES = 64
 PAIRED_FILL_MAX_INPUT_BYTES = 1_610_612_736
 PAIRED_FILL_MAX_OUTPUT_ROWS = 12_000_000
@@ -497,6 +573,7 @@ class PairedFillReduceRequest(Frozen):
     schema_version: Literal[
         "pbe.replay.paired-fill-reduce.v1",
         "pbe.replay.paired-fill-reduce.v2",
+        "pbe.replay.paired-fill-reduce.v3",
     ]
     request_id: str
     identity_mapping: PairedFillIdentityMapping
@@ -505,7 +582,7 @@ class PairedFillReduceRequest(Frozen):
     nullable_json_scalar_projections: tuple[NullableJsonScalarProjection, ...] = ()
     row_invariants: tuple[RowInvariant, ...] = ()
     administrative_row_handling: AdministrativeRowHandling | None = None
-    state_transition_handling: PairedFillStateTransitionHandling | None = None
+    state_transition_handling: PairedFillStateTransitionSpec | None = None
     max_input_files: int = Field(
         default=PAIRED_FILL_MAX_INPUT_FILES,
         ge=1,
@@ -552,13 +629,20 @@ class PairedFillReduceRequest(Frozen):
 
     @model_validator(mode="after")
     def _validate_state_transition_version(self) -> PairedFillReduceRequest:
-        if self.state_transition_handling is None:
+        handling = self.state_transition_handling
+        if handling is None:
             if self.schema_version != "pbe.replay.paired-fill-reduce.v1":
                 raise ValueError("paired-fill v2 requires state_transition_handling")
             return self
-        if self.schema_version != "pbe.replay.paired-fill-reduce.v2":
-            raise ValueError("state_transition_handling requires paired-fill v2")
-        return self
+        if self.schema_version == "pbe.replay.paired-fill-reduce.v2":
+            if not isinstance(handling, PairedFillStateTransitionHandling):
+                raise ValueError("paired-fill v2 requires state transition handling v1")
+            return self
+        if self.schema_version == "pbe.replay.paired-fill-reduce.v3":
+            if not isinstance(handling, PairedFillStateTransitionHandlingV2):
+                raise ValueError("paired-fill v3 requires state transition handling v2")
+            return self
+        raise ValueError("state_transition_handling requires paired-fill v2 or v3")
 
 
 PARAM_MODELS = {

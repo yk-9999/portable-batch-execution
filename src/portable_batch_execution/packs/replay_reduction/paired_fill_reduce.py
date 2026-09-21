@@ -21,14 +21,20 @@ from .event_window import _row_is_sentinel, _validate_positive_row
 from .models import (
     PAIRED_FILL_MAX_PAIR_SIZE,
     PairedFillReduceRequest,
+    PairedFillStateTransitionHandling,
+    PairedFillStateTransitionHandlingV2,
+    PairedFillStateTransitionOutcomeTerminalOneBranch,
+    PairedFillStateTransitionValueZeroBranch,
 )
 from .nullable_json_projection import apply_nullable_json_projections_to_lazy
 from .row_invariants import invariant_columns, validate_row_invariants
 
 RESULT_SCHEMA_VERSION = "pbe.replay.paired-fill-reduce-result.v1"
 RESULT_SCHEMA_VERSION_V2 = "pbe.replay.paired-fill-reduce-result.v2"
+RESULT_SCHEMA_VERSION_V3 = "pbe.replay.paired-fill-reduce-result.v3"
 METADATA_SCHEMA_VERSION = "pbe.replay.paired-fill-reduce-metadata.v1"
 METADATA_SCHEMA_VERSION_V2 = "pbe.replay.paired-fill-reduce-metadata.v2"
+METADATA_SCHEMA_VERSION_V3 = "pbe.replay.paired-fill-reduce-metadata.v3"
 CARRY_SCHEMA_VERSION = "pbe.replay.paired-fill-reduce-carry.v1"
 LEDGER_PARQUET_MEDIA_TYPE = "application/vnd.apache.parquet"
 _SOURCE_INPUT_INDEX = "_source_input_index"
@@ -246,6 +252,121 @@ def _numeric_close(left: Any, right: float, *, atol: float, rtol: float) -> bool
     return math.isfinite(value) and math.isclose(value, right, abs_tol=atol, rel_tol=rtol)
 
 
+def _outcome_asset_encoding(symbol: Any) -> int | None:
+    if not isinstance(symbol, str) or not symbol.startswith("#"):
+        return None
+    digits = symbol[1:]
+    if not digits or not digits.isdigit():
+        return None
+    return int(digits)
+
+
+def _row_matches_value_zero_branch(
+    row: dict[str, Any],
+    branch: PairedFillStateTransitionValueZeroBranch,
+    *,
+    atol: float,
+    rtol: float,
+) -> bool:
+    return all(
+        _numeric_close(row.get(field_name), 0.0, atol=atol, rtol=rtol)
+        for field_name in branch.zero_numeric_fields
+    )
+
+
+def _row_matches_outcome_terminal_one_branch(
+    row: dict[str, Any],
+    branch: PairedFillStateTransitionOutcomeTerminalOneBranch,
+    *,
+    atol: float,
+    rtol: float,
+) -> bool:
+    encoding = _outcome_asset_encoding(row.get(branch.symbol_column))
+    if encoding is None or encoding % 10 not in (0, 1):
+        return False
+    if not _numeric_close(
+        row.get(branch.price_column),
+        branch.terminal_price,
+        atol=atol,
+        rtol=rtol,
+    ):
+        return False
+    if not _numeric_close(
+        row.get(branch.raw_event_px_column),
+        branch.terminal_price,
+        atol=atol,
+        rtol=rtol,
+    ):
+        return False
+    try:
+        price = float(row.get(branch.price_column))
+        size = float(row.get(branch.size_column))
+        notional = float(row.get(branch.notional_column))
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in (price, size, notional)):
+        return False
+    return math.isclose(notional, price * size, abs_tol=atol, rel_tol=rtol)
+
+
+def _rows_match_value_branch(
+    rows: list[dict[str, Any]],
+    branch: PairedFillStateTransitionValueZeroBranch
+    | PairedFillStateTransitionOutcomeTerminalOneBranch,
+    *,
+    atol: float,
+    rtol: float,
+) -> bool:
+    if isinstance(branch, PairedFillStateTransitionValueZeroBranch):
+        return all(
+            _row_matches_value_zero_branch(row, branch, atol=atol, rtol=rtol)
+            for row in rows
+        )
+    return all(
+        _row_matches_outcome_terminal_one_branch(row, branch, atol=atol, rtol=rtol)
+        for row in rows
+    )
+
+
+def _rows_match_any_value_branch(
+    rows: list[dict[str, Any]], model: PairedFillReduceRequest
+) -> bool:
+    spec = model.state_transition_handling
+    if not isinstance(spec, PairedFillStateTransitionHandlingV2):
+        return False
+    for branch in spec.value_branches:
+        if _rows_match_value_branch(
+            rows,
+            branch,
+            atol=spec.absolute_tolerance,
+            rtol=spec.relative_tolerance,
+        ):
+            return True
+    return False
+
+
+def _validate_transition_value_constraints(
+    rows: list[dict[str, Any]], model: PairedFillReduceRequest
+) -> None:
+    spec = model.state_transition_handling
+    if isinstance(spec, PairedFillStateTransitionHandling):
+        for row in rows:
+            for field_name in spec.zero_numeric_fields:
+                if not _numeric_close(
+                    row.get(field_name),
+                    0.0,
+                    atol=spec.absolute_tolerance,
+                    rtol=spec.relative_tolerance,
+                ):
+                    raise StructuralCanonicalizeError("state transition zero field invalid")
+        return
+    if isinstance(spec, PairedFillStateTransitionHandlingV2):
+        if not _rows_match_any_value_branch(rows, model):
+            raise StructuralCanonicalizeError("state transition value branch invalid")
+        return
+    raise StructuralCanonicalizeError("state transition handling missing")
+
+
 def _state_transition_ledger_row(
     rows: list[dict[str, Any]],
     *,
@@ -262,15 +383,7 @@ def _state_transition_ledger_row(
     for field_name in spec.shared_fields:
         if rows[0].get(field_name) != rows[1].get(field_name):
             raise StructuralCanonicalizeError("state transition shared fields disagree")
-    for row in rows:
-        for field_name in spec.zero_numeric_fields:
-            if not _numeric_close(
-                row.get(field_name),
-                0.0,
-                atol=spec.absolute_tolerance,
-                rtol=spec.relative_tolerance,
-            ):
-                raise StructuralCanonicalizeError("state transition zero field invalid")
+    _validate_transition_value_constraints(rows, model)
 
     role_column = model.pair_mapping.pair_role_column
     by_role = {row.get(role_column): row for row in rows}
@@ -630,16 +743,28 @@ def _required_columns(model: PairedFillReduceRequest) -> tuple[str, ...]:
     transition = model.state_transition_handling
     transition_columns: tuple[str, ...] = ()
     if transition is not None:
-        transition_columns = tuple(
-            dict.fromkeys(
-                [
-                    *transition.marker_exact_match_fields,
-                    *transition.zero_numeric_fields,
-                    *transition.shared_fields,
-                    *transition.bypass_row_invariant_columns,
-                ]
-            )
-        )
+        extra_fields: list[str] = [
+            *transition.marker_exact_match_fields,
+            *transition.shared_fields,
+            *transition.bypass_row_invariant_columns,
+        ]
+        if isinstance(transition, PairedFillStateTransitionHandling):
+            extra_fields.extend(transition.zero_numeric_fields)
+        elif isinstance(transition, PairedFillStateTransitionHandlingV2):
+            for branch in transition.value_branches:
+                if isinstance(branch, PairedFillStateTransitionValueZeroBranch):
+                    extra_fields.extend(branch.zero_numeric_fields)
+                elif isinstance(branch, PairedFillStateTransitionOutcomeTerminalOneBranch):
+                    extra_fields.extend(
+                        (
+                            branch.symbol_column,
+                            branch.price_column,
+                            branch.raw_event_px_column,
+                            branch.notional_column,
+                            branch.size_column,
+                        )
+                    )
+        transition_columns = tuple(dict.fromkeys(extra_fields))
     return tuple(
         dict.fromkeys(
             [
@@ -770,11 +895,12 @@ def execute_paired_fill_reduce(
         f"sha256:{sha256(ledger_bytes).hexdigest()}" if ledger_bytes else None
     )
 
-    result_schema_version = (
-        RESULT_SCHEMA_VERSION_V2
-        if model.state_transition_handling is not None
-        else RESULT_SCHEMA_VERSION
-    )
+    if model.state_transition_handling is None:
+        result_schema_version = RESULT_SCHEMA_VERSION
+    elif model.schema_version == "pbe.replay.paired-fill-reduce.v3":
+        result_schema_version = RESULT_SCHEMA_VERSION_V3
+    else:
+        result_schema_version = RESULT_SCHEMA_VERSION_V2
     return {
         "schema_version": result_schema_version,
         "summary": summary,
@@ -798,11 +924,13 @@ def build_paired_fill_metadata(
     *,
     ledger_parquet_ref: Any | None,
 ) -> dict[str, Any]:
-    metadata_schema_version = (
-        METADATA_SCHEMA_VERSION_V2
-        if result_payload.get("schema_version") == RESULT_SCHEMA_VERSION_V2
-        else METADATA_SCHEMA_VERSION
-    )
+    result_schema = result_payload.get("schema_version")
+    if result_schema == RESULT_SCHEMA_VERSION_V3:
+        metadata_schema_version = METADATA_SCHEMA_VERSION_V3
+    elif result_schema == RESULT_SCHEMA_VERSION_V2:
+        metadata_schema_version = METADATA_SCHEMA_VERSION_V2
+    else:
+        metadata_schema_version = METADATA_SCHEMA_VERSION
     return {
         "schema_version": metadata_schema_version,
         "result_schema_version": result_payload["schema_version"],
