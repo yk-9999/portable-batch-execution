@@ -113,9 +113,13 @@ def _validate_closed_contracts(payload: Any, run_id: str, wave_id: str) -> tuple
 
 
 def resolve_private_profile(
-    run_id: str, wave_id: str, *, plane=None
+    run_id: str, wave_id: str, *, plane=None, mode: str = "private"
 ) -> RuntimeProfileResolution:
-    """Resolve a private closed wave through the data plane without domain imports."""
+    """Resolve a private closed wave through the data plane without domain imports.
+
+    Resolution consumes A1 control metadata only (``resolve_wave``); it never
+    fetches artifact bytes, in both the ``private`` and ``hf-direct`` modes.
+    """
     from portable_batch_execution.data_plane import HttpPrivateDataPlane
 
     plane = plane or HttpPrivateDataPlane.from_environment()
@@ -123,7 +127,7 @@ def resolve_private_profile(
     job, _wave, _shards = _validate_closed_contracts(payload, run_id, wave_id)
     profile = classify_operation(job.pack, job.operation)
     return RuntimeProfileResolution(
-        mode="private",
+        mode=mode,
         wave_id=wave_id,
         run_id=run_id,
         profile=profile,
@@ -218,24 +222,26 @@ def resolve_profile(
     repository_root: Path | None = None,
     plane=None,
 ) -> RuntimeProfileResolution:
-    if mode == "private":
+    if mode in ("private", "hf-direct"):
         if not run_id:
-            raise RuntimeProfileError("private mode requires a run identifier")
-        return resolve_private_profile(run_id, wave_id, plane=plane)
+            raise RuntimeProfileError(f"{mode} mode requires a run identifier")
+        return resolve_private_profile(run_id, wave_id, plane=plane, mode=mode)
     if mode == "public":
         return resolve_public_profile(wave_id, repository_root=repository_root)
-    raise RuntimeProfileError("mode must be public or private")
+    raise RuntimeProfileError("mode must be public, private, or hf-direct")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Resolve one closed wave's runtime profile.")
     parser.add_argument("--wave-id", required=True)
     parser.add_argument("--run-id")
-    parser.add_argument("--mode", choices=("public", "private"), default="public")
+    parser.add_argument(
+        "--mode", choices=("public", "private", "hf-direct"), default="public"
+    )
     parser.add_argument("--json", action="store_true", help="Emit a JSON resolution object")
     args = parser.parse_args(argv)
-    if args.mode == "private" and not args.run_id:
-        parser.error("--mode private requires --run-id")
+    if args.mode in ("private", "hf-direct") and not args.run_id:
+        parser.error(f"--mode {args.mode} requires --run-id")
     try:
         resolution = resolve_profile(
             args.wave_id,

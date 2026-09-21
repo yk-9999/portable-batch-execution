@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       run_id:
-        description: Opaque private run identifier (private mode only)
+        description: Opaque private run identifier (private/hf-direct mode only)
         required: false
         type: string
       private:
@@ -16,6 +16,24 @@ on:
         required: false
         default: false
         type: boolean
+      hf_direct:
+        description: Private mode with artifact payloads routed directly to the HF bucket
+        required: false
+        default: false
+        type: boolean
+      hf_bucket:
+        description: HF bucket identity for hf-direct mode (bounded owner/name metadata)
+        required: false
+        type: string
+      hf_prefix:
+        description: HF object prefix for hf-direct mode (bounded relative path metadata)
+        required: false
+        type: string
+      hf_object_layout:
+        description: HF object layout version for hf-direct mode
+        required: false
+        default: sha256-flat.v1
+        type: string
 
 permissions:
   contents: read
@@ -26,9 +44,13 @@ jobs:
     env:
       PBE_WAVE_ID: ${{ inputs.wave_id }}
       PBE_RUN_ID: ${{ inputs.run_id }}
-      PBE_MODE: ${{ inputs.private && 'private' || 'public' }}
-      PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}
-      PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}
+      PBE_MODE: ${{ inputs.hf_direct && 'hf-direct' || (inputs.private && 'private' || 'public') }}
+      PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ (inputs.private || inputs.hf_direct) && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}
+      PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ (inputs.private || inputs.hf_direct) && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}
+      PBE_HF_BUCKET: ${{ inputs.hf_direct && inputs.hf_bucket || '' }}
+      PBE_HF_PREFIX: ${{ inputs.hf_direct && inputs.hf_prefix || '' }}
+      PBE_HF_OBJECT_LAYOUT: ${{ inputs.hf_direct && inputs.hf_object_layout || '' }}
+      HF_SYSTEM_TRADING_DATA_RW_TOKEN: ${{ inputs.hf_direct && secrets.HF_SYSTEM_TRADING_DATA_RW_TOKEN || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -37,10 +59,15 @@ jobs:
       - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
       - name: Install base dependencies only
         run: uv sync --no-dev
+      - name: Install pinned Hugging Face CLI
+        if: env.PBE_MODE == 'hf-direct'
+        run: uv tool install "huggingface_hub[cli]==1.8.0"
       - name: Resolve runtime profile
         id: profile
         run: |
-          if [ "$PBE_MODE" = "private" ]; then
+          if [ "$PBE_MODE" = "hf-direct" ]; then
+            PROFILE="$(uv run --no-sync python -m portable_batch_execution.worker.runtime_profile --wave-id "$PBE_WAVE_ID" --run-id "$PBE_RUN_ID" --mode hf-direct)"
+          elif [ "$PBE_MODE" = "private" ]; then
             PROFILE="$(uv run --no-sync python -m portable_batch_execution.worker.runtime_profile --wave-id "$PBE_WAVE_ID" --run-id "$PBE_RUN_ID" --mode private)"
           else
             PROFILE="$(uv run --no-sync python -m portable_batch_execution.worker.runtime_profile --wave-id "$PBE_WAVE_ID" --mode public)"

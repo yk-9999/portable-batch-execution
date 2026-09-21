@@ -269,13 +269,30 @@ def execute_public_wave(
         return tuple(attempts)
 
 
+def resolve_private_plane(mode: str):
+    """Build the private data plane for one closed execute-wave mode.
+
+    ``private`` keeps the original A1 data plane for both control metadata and
+    artifacts.  ``hf-direct`` composes A1 control metadata with a generic HF
+    bucket artifact store, so artifact bytes never touch A1 ``/v1/artifacts``.
+    """
+    from portable_batch_execution.data_plane import (
+        HfDirectDataPlane,
+        HttpPrivateDataPlane,
+    )
+
+    if mode == "private":
+        return HttpPrivateDataPlane.from_environment()
+    if mode == "hf-direct":
+        return HfDirectDataPlane.from_environment()
+    raise ValueError("private plane mode must be private or hf-direct")
+
+
 def execute_private_wave(
-    run_id: str, wave_id: str, *, plane=None
+    run_id: str, wave_id: str, *, plane=None, mode: str = "private"
 ) -> tuple[ShardAttemptRecord, ...]:
     """Execute an externally resolved closed tabular wave through the private plane."""
-    from portable_batch_execution.data_plane import HttpPrivateDataPlane
-
-    plane = plane or HttpPrivateDataPlane.from_environment()
+    plane = plane or resolve_private_plane(mode)
     payload = plane.resolve_wave(run_id, wave_id)
     try:
         job = JobSpec.model_validate(payload["job"])
@@ -582,14 +599,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Execute one approved wave.")
     parser.add_argument("--wave-id", required=True)
     parser.add_argument("--run-id")
-    parser.add_argument("--mode", choices=("public", "private"), default="public")
+    parser.add_argument(
+        "--mode", choices=("public", "private", "hf-direct"), default="public"
+    )
     args = parser.parse_args(argv)
-    if args.mode == "private" and not args.run_id:
-        parser.error("--mode private requires --run-id")
+    if args.mode in ("private", "hf-direct") and not args.run_id:
+        parser.error(f"--mode {args.mode} requires --run-id")
     try:
         attempts = (
-            execute_private_wave(args.run_id, args.wave_id)
-            if args.mode == "private"
+            execute_private_wave(args.run_id, args.wave_id, mode=args.mode)
+            if args.mode in ("private", "hf-direct")
             else execute_public_wave(args.wave_id)
         )
     except PrivateWaveExecutionError as exc:

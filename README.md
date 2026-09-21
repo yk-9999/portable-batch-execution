@@ -64,3 +64,35 @@ The kernel exposes `exhausted_shards` for current unsuccessful attempts that
 reach the configured per-shard budget (the initial attempt counts). Project
 controllers may use that state to choose their own fallback; fallback
 implementations and private project logic remain outside this repository.
+
+### HF-direct artifact mode
+
+Trusted `workflow_dispatch` may also select `hf_direct` together with the
+bounded HF store identity metadata `hf_bucket`, `hf_prefix`, and
+`hf_object_layout` (`sha256-flat.v1`). In this mode the A1 controller remains the
+control plane for closed-wave resolution, attempt/status metadata, and
+orchestration, while artifact payload bytes move directly between the GitHub
+Actions worker and the private HF bucket:
+
+- `HfDirectDataPlane` delegates control methods (`resolve_wave`,
+  `read_attempts`, `append_attempt`, manifest/status) to the A1 client and all
+  artifact methods (`read`/`write`/`exists`/`verify`) to
+  `HfBucketArtifactStore`; no artifact request is sent to `/v1/artifacts`.
+- `sha256-flat.v1` maps `object_id` (lowercase SHA-256 hex) to
+  `<prefix>/objects/sha256/<object_id>`. The identity is validated fail-closed
+  against unsafe or out-of-scope bucket/prefix values before any remote call.
+- Reads derive the object solely from the closed identity plus `ref.object_id`,
+  download it directly, then verify the expected SHA-256 and exact size before
+  returning bytes. Writes content-address the bytes, idempotently reuse an
+  existing exact-size object, otherwise upload directly and re-check
+  persistence, returning an `ArtifactRef` with an `hf://buckets/...` reference.
+- The HF token is read only from the `HF_SYSTEM_TRADING_DATA_RW_TOKEN`
+  environment variable injected by the workflow from the fixed repository
+  secret. It is never placed on argv, in logs, in returned metadata, or in a
+  persisted file. The pinned `hf` CLI (exact version `1.8.0`) is installed only
+  for HF-direct jobs.
+- Runtime-profile resolution still consumes A1 control metadata only
+  (`resolve_wave`) and never fetches artifact bytes.
+
+The existing A1 artifact mode (`private`) and public synthetic mode remain
+unchanged for unrelated callers.
