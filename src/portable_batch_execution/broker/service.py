@@ -21,17 +21,14 @@ from portable_batch_execution.kernel import completeness, exhausted_shards
 from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate_fixed_set import (
     FIXED_SET_OPERATION,
 )
-from portable_batch_execution.transport.hf_bucket import (
-    artifact_ref_to_hf_bucket_ref,
-    validate_hf_bucket_ref,
-)
-from portable_batch_execution.worker.hf_direct import artifact_ref_is_hf_bucket
+from portable_batch_execution.transport.hf_bucket import validate_hf_bucket_ref
 
 from .artifact_reader import BrokerArtifactReader, build_broker_artifact_reader
 from .config import BrokerConfig
 from .hf_direct import (
     BrokerHfDirectExecuteRequest,
     BrokerHfDirectExecuteResponse,
+    hf_direct_wave_input_digest,
     parse_hf_direct_request,
     reject_legacy_byte_fields,
 )
@@ -42,7 +39,6 @@ from .planning import (
     canonical_operation_params,
     opaque_run_id,
     opaque_wave_id,
-    register_broker_hf_direct_run,
     register_broker_private_run,
     validate_registered_wave_binding,
 )
@@ -50,6 +46,7 @@ from .protocol import BrokerExecuteRequest, BrokerExecuteResponse, parse_request
 from .state import BrokerRequestState, BrokerRequestStore, RequestBinding
 
 _TERMINAL_FAILURE_STATUSES = frozenset({"failed", "cancelled"})
+_HF_DIRECT_MAX_DISPATCHES = 4
 _BrokerResponse = Union[BrokerExecuteResponse, BrokerHfDirectExecuteResponse]
 
 
@@ -171,11 +168,15 @@ class UnixBrokerService:
             )
         except ValueError:
             return self._failed_hf(request.request_id, "operation_params_invalid")
-        validated_ref = validate_hf_bucket_ref(request.input_hf_ref)
-        input_bytes = json.dumps(
-            validated_ref, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        input_digest = broker_shard_input_digest(input_bytes)
+        validated_ref = validate_hf_bucket_ref(request.wave_descriptor_hf_ref)
+        input_digest = hf_direct_wave_input_digest(
+            wave_descriptor_hf_ref=validated_ref,
+            result_manifest_object_path=request.result_manifest_object_path,
+            logical_run_id=request.logical_run_id,
+            wave_id=request.wave_id,
+            public_revision=request.public_revision,
+            shard_count=request.shard_count,
+        )
         binding = RequestBinding(
             input_digest=input_digest,
             pack=request.pack,
@@ -193,55 +194,97 @@ class UnixBrokerService:
         )
         state = self._store.load(request.request_id)
         if state is None:
-            run_id = opaque_run_id(request.request_id)
-            wave_id = opaque_wave_id(request.request_id)
-            try:
-                self.controller.registry.resolve_wave(run_id, wave_id)
-            except KeyError:
-                try:
-                    state = self._register_hf_direct_request(request, binding)
-                except ValueError:
-                    return self._failed_hf(request.request_id, "broker_internal_error")
-            else:
-                try:
-                    state = self.recover_request_state(request.request_id, binding)
-                except ValueError as exc:
-                    if str(exc) == "request_binding_conflict":
-                        return self._failed_hf(request.request_id, "request_id_conflict")
-                    raise
+            state = BrokerRequestState(
+                request_id=request.request_id,
+                binding=binding,
+                logical_run_id=request.logical_run_id,
+                wave_id=request.wave_id,
+                shard_id="wave",
+                status="active",
+                result_manifest_object_path=request.result_manifest_object_path,
+                wave_descriptor_hf_ref=dict(validated_ref),
+            )
+            self._store.save(state)
         elif not state.binding.matches(binding):
             return self._failed_hf(request.request_id, "request_id_conflict")
         if state.status == "succeeded":
-            return self._success_from_state(state, hf_direct=True)
+            return self._success_hf_wave(state)
         if state.status == "exhausted":
             return self._exhausted(state, hf_direct=True)
-        return self._drive_to_terminal(request.request_id, state, hf_direct=True)
+        return self._drive_hf_wave_to_terminal(request.request_id, state)
 
-    def _register_hf_direct_request(
-        self,
-        request: BrokerHfDirectExecuteRequest,
-        binding: RequestBinding,
-    ) -> BrokerRequestState:
-        _, wave, shard, _ = register_broker_hf_direct_run(
-            state_root=self.state_root,
-            request_id=request.request_id,
-            pack=request.pack,
-            operation=request.operation,
-            operation_params=binding.operation_params,
-            input_hf_ref=dict(request.input_hf_ref),
-            input_media_type=request.input_media_type,
-            public_sha=self.config.public_sha,
+    def _drive_hf_wave_to_terminal(
+        self, request_id: str, state: BrokerRequestState
+    ) -> BrokerHfDirectExecuteResponse:
+        if self.controller.backend is None:
+            return self._failed_hf(request_id, "backend_unavailable")
+        if state.wave_descriptor_hf_ref is None or state.result_manifest_object_path is None:
+            return self._failed_hf(request_id, "broker_internal_error")
+        self._sync_hf_dispatch_from_controller(state)
+        while True:
+            backend_status = self._backend_status(state)
+            if state.status == "succeeded":
+                return self._success_hf_wave(state)
+            if backend_status == "running":
+                self._sleep(self.poll_interval_seconds)
+                continue
+            if backend_status == "succeeded":
+                state.status = "succeeded"
+                self._store.save(state)
+                return self._success_hf_wave(state)
+            backend_terminal = backend_status in _TERMINAL_FAILURE_STATUSES | {"succeeded"}
+            if state.dispatch_count >= _HF_DIRECT_MAX_DISPATCHES and backend_terminal:
+                state.status = "exhausted"
+                self._store.save(state)
+                return self._exhausted(state, hf_direct=True)
+            should_dispatch = state.dispatch_count == 0 or (
+                state.dispatch_count < _HF_DIRECT_MAX_DISPATCHES
+                and backend_status in {"failed", "cancelled", None}
+            )
+            if not should_dispatch:
+                self._sleep(self.poll_interval_seconds)
+                continue
+            try:
+                execution = self.controller.dispatch_hf_direct_wave(
+                    state.logical_run_id,
+                    state.wave_id,
+                    state.wave_descriptor_hf_ref,
+                    result_manifest_object_path=state.result_manifest_object_path,
+                )
+            except GitHubActionsAPIError:
+                return self._failed_hf(request_id, "backend_transient")
+            except ValueError:
+                return self._failed_hf(request_id, "dispatch_failed")
+            state.execution_id = execution.execution_id
+            state.dispatch_count += 1
+            self._store.save(state)
+            self._sleep(self.poll_interval_seconds)
+
+    def _sync_hf_dispatch_from_controller(self, state: BrokerRequestState) -> None:
+        history = self.controller.read_wave_dispatch_history(
+            state.logical_run_id, state.wave_id
         )
-        state = BrokerRequestState(
-            request_id=request.request_id,
-            binding=binding,
-            logical_run_id=wave.logical_run_id,
-            wave_id=wave.wave_id,
-            shard_id=shard.shard_id,
-            status="active",
-        )
+        if not history:
+            return
+        recorded_count = len(history)
+        if recorded_count <= state.dispatch_count:
+            return
+        state.dispatch_count = recorded_count
+        state.execution_id = history[-1]["execution_id"]
         self._store.save(state)
-        return state
+
+    def _success_hf_wave(self, state: BrokerRequestState) -> BrokerHfDirectExecuteResponse:
+        manifest_path = (state.result_manifest_object_path or "").lstrip("/")
+        return BrokerHfDirectExecuteResponse(
+            request_id=state.request_id,
+            status="succeeded",
+            logical_run_id=state.logical_run_id,
+            wave_id=state.wave_id,
+            execution_id=state.execution_id,
+            input_digest=state.binding.input_digest,
+            execution_fingerprint=state.binding.execution_fingerprint,
+            result_manifest_object_path=manifest_path,
+        )
 
     def _register_request(
         self,
@@ -437,16 +480,6 @@ class UnixBrokerService:
         media_type = ref.media_type or "application/octet-stream"
         return payload, media_type, f"sha256:{digest}"
 
-    def _hf_output_metadata(
-        self, attempt: ShardAttemptRecord
-    ) -> tuple[dict[str, object], str]:
-        if not attempt.output_refs:
-            raise ValueError("successful attempt missing output")
-        ref = attempt.output_refs[0]
-        if not artifact_ref_is_hf_bucket(ref):
-            raise ValueError("hf-direct output must be an HF bucket artifact ref")
-        return artifact_ref_to_hf_bucket_ref(ref), ref.media_type or "application/json"
-
     def _success_from_attempt(
         self,
         state: BrokerRequestState,
@@ -455,20 +488,7 @@ class UnixBrokerService:
         hf_direct: bool,
     ) -> _BrokerResponse:
         if hf_direct:
-            output_hf_ref, media_type = self._hf_output_metadata(attempt)
-            state.output_media_type = media_type
-            self._store.save(state)
-            return BrokerHfDirectExecuteResponse(
-                request_id=state.request_id,
-                status="succeeded",
-                logical_run_id=state.logical_run_id,
-                wave_id=state.wave_id,
-                execution_id=state.execution_id,
-                input_digest=state.binding.input_digest,
-                execution_fingerprint=state.binding.execution_fingerprint,
-                output_media_type=media_type,
-                output_hf_ref=output_hf_ref,
-            )
+            return self._success_hf_wave(state)
         output_bytes, media_type, digest = self._read_attempt_output(attempt)
         state.output_sha256 = digest
         state.output_media_type = media_type

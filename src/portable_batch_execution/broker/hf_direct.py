@@ -1,8 +1,9 @@
-"""HF-direct Unix broker request/response (metadata-only artifact refs)."""
+"""HF-direct Unix broker request/response (wave-level metadata-only artifact refs)."""
 
 from __future__ import annotations
 
 import json
+import re
 from hashlib import sha256
 from typing import Any, Literal
 
@@ -14,6 +15,7 @@ from portable_batch_execution.transport.hf_bucket import validate_hf_bucket_ref
 
 _HF_DIRECT_REQUEST_SCHEMA = "pbe.a1-unix-broker.hf-direct-request.v1"
 _HF_DIRECT_RESPONSE_SCHEMA = "pbe.a1-unix-broker.hf-direct-response.v1"
+_FORBIDDEN_BYTE_KEYS = frozenset({"input_b64", "output_b64", "result_b64"})
 
 
 class BrokerHfDirectExecuteRequest(_StrictModel):
@@ -24,20 +26,40 @@ class BrokerHfDirectExecuteRequest(_StrictModel):
     pack: Literal["replay-batch"]
     operation: Literal["replay.trade_path_scenario_evaluate_fixed_set"]
     operation_params: dict[str, Any] = Field(default_factory=dict)
-    input_media_type: str
-    input_hf_ref: dict[str, Any]
+    logical_run_id: str
+    wave_id: str
+    public_revision: str
+    wave_descriptor_hf_ref: dict[str, Any]
+    result_manifest_object_path: str
+    shard_count: int = Field(ge=1, le=16)
+    max_parallel: int = Field(ge=1, le=16)
 
     @field_validator("request_id")
     @classmethod
     def validate_request_id(cls, value: str) -> str:
         return opaque_request_id(value)
 
-    @field_validator("input_media_type")
+    @field_validator("logical_run_id", "wave_id")
     @classmethod
-    def validate_media_type(cls, value: str) -> str:
-        if not value or len(value) > 128 or "/" not in value:
-            raise ValueError("input_media_type must be a media type")
+    def validate_opaque_identity(cls, value: str) -> str:
+        if not value or len(value) > 128 or any(c in value for c in "/\\?#"):
+            raise ValueError("identity must be opaque")
         return value
+
+    @field_validator("public_revision")
+    @classmethod
+    def validate_public_revision(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{40}", value):
+            raise ValueError("public_revision must be a git commit sha")
+        return value
+
+    @field_validator("result_manifest_object_path")
+    @classmethod
+    def validate_manifest_path(cls, value: str) -> str:
+        normalized = value.lstrip("/")
+        if not normalized or ".." in normalized.split("/"):
+            raise ValueError("invalid result manifest object path")
+        return normalized
 
     @field_validator("operation_params")
     @classmethod
@@ -45,9 +67,9 @@ class BrokerHfDirectExecuteRequest(_StrictModel):
         _walk_forbidden(value)
         return value
 
-    @field_validator("input_hf_ref")
+    @field_validator("wave_descriptor_hf_ref")
     @classmethod
-    def validate_input_hf_ref(cls, value: dict[str, Any]) -> dict[str, Any]:
+    def validate_wave_descriptor_hf_ref(cls, value: dict[str, Any]) -> dict[str, Any]:
         return validate_hf_bucket_ref(value)
 
 
@@ -63,8 +85,8 @@ class BrokerHfDirectExecuteResponse(_StrictModel):
     execution_id: str | None = None
     input_digest: str | None = None
     execution_fingerprint: str | None = None
-    output_media_type: str | None = None
-    output_hf_ref: dict[str, Any] | None = None
+    result_manifest_object_path: str | None = None
+    result_manifest_hf_ref: dict[str, Any] | None = None
 
 
 def parse_hf_direct_request(payload: object) -> BrokerHfDirectExecuteRequest:
@@ -72,8 +94,11 @@ def parse_hf_direct_request(payload: object) -> BrokerHfDirectExecuteRequest:
         raise TypeError("request must be a JSON object")
     if payload.get("schema_version") != _HF_DIRECT_REQUEST_SCHEMA:
         raise TypeError("not an HF-direct broker request")
-    if "input_b64" in payload or "output_b64" in payload:
-        raise ValueError("byte/base64 broker fields are forbidden in HF-direct mode")
+    for key in _FORBIDDEN_BYTE_KEYS:
+        if key in payload:
+            raise ValueError(f"{key} forbidden in HF-direct mode")
+    if "input_hf_ref" in payload or "artifact_url" in payload:
+        raise ValueError("legacy per-batch HF-direct fields are forbidden")
     return BrokerHfDirectExecuteRequest.model_validate(payload)
 
 
@@ -83,7 +108,7 @@ def reject_legacy_byte_fields(payload: object) -> None:
     if payload.get("transport_profile") == "hf_bucket_direct" or payload.get(
         "schema_version"
     ) in {_HF_DIRECT_REQUEST_SCHEMA, _HF_DIRECT_RESPONSE_SCHEMA}:
-        for key in ("input_b64", "result_b64", "output_b64"):
+        for key in _FORBIDDEN_BYTE_KEYS.union({"input_hf_ref", "artifact_url"}):
             if key in payload:
                 raise ValueError(f"{key} forbidden in HF-direct mode")
 
@@ -92,7 +117,25 @@ def hf_direct_response_to_json(response: BrokerHfDirectExecuteResponse) -> bytes
     return (response.model_dump_json(exclude_none=True) + "\n").encode("utf-8")
 
 
-def hf_direct_input_digest(input_hf_ref: dict[str, Any]) -> str:
-    validated = validate_hf_bucket_ref(input_hf_ref)
-    material = json.dumps(validated, sort_keys=True, separators=(",", ":"))
+def hf_direct_wave_input_digest(
+    *,
+    wave_descriptor_hf_ref: dict[str, Any],
+    result_manifest_object_path: str,
+    logical_run_id: str,
+    wave_id: str,
+    public_revision: str,
+    shard_count: int,
+) -> str:
+    material = json.dumps(
+        {
+            "wave_descriptor_hf_ref": validate_hf_bucket_ref(wave_descriptor_hf_ref),
+            "result_manifest_object_path": result_manifest_object_path.lstrip("/"),
+            "logical_run_id": logical_run_id,
+            "wave_id": wave_id,
+            "public_revision": public_revision,
+            "shard_count": shard_count,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return sha256(material.encode("utf-8")).hexdigest()

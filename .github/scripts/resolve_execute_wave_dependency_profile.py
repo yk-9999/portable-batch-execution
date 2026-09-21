@@ -45,6 +45,8 @@ def resolve_profile(
     bearer_token: str,
     urlopen: Callable[..., Any] = _default_urlopen,
 ) -> str:
+    if mode == "hf-direct":
+        return _REPLAY_PROFILE
     if mode != "private":
         return _FALLBACK_PROFILE
     if not run_id or not wave_id:

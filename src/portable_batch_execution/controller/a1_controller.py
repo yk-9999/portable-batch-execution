@@ -283,6 +283,32 @@ class A1Controller:
         self._write_dispatch_state(run_id, state)
         return recorded
 
+    def dispatch_hf_direct_wave(
+        self,
+        run_id: str,
+        wave_id: str,
+        wave_descriptor_hf_ref: dict,
+        *,
+        result_manifest_object_path: str,
+    ) -> BackendExecutionRef:
+        if self.backend is None:
+            raise ValueError("GitHub backend is not configured")
+        submit = getattr(self.backend, "submit_hf_direct_wave", None)
+        if submit is None:
+            raise ValueError("GitHub backend does not support HF-direct dispatch")
+        run_id = opaque_identifier(run_id, "run_id")
+        wave_id = opaque_identifier(wave_id, "wave_id")
+        execution = submit(
+            run_id=run_id,
+            wave_id=wave_id,
+            wave_descriptor_hf_ref=wave_descriptor_hf_ref,
+            result_manifest_object_path=result_manifest_object_path,
+        )
+        state = self._read_dispatch_state(run_id)
+        recorded = self._record_wave_dispatch(state, wave_id, execution)
+        self._write_dispatch_state(run_id, state)
+        return recorded
+
     def inspect_run(self, run_id: str) -> dict:
         run_id = opaque_identifier(run_id, "run_id")
         manifest = self.data_plane.read_manifest(run_id)

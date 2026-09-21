@@ -184,7 +184,29 @@ class HfBucketTransport:
 
         def attempt() -> dict[str, Any]:
             if self._storage.remote_exists(normalized):
-                raise HfBucketTransportError("refusing overwrite of existing bucket object")
+                existing = self.read_verified(
+                    {
+                        "schema_version": HF_BUCKET_REF_SCHEMA,
+                        "bucket_id": HF_BUCKET_ID,
+                        "object_path": normalized,
+                        "sha256": digest,
+                        "size_bytes": size_bytes,
+                        "media_type": media_type,
+                    }
+                )
+                verify_bytes_identity(
+                    existing, sha256_hex=digest, size_bytes=size_bytes
+                )
+                return validate_hf_bucket_ref(
+                    {
+                        "schema_version": HF_BUCKET_REF_SCHEMA,
+                        "bucket_id": HF_BUCKET_ID,
+                        "object_path": normalized,
+                        "sha256": digest,
+                        "size_bytes": size_bytes,
+                        "media_type": media_type,
+                    }
+                )
             tmp = Path(os.environ.get("TMPDIR", "/tmp")) / f"pbe-hf-upload-{digest}.bin"
             tmp.parent.mkdir(parents=True, exist_ok=True)
             try:

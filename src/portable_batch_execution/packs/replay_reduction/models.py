@@ -219,17 +219,7 @@ class TradePathScenarioEvaluateJobParams(Frozen):
 class TradePathScenarioEvaluateFixedSetJobParams(Frozen):
     schema_version: Literal["pbe.replay.trade-path-scenario-evaluate-fixed-set-job.v1"]
     transport_profile: Literal["hf_bucket_direct"] = "hf_bucket_direct"
-    output_object_path: str = ""
-
-    @field_validator("output_object_path")
-    @classmethod
-    def _validate_output_path(cls, value: str) -> str:
-        if not value:
-            return value
-        normalized = value.lstrip("/")
-        if ".." in normalized.split("/"):
-            raise ValueError("output_object_path invalid")
-        return normalized
+    bucket_prefix: str | None = None
 
 
 PARAM_MODELS = {

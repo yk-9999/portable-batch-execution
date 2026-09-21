@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
@@ -96,6 +97,30 @@ class GitHubActionsBackend:
             raise GitHubActionsAPIError(operation, response)
         return response
 
+    def submit_hf_direct_wave(
+        self,
+        *,
+        run_id: str,
+        wave_id: str,
+        wave_descriptor_hf_ref: dict[str, Any],
+        result_manifest_object_path: str,
+    ) -> BackendExecutionRef:
+        _opaque_identifier(run_id, "run_id")
+        _opaque_identifier(wave_id, "wave_id")
+        inputs = {
+            "wave_id": wave_id,
+            "run_id": run_id,
+            "jpx_hf_direct": True,
+            "private": False,
+            "hf_wave_descriptor_ref": json.dumps(
+                wave_descriptor_hf_ref, sort_keys=True, separators=(",", ":")
+            ),
+            "hf_wave_result_manifest_object_path": result_manifest_object_path.lstrip(
+                "/"
+            ),
+        }
+        return self._dispatch_workflow(inputs)
+
     def submit_wave(self, request: WaveSubmission) -> BackendExecutionRef:
         if self.private_data_plane:
             _opaque_identifier(request.wave.logical_run_id, "run_id")
@@ -107,6 +132,9 @@ class GitHubActionsBackend:
             }
         else:
             inputs = {"wave_id": request.wave.wave_id}
+        return self._dispatch_workflow(inputs)
+
+    def _dispatch_workflow(self, inputs: dict[str, Any]) -> BackendExecutionRef:
         response = self._request(
             "submit wave",
             "POST",

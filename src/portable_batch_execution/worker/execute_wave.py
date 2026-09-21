@@ -693,42 +693,7 @@ def execute_private_wave(
                             ) from None
                         output_rows = len(result_payload["rows"])
                 elif job.operation == FIXED_SET_OPERATION:
-                    from portable_batch_execution.transport.hf_bucket import (
-                        HfBucketTransport,
-                        build_hf_api_storage_from_token,
-                    )
-                    from portable_batch_execution.worker.hf_direct import (
-                        assert_no_private_data_plane_dependency,
-                        execute_hf_direct_trade_path_fixed_set_shard,
-                        jpx_hf_direct_enabled,
-                    )
-
-                    if not jpx_hf_direct_enabled():
-                        raise _ShardStageFailure("hf_direct_required")
-                    assert_no_private_data_plane_dependency()
-                    if len(shard.input_refs) != 1:
-                        raise _ShardStageFailure("input_artifact_invalid")
-                    batch_ref = shard.input_refs[0]
-                    configured_output_path = str(
-                        job.operation_params.get("output_object_path") or ""
-                    )
-                    token = HfBucketTransport.token_from_environment()
-                    transport = HfBucketTransport(
-                        build_hf_api_storage_from_token(token)
-                    )
-                    out_ref, summary = execute_hf_direct_trade_path_fixed_set_shard(
-                        transport=transport,
-                        replay_pack=replay_pack,
-                        job=job,
-                        shard=shard,
-                        input_ref=batch_ref,
-                        output_object_path=configured_output_path,
-                    )
-                    input_rows = int(summary.get("record_count") or 0)
-                    output_rows = input_rows
-                    output_refs = (out_ref,)
-                    output_digest_value = out_ref.sha256.removeprefix("sha256:")
-                    publish_single_output = False
+                    raise _ShardStageFailure("hf_direct_required")
                 elif job.operation == "replay.trade_path_scenario_evaluate":
                     if len(shard.input_refs) != 1:
                         raise _ShardStageFailure("input_artifact_invalid")
@@ -948,15 +913,38 @@ def execute_private_wave(
         raise PrivateWaveExecutionError(tuple(attempts))
     return tuple(attempts)
 
+def execute_hf_direct_wave_entry() -> dict[str, object]:
+    from portable_batch_execution.worker.hf_direct_wave import (
+        execute_hf_direct_wave,
+        expected_manifest_path_from_environment,
+        wave_descriptor_ref_from_environment,
+    )
+
+    return execute_hf_direct_wave(
+        wave_descriptor_ref=wave_descriptor_ref_from_environment(),
+        expected_manifest_path=expected_manifest_path_from_environment(),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Execute one approved wave.")
     parser.add_argument("--wave-id", required=True)
     parser.add_argument("--run-id")
-    parser.add_argument("--mode", choices=("public", "private"), default="public")
+    parser.add_argument(
+        "--mode",
+        choices=("public", "private", "hf-direct"),
+        default="public",
+    )
     args = parser.parse_args(argv)
     if args.mode == "private" and not args.run_id:
         parser.error("--mode private requires --run-id")
+    if args.mode == "hf-direct" and not args.run_id:
+        parser.error("--mode hf-direct requires --run-id")
     try:
+        if args.mode == "hf-direct":
+            summary = execute_hf_direct_wave_entry()
+            print(json.dumps({"wave_id": args.wave_id, "hf_direct": summary}))
+            return 0
         attempts = (
             execute_private_wave(args.run_id, args.wave_id)
             if args.mode == "private"

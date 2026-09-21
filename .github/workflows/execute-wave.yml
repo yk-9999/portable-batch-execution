@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       run_id:
-        description: Opaque private run identifier (private mode only)
+        description: Opaque private run identifier (private / HF-direct modes)
         required: false
         type: string
       private:
@@ -21,6 +21,14 @@ on:
         required: false
         default: false
         type: boolean
+      hf_wave_descriptor_ref:
+        description: HF Bucket ref JSON for the wave descriptor (HF-direct only)
+        required: false
+        type: string
+      hf_wave_result_manifest_object_path:
+        description: Deterministic HF result-manifest object path (HF-direct only)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -38,9 +46,9 @@ jobs:
         env:
           PBE_WAVE_ID: ${{ inputs.wave_id }}
           PBE_RUN_ID: ${{ inputs.run_id }}
-          PBE_MODE: ${{ inputs.private && 'private' || 'public' }}
-          PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}
-          PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}
+          PBE_MODE: ${{ inputs.jpx_hf_direct && 'hf-direct' || (inputs.private && 'private' || 'public') }}
+          PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ inputs.private && !inputs.jpx_hf_direct && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}
+          PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ inputs.private && !inputs.jpx_hf_direct && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}
         run: python3 .github/scripts/resolve_execute_wave_dependency_profile.py
       - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
       - name: Install dependencies (replay-batch)
@@ -58,8 +66,10 @@ jobs:
         env:
           PBE_WAVE_ID: ${{ inputs.wave_id }}
           PBE_RUN_ID: ${{ inputs.run_id }}
-          PBE_MODE: ${{ inputs.private && 'private' || 'public' }}
-          PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}
-          PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}
+          PBE_MODE: ${{ inputs.jpx_hf_direct && 'hf-direct' || (inputs.private && 'private' || 'public') }}
+          PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ inputs.private && !inputs.jpx_hf_direct && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}
+          PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ inputs.private && !inputs.jpx_hf_direct && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}
           PBE_JPX_HF_DIRECT: ${{ inputs.jpx_hf_direct && '1' || '' }}
           HF_TOKEN: ${{ inputs.jpx_hf_direct && secrets.HF_SYSTEM_TRADING_DATA_RW_TOKEN || '' }}
+          PBE_HF_WAVE_DESCRIPTOR_REF: ${{ inputs.jpx_hf_direct && inputs.hf_wave_descriptor_ref || '' }}
+          PBE_HF_WAVE_RESULT_MANIFEST_OBJECT_PATH: ${{ inputs.jpx_hf_direct && inputs.hf_wave_result_manifest_object_path || '' }}

@@ -1,5 +1,4 @@
 import json
-from datetime import UTC, datetime
 from hashlib import sha256
 from unittest.mock import patch
 
@@ -8,15 +7,10 @@ import httpx
 from portable_batch_execution.backends.github_actions import GitHubActionsBackend
 from portable_batch_execution.broker.config import BrokerConfig
 from portable_batch_execution.broker.hf_direct import BrokerHfDirectExecuteResponse
-from portable_batch_execution.broker.planning import opaque_run_id, register_broker_hf_direct_run
 from portable_batch_execution.broker.service import UnixBrokerService
 from portable_batch_execution.broker.state import BrokerRequestStore
-from portable_batch_execution.contracts import ShardAttemptRecord
 from portable_batch_execution.controller.a1_controller import A1Controller
-from portable_batch_execution.transport.hf_bucket import (
-    HF_BUCKET_REF_SCHEMA,
-    artifact_ref_from_hf_object,
-)
+from portable_batch_execution.transport.hf_bucket import HF_BUCKET_REF_SCHEMA
 
 _PUBLIC_SHA = "ac3a69d2c818526b87f38c848d324221e2dc2775"
 _UID = 1000
@@ -44,8 +38,10 @@ def _service(tmp_path, config, handler):
         sleeper=lambda _seconds: None,
     )
 
+
 _FIXED_SET_OPERATION = "replay.trade_path_scenario_evaluate_fixed_set"
 _FIXED_SET_JOB_SCHEMA = "pbe.replay.trade-path-scenario-evaluate-fixed-set-job.v1"
+_PUBLIC_REVISION = "a" * 40
 _REQUEST_ID = sha256(b"hf-direct-broker-test").hexdigest()
 
 
@@ -74,23 +70,27 @@ def _hf_config(tmp_path):
     return BrokerConfig.load(path)
 
 
-def _input_hf_ref() -> dict:
-    payload = b'{"schema_version":"pbe.replay.trade-path-scenario-evaluate.v1","records":[]}'
+def _wave_descriptor_hf_ref() -> dict:
+    payload = b'{"schema_version":"pbe.hf-direct.wave-descriptor.v1"}'
     digest = sha256(payload).hexdigest()
     return {
         "schema_version": HF_BUCKET_REF_SCHEMA,
         "bucket_id": "yamauchiJP/system-trading-data",
-        "object_path": "pair-trading/v1/public-eval/normalized/digest-1/batch-00000-0123456789abcdef.json",
+        "object_path": "pair-trading/v1/public-eval/waves/"
+        f"{_PUBLIC_REVISION}/digest-1/wave-0001-descriptor-0123456789abcdef.json",
         "sha256": digest,
         "size_bytes": len(payload),
-        "media_type": "application/json",
+        "media_type": "application/vnd.pbe.hf-direct-wave-descriptor.v1",
     }
 
 
 def _hf_request(
     *,
     request_id: str = _REQUEST_ID,
-    output_object_path: str = "pair-trading/v1/public-eval/results/digest-1/batch-00000-out.json",
+    result_manifest_object_path: str = (
+        f"pair-trading/v1/public-eval/wave-results/{_PUBLIC_REVISION}/"
+        "digest-1/wave-0001-manifest-0123456789abcdef.json"
+    ),
 ) -> dict:
     return {
         "schema_version": "pbe.a1-unix-broker.hf-direct-request.v1",
@@ -100,54 +100,26 @@ def _hf_request(
         "operation_params": {
             "schema_version": _FIXED_SET_JOB_SCHEMA,
             "transport_profile": "hf_bucket_direct",
-            "output_object_path": output_object_path,
         },
-        "input_media_type": "application/json",
-        "input_hf_ref": _input_hf_ref(),
+        "logical_run_id": "run-1",
+        "wave_id": "wave-0001",
+        "public_revision": _PUBLIC_REVISION,
+        "wave_descriptor_hf_ref": _wave_descriptor_hf_ref(),
+        "result_manifest_object_path": result_manifest_object_path,
+        "shard_count": 8,
+        "max_parallel": 8,
     }
-
-
-def _append_hf_success_attempt(
-    controller: A1Controller,
-    request_id: str,
-    *,
-    output_object_path: str,
-) -> None:
-    run_id = opaque_run_id(request_id)
-    wave_id = f"wave-{sha256(request_id.encode('utf-8')).hexdigest()[:12]}"
-    payload = controller.registry.resolve_wave(run_id, wave_id)
-    shard = payload["shards"][0]
-    output_bytes = (
-        b'{"schema_version":"pbe.replay.trade-path-scenario-evaluate-fixed-set-result.v1"}'
-    )
-    digest = sha256(output_bytes).hexdigest()
-    output_ref = artifact_ref_from_hf_object(
-        object_path=output_object_path,
-        sha256_hex=digest,
-        size_bytes=len(output_bytes),
-        media_type="application/json",
-    )
-    now = datetime.now(UTC)
-    controller.data_plane.append_attempt(
-        ShardAttemptRecord(
-            logical_run_id=run_id,
-            shard_id=shard["shard_id"],
-            attempt_id="attempt-1",
-            status="succeeded",
-            input_digest=shard["input_digest"],
-            execution_fingerprint=shard["execution_fingerprint"],
-            started_at=now,
-            finished_at=now,
-            wave_id=wave_id,
-            output_refs=(output_ref,),
-            output_digest=digest,
-        )
-    )
 
 
 def _github_handler():
     def handler(request):
         if request.method == "POST":
+            body = json.loads(request.content.decode("utf-8"))
+            inputs = body.get("inputs") or {}
+            assert inputs.get("jpx_hf_direct") is True
+            assert inputs.get("private") is False
+            assert "hf_wave_descriptor_ref" in inputs
+            assert "input_b64" not in inputs
             return httpx.Response(201, json={"workflow_run_id": 1, "html_url": "https://run"})
         return httpx.Response(
             200,
@@ -161,45 +133,27 @@ def test_hf_direct_success_metadata_only_without_artifact_reader(tmp_path):
     config = _hf_config(tmp_path)
     service = _service(tmp_path, config, _github_handler())
     request = _hf_request()
-    output_path = request["operation_params"]["output_object_path"]
-    registration_calls = 0
-    real_register = register_broker_hf_direct_run
-
-    def spy_register(**kwargs):
-        nonlocal registration_calls
-        registration_calls += 1
-        return real_register(**kwargs)
-
-    real_dispatch = service.controller.dispatch_private_wave
-
-    def dispatch_with_success(run_id, wave_id):
-        ref = real_dispatch(run_id, wave_id)
-        _append_hf_success_attempt(
-            service.controller, _REQUEST_ID, output_object_path=output_path
-        )
-        return ref
+    manifest_path = request["result_manifest_object_path"]
 
     def fail_read(ref):
         raise AssertionError("HF-direct broker must not read Private Data Plane artifacts")
 
     service._artifact_reader.read = fail_read  # type: ignore[method-assign]
 
-    with (
-        patch(
-            "portable_batch_execution.broker.service.register_broker_hf_direct_run",
-            side_effect=spy_register,
-        ),
-        patch.object(service.controller, "dispatch_private_wave", dispatch_with_success),
-    ):
+    with patch.object(
+        service.controller,
+        "dispatch_hf_direct_wave",
+        wraps=service.controller.dispatch_hf_direct_wave,
+    ) as dispatch:
         response = service.handle_payload(_UID, request)
 
+    assert dispatch.call_count == 1
     assert isinstance(response, BrokerHfDirectExecuteResponse)
     assert response.status == "succeeded"
-    assert response.output_hf_ref is not None
-    assert response.output_hf_ref["object_path"] == output_path
-    assert registration_calls == 1
+    assert response.result_manifest_object_path == manifest_path
     dumped = response.model_dump(exclude_none=True)
     assert "output_b64" not in dumped
+    assert "input_hf_ref" not in dumped
     assert dumped["schema_version"] == "pbe.a1-unix-broker.hf-direct-response.v1"
 
 
@@ -217,24 +171,13 @@ def test_hf_direct_recovery_after_state_loss(tmp_path):
     config = _hf_config(tmp_path)
     service = _service(tmp_path, config, _github_handler())
     request = _hf_request(request_id=sha256(b"recover-hf").hexdigest())
-    output_path = request["operation_params"]["output_object_path"]
-    real_dispatch = service.controller.dispatch_private_wave
-
-    def dispatch_with_success(run_id, wave_id):
-        ref = real_dispatch(run_id, wave_id)
-        _append_hf_success_attempt(
-            service.controller, request["request_id"], output_object_path=output_path
-        )
-        return ref
-
-    with patch.object(service.controller, "dispatch_private_wave", dispatch_with_success):
-        first = service.handle_payload(_UID, request)
+    first = service.handle_payload(_UID, request)
     assert first.status == "succeeded"
     store = BrokerRequestStore(service.state_root / "controller")
     store._path(request["request_id"]).unlink()
     second = service.handle_payload(_UID, request)
     assert second.status == "succeeded"
-    assert second.output_hf_ref == first.output_hf_ref
+    assert second.result_manifest_object_path == first.result_manifest_object_path
 
 
 def test_legacy_fixed_set_with_input_b64_rejected(tmp_path):
@@ -248,7 +191,6 @@ def test_legacy_fixed_set_with_input_b64_rejected(tmp_path):
         "operation_params": {
             "schema_version": _FIXED_SET_JOB_SCHEMA,
             "transport_profile": "hf_bucket_direct",
-            "output_object_path": "pair-trading/v1/public-eval/results/x.json",
         },
         "input_media_type": "application/json",
         "input_b64": "e30=",

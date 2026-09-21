@@ -62,6 +62,21 @@ class TestHfBucketTransport(unittest.TestCase):
                 media_type="application/json",
             )
 
+    def test_idempotent_reuse_on_matching_bytes(self):
+        storage = InMemoryHfBucketStorage()
+        transport = HfBucketTransport(storage)
+        first = transport.write_verified_append_only(
+            object_path="pair-trading/v1/public-eval/a.json",
+            data=b"a",
+            media_type="application/json",
+        )
+        second = transport.write_verified_append_only(
+            object_path="pair-trading/v1/public-eval/a.json",
+            data=b"a",
+            media_type="application/json",
+        )
+        self.assertEqual(first["sha256"], second["sha256"])
+
 
 if __name__ == "__main__":
     unittest.main()

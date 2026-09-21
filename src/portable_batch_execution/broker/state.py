@@ -47,9 +47,11 @@ class BrokerRequestState:
     dispatch_count: int = 0
     last_dispatched_failure_count: int = 0
     last_reconciled_attempt_marker: str | None = None
+    result_manifest_object_path: str | None = None
+    wave_descriptor_hf_ref: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": _STATE_SCHEMA,
             "request_id": self.request_id,
             "binding": {
@@ -71,6 +73,11 @@ class BrokerRequestState:
             "last_dispatched_failure_count": self.last_dispatched_failure_count,
             "last_reconciled_attempt_marker": self.last_reconciled_attempt_marker,
         }
+        if self.result_manifest_object_path is not None:
+            payload["result_manifest_object_path"] = self.result_manifest_object_path
+        if self.wave_descriptor_hf_ref is not None:
+            payload["wave_descriptor_hf_ref"] = self.wave_descriptor_hf_ref
+        return payload
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> BrokerRequestState:
@@ -87,6 +94,7 @@ class BrokerRequestState:
             execution_fingerprint=str(binding_payload["execution_fingerprint"]),
             public_sha=str(binding_payload["public_sha"]),
         )
+        wave_descriptor = payload.get("wave_descriptor_hf_ref")
         return cls(
             request_id=str(payload["request_id"]),
             binding=binding,
@@ -102,6 +110,10 @@ class BrokerRequestState:
                 payload.get("last_dispatched_failure_count", 0)
             ),
             last_reconciled_attempt_marker=payload.get("last_reconciled_attempt_marker"),
+            result_manifest_object_path=payload.get("result_manifest_object_path"),
+            wave_descriptor_hf_ref=dict(wave_descriptor)
+            if isinstance(wave_descriptor, dict)
+            else None,
         )
 
 

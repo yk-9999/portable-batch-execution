@@ -72,6 +72,7 @@ _FIXED_SCENARIO_PARAMS: dict[str, TradePathScenarioParams] = {
 class TradePathScenarioEvaluateFixedSetJobParams(Frozen):
     schema_version: Literal["pbe.replay.trade-path-scenario-evaluate-fixed-set-job.v1"]
     transport_profile: Literal["hf_bucket_direct"] = "hf_bucket_direct"
+    bucket_prefix: str | None = None
 
 
 _SCENARIO_DEPENDENT_FIELDS = (
