@@ -42,7 +42,7 @@ jobs:
                   env.pop("HF_TOKEN", None)
               proc = subprocess.run(["hf", "--version"], env=env, capture_output=True, text=True)
               combined = ((proc.stdout or "") + (proc.stderr or "")).replace(secret, "***")
-              print(label, "rc=", proc.returncode, "output=", repr(combined[:500]))
+              print(label, "rc=", proc.returncode, "output_tail=", repr(combined[-1500:]))
           PY
       - name: Stage synthetic non-outcome fixture directly to HF
         run: uv run --no-sync python validation/task0062_stage_hf_fixture.py
