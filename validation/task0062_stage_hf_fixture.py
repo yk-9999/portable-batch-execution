@@ -8,6 +8,7 @@ from portable_batch_execution.data_plane.hf import (
     HfBucketIdentity,
 )
 
+# TASK-0062 validation fixture; rerun after public HF CLI probe repair.
 ROW_COUNT = 90_000
 TEXT = "ab" * 50
 MIN_INPUT_BYTES = 16 * 1024 * 1024
