@@ -60,7 +60,7 @@ def test_http_plane_uses_explicit_finite_timeout_policy():
         assert isinstance(timeout, httpx.Timeout)
         assert (timeout.connect, timeout.read, timeout.write, timeout.pool) == (
             10.0,
-            60.0,
+            300.0,
             30.0,
             10.0,
         )
@@ -85,7 +85,7 @@ def test_http_plane_timeout_policy_applies_to_every_call():
         plane.resolve_wave("run", "wave")
     finally:
         plane._client.close()
-    assert seen == [{"connect": 10.0, "read": 60.0, "write": 30.0, "pool": 10.0}]
+    assert seen == [{"connect": 10.0, "read": 300.0, "write": 30.0, "pool": 10.0}]
 
 
 def test_http_plane_maps_read_timeouts_to_sanitized_error():

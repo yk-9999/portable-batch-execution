@@ -21,7 +21,7 @@ class PrivateDataPlaneError(RuntimeError):
     """An error intentionally containing operation/status, never response data."""
 
 
-_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
 
 
 class HttpPrivateDataPlane:
