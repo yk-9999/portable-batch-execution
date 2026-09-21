@@ -28,6 +28,7 @@ from portable_batch_execution.transport.hf_bucket import (
 from portable_batch_execution.worker.hf_direct_wave import (
     HF_WAVE_DESCRIPTOR_SCHEMA,
     HF_WAVE_RESULT_MANIFEST_SCHEMA,
+    HfDirectWaveError,
     SerializedWaveDescriptor,
     execute_hf_direct_wave,
     load_wave_descriptor_from_ref,
@@ -53,6 +54,15 @@ def _batch_bytes(batch_id: str = "batch-00000") -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _hf_direct_env(public_revision: str) -> dict[str, str]:
+    return {
+        "PBE_MODE": "hf-direct",
+        "PBE_JPX_HF_DIRECT": "1",
+        "HF_TOKEN": "hf_test",
+        "PBE_EXPECTED_PUBLIC_REVISION": public_revision,
+    }
 
 
 def _build_descriptor(storage: InMemoryHfBucketStorage, shard_count: int = 8):
@@ -168,11 +178,7 @@ class TestHfDirectWaveWorker(unittest.TestCase):
         storage = InMemoryHfBucketStorage()
         ref, manifest_path, public_revision, _digest = _build_descriptor(storage, shard_count=8)
         transport = HfBucketTransport(storage)
-        env = {
-            "PBE_MODE": "hf-direct",
-            "PBE_JPX_HF_DIRECT": "1",
-            "HF_TOKEN": "hf_test",
-        }
+        env = _hf_direct_env(public_revision)
         with mock.patch.dict(os.environ, env, clear=False):
             summary = execute_hf_direct_wave(
                 wave_descriptor_ref=ref,
@@ -194,9 +200,9 @@ class TestHfDirectWaveWorker(unittest.TestCase):
 
     def test_idempotent_result_reuse(self):
         storage = InMemoryHfBucketStorage()
-        ref, manifest_path, _rev, _digest = _build_descriptor(storage, shard_count=1)
+        ref, manifest_path, public_revision, _digest = _build_descriptor(storage, shard_count=1)
         transport = HfBucketTransport(storage)
-        env = {"PBE_MODE": "hf-direct", "PBE_JPX_HF_DIRECT": "1", "HF_TOKEN": "hf_test"}
+        env = _hf_direct_env(public_revision)
         with mock.patch.dict(os.environ, env, clear=False):
             first = execute_hf_direct_wave(
                 wave_descriptor_ref=ref,
@@ -215,12 +221,10 @@ class TestHfDirectWaveWorker(unittest.TestCase):
 
     def test_no_private_data_plane_env_required(self):
         storage = InMemoryHfBucketStorage()
-        ref, manifest_path, _rev, _digest = _build_descriptor(storage, shard_count=1)
+        ref, manifest_path, public_revision, _digest = _build_descriptor(storage, shard_count=1)
         transport = HfBucketTransport(storage)
         env = {
-            "PBE_MODE": "hf-direct",
-            "PBE_JPX_HF_DIRECT": "1",
-            "HF_TOKEN": "hf_test",
+            **_hf_direct_env(public_revision),
             "PBE_PRIVATE_DATA_PLANE_BASE_URL": "",
             "PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN": "",
         }
@@ -231,11 +235,27 @@ class TestHfDirectWaveWorker(unittest.TestCase):
                 transport=transport,
             )
 
+    def test_checked_out_revision_mismatch_fails(self):
+        storage = InMemoryHfBucketStorage()
+        ref, manifest_path, _public_revision, _digest = _build_descriptor(storage, shard_count=1)
+        transport = HfBucketTransport(storage)
+        wrong = "b" * 40
+        env = _hf_direct_env(wrong)
+        with (
+            mock.patch.dict(os.environ, env, clear=False),
+            self.assertRaises(HfDirectWaveError),
+        ):
+            execute_hf_direct_wave(
+                wave_descriptor_ref=ref,
+                expected_manifest_path=manifest_path,
+                transport=transport,
+            )
+
     def test_collision_mismatch_fails(self):
         storage = InMemoryHfBucketStorage()
-        ref, manifest_path, _rev, _digest = _build_descriptor(storage, shard_count=1)
+        ref, manifest_path, public_revision, _digest = _build_descriptor(storage, shard_count=1)
         transport = HfBucketTransport(storage)
-        env = {"PBE_MODE": "hf-direct", "PBE_JPX_HF_DIRECT": "1", "HF_TOKEN": "hf_test"}
+        env = _hf_direct_env(public_revision)
         with mock.patch.dict(os.environ, env, clear=False):
             execute_hf_direct_wave(
                 wave_descriptor_ref=ref,

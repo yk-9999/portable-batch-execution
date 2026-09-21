@@ -166,6 +166,8 @@ class UnixBrokerService:
             )
         except ValueError:
             return self._failed_hf(request.request_id, "operation_params_invalid")
+        if request.public_revision != self.config.public_sha:
+            return self._failed_hf(request.request_id, "public_revision_mismatch")
         validated_ref = validate_hf_bucket_ref(request.wave_descriptor_hf_ref)
         input_digest = hf_direct_wave_input_digest(
             wave_descriptor_hf_ref=validated_ref,

@@ -80,6 +80,8 @@ def test_execute_wave_worker_invocation_and_secrets_unchanged(workflow):
     )
     assert "hf_wave_descriptor_ref" in workflow
     assert "PBE_HF_WAVE_DESCRIPTOR_REF" in workflow
+    assert "PBE_EXPECTED_PUBLIC_REVISION" in workflow
+    assert "github.sha" in workflow
     assert "pytest" not in workflow
 
 

@@ -80,18 +80,41 @@ def read_verified_input_batch(
     return payload, parsed
 
 
-def derive_result_object_path_from_input_object_path(input_object_path: str) -> str:
+def fixed_set_result_object_path(
+    *,
+    bucket_prefix: str,
+    public_revision: str,
+    manifest_digest: str,
+    batch_id: str,
+) -> str:
+    revision = public_revision.strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise HfDirectExecutionError("public_revision must be a git commit sha")
+    tag = sha256(
+        f"{revision}|{manifest_digest}|{batch_id}|fixed-set".encode()
+    ).hexdigest()[:16]
+    prefix = bucket_prefix.rstrip("/")
+    return (
+        f"{prefix}/results/{revision}/{manifest_digest}/{batch_id}-{tag}.json"
+    ).lstrip("/")
+
+
+def derive_result_object_path_from_input_object_path(
+    input_object_path: str, *, public_revision: str
+) -> str:
     pattern = re.compile(
         r"^(?P<prefix>.+/normalized/(?P<digest>[^/]+)/)(?P<batch_id>batch-\d{5})-(?P<tag>[0-9a-f]{16})\.json$"
     )
     match = pattern.match(input_object_path.lstrip("/"))
     if match is None:
         raise HfDirectExecutionError("cannot derive result path from input object path")
-    prefix = match.group("prefix").split("/normalized/")[0].rstrip("/")
-    manifest_digest = match.group("digest")
-    batch_id = match.group("batch_id")
-    tag = sha256(f"{manifest_digest}|{batch_id}|fixed-set".encode()).hexdigest()[:16]
-    return f"{prefix}/results/{manifest_digest}/{batch_id}-{tag}.json".lstrip("/")
+    prefix = match.group("prefix").split("/normalized/")[0].rstrip("/") + "/"
+    return fixed_set_result_object_path(
+        bucket_prefix=prefix,
+        public_revision=public_revision,
+        manifest_digest=match.group("digest"),
+        batch_id=match.group("batch_id"),
+    )
 
 
 def execute_hf_direct_trade_path_fixed_set_shard(
@@ -112,8 +135,10 @@ def execute_hf_direct_trade_path_fixed_set_shard(
     batch_bytes, parsed_batch = read_verified_input_batch(transport, input_ref)
     resolved_output_path = output_object_path.lstrip("/")
     if not resolved_output_path:
+        public_revision = str(job.provenance.revision or "")
         resolved_output_path = derive_result_object_path_from_input_object_path(
-            parse_hf_object_uri(input_ref.uri)
+            parse_hf_object_uri(input_ref.uri),
+            public_revision=public_revision,
         )
     result_payload = replay_pack.execute(
         job,

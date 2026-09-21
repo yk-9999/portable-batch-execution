@@ -204,6 +204,9 @@ def execute_hf_direct_wave(
     transport = transport or HfBucketTransport(build_hf_api_storage_from_token(token))
     descriptor = load_wave_descriptor_from_ref(transport, wave_descriptor_ref)
     public_revision = str(descriptor["public_revision"])
+    expected_revision = expected_public_revision_from_environment()
+    if public_revision != expected_revision:
+        raise HfDirectWaveError("descriptor public_revision mismatch with checked-out revision")
     job: JobSpec = descriptor["job"]
     wave: WaveSpec = descriptor["wave"]
     shards: tuple[ShardSpec, ...] = descriptor["shards"]
@@ -234,7 +237,10 @@ def execute_hf_direct_wave(
             raise HfDirectExecutionError("shard requires one HF input ref")
         input_ref = shard.input_refs[0]
         input_object_path = parse_hf_object_uri(input_ref.uri)
-        output_path = derive_result_object_path_from_input_object_path(input_object_path)
+        output_path = derive_result_object_path_from_input_object_path(
+            input_object_path,
+            public_revision=public_revision,
+        )
         out_ref, _summary = execute_hf_direct_trade_path_fixed_set_shard(
             transport=transport,
             replay_pack=replay_pack,
@@ -337,6 +343,13 @@ def wave_descriptor_ref_from_environment() -> dict[str, Any]:
 def expected_manifest_path_from_environment() -> str | None:
     raw = os.environ.get("PBE_HF_WAVE_RESULT_MANIFEST_OBJECT_PATH", "").strip()
     return raw or None
+
+
+def expected_public_revision_from_environment() -> str:
+    raw = os.environ.get("PBE_EXPECTED_PUBLIC_REVISION", "").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", raw):
+        raise HfDirectWaveError("PBE_EXPECTED_PUBLIC_REVISION must be a 40-char git sha")
+    return raw
 
 
 @dataclass(frozen=True)

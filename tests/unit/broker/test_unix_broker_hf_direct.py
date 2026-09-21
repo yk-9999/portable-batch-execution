@@ -41,7 +41,7 @@ def _service(tmp_path, config, handler):
 
 _FIXED_SET_OPERATION = "replay.trade_path_scenario_evaluate_fixed_set"
 _FIXED_SET_JOB_SCHEMA = "pbe.replay.trade-path-scenario-evaluate-fixed-set-job.v1"
-_PUBLIC_REVISION = "a" * 40
+_PUBLIC_REVISION = _PUBLIC_SHA
 _REQUEST_ID = sha256(b"hf-direct-broker-test").hexdigest()
 
 
@@ -154,6 +154,16 @@ def test_hf_direct_success_metadata_only_without_artifact_reader(tmp_path):
     assert "output_b64" not in dumped
     assert "input_hf_ref" not in dumped
     assert dumped["schema_version"] == "pbe.a1-unix-broker.hf-direct-response.v1"
+
+
+def test_hf_direct_rejects_public_revision_mismatch(tmp_path):
+    config = _hf_config(tmp_path)
+    service = _service(tmp_path, config, _github_handler())
+    request = _hf_request()
+    request["public_revision"] = "b" * 40
+    response = service.handle_payload(_UID, request)
+    assert response.status == "failed"
+    assert response.error_code == "public_revision_mismatch"
 
 
 def test_hf_direct_rejects_byte_fields(tmp_path):

@@ -73,3 +73,4 @@ jobs:
           HF_TOKEN: ${{ inputs.jpx_hf_direct && secrets.HF_SYSTEM_TRADING_DATA_RW_TOKEN || '' }}
           PBE_HF_WAVE_DESCRIPTOR_REF: ${{ inputs.jpx_hf_direct && inputs.hf_wave_descriptor_ref || '' }}
           PBE_HF_WAVE_RESULT_MANIFEST_OBJECT_PATH: ${{ inputs.jpx_hf_direct && inputs.hf_wave_result_manifest_object_path || '' }}
+          PBE_EXPECTED_PUBLIC_REVISION: ${{ inputs.jpx_hf_direct && github.sha || '' }}
