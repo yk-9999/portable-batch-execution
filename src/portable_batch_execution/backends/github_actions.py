@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -65,16 +66,42 @@ class GitHubActionsBackend:
         token: str | None = None,
         client: httpx.Client | None = None,
         private_data_plane: bool = False,
+        hf_direct_store: Mapping[str, Any] | None = None,
     ):
+        if private_data_plane and hf_direct_store is not None:
+            raise ValueError(
+                "private_data_plane and hf_direct_store are mutually exclusive"
+            )
         self.owner = owner
         self.repo = repo
         self.workflow_id = workflow_id
         self.dispatch_ref = dispatch_ref
         self.private_data_plane = private_data_plane
+        self.hf_direct_store = self._resolve_hf_direct_store(hf_direct_store)
         self.token = token if token is not None else os.environ.get("PBE_GITHUB_TOKEN")
         self.client = client or httpx.Client(
             base_url="https://api.github.com", timeout=30.0
         )
+
+    @staticmethod
+    def _resolve_hf_direct_store(hf_direct_store: Mapping[str, Any] | None):
+        """Validate and freeze the bounded HF store identity, or fail closed.
+
+        Imported lazily so the backends package stays importable without the
+        data-plane/controller module graph.
+        """
+        if hf_direct_store is None:
+            return None
+        from portable_batch_execution.data_plane.hf import (
+            HfBucketIdentity,
+            HfBucketStoreError,
+        )
+
+        if isinstance(hf_direct_store, HfBucketIdentity):
+            return hf_direct_store
+        if not isinstance(hf_direct_store, Mapping):
+            raise HfBucketStoreError("hf_direct_store must be bounded identity metadata")
+        return HfBucketIdentity.from_metadata(hf_direct_store)
 
     def capabilities(self) -> BackendCapabilities:
         return BackendCapabilities("github-actions", 256, True, True)
@@ -97,7 +124,18 @@ class GitHubActionsBackend:
         return response
 
     def submit_wave(self, request: WaveSubmission) -> BackendExecutionRef:
-        if self.private_data_plane:
+        if self.hf_direct_store is not None:
+            _opaque_identifier(request.wave.logical_run_id, "run_id")
+            _opaque_identifier(request.wave.wave_id, "wave_id")
+            inputs = {
+                "wave_id": request.wave.wave_id,
+                "run_id": request.wave.logical_run_id,
+                "hf_direct": True,
+                "hf_bucket": self.hf_direct_store.bucket,
+                "hf_prefix": self.hf_direct_store.prefix,
+                "hf_object_layout": self.hf_direct_store.object_layout_version,
+            }
+        elif self.private_data_plane:
             _opaque_identifier(request.wave.logical_run_id, "run_id")
             _opaque_identifier(request.wave.wave_id, "wave_id")
             inputs = {
