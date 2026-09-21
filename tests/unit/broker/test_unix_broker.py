@@ -15,6 +15,7 @@ from portable_batch_execution.backends.github_actions import (
     GitHubActionsAPIError,
     GitHubActionsBackend,
 )
+from portable_batch_execution.broker.artifact_reader import build_broker_artifact_reader
 from portable_batch_execution.broker.config import BrokerConfig, max_request_frame_bytes
 from portable_batch_execution.broker.planning import (
     broker_execution_fingerprint,
@@ -29,7 +30,6 @@ from portable_batch_execution.broker.server import (
     _serve_accept_loop,
     serve_unix_broker,
 )
-from portable_batch_execution.broker.artifact_reader import build_broker_artifact_reader
 from portable_batch_execution.broker.service import UnixBrokerService
 from portable_batch_execution.broker.state import (
     BrokerRequestState,
@@ -1214,7 +1214,7 @@ def test_serve_accept_loop_bounded_concurrency_overlaps_handles(tmp_path):
                 side_effect=gated_handle,
             ):
                 _serve_accept_loop(listener, service, 2)
-        except BaseException as exc:  # pragma: no cover - surfaced in test
+        except BaseException as exc:  # pragma: no cover - surfaced in test  # noqa: BLE001
             loop_error.append(exc)
 
     loop_thread = threading.Thread(target=run_loop, daemon=True)

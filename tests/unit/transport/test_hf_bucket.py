@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -17,8 +15,6 @@ from portable_batch_execution.transport.hf_bucket import (
 
 class TestHfBucketTransport(unittest.TestCase):
     def test_write_read_verify_and_retry(self):
-        storage = InMemoryHfBucketStorage()
-
         class FlakyStorage(InMemoryHfBucketStorage):
             def __init__(self) -> None:
                 super().__init__()

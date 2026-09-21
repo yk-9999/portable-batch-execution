@@ -6,8 +6,8 @@ from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluat
     execute_trade_path_scenario_evaluate,
 )
 from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate_fixed_set import (
-    FIXED_SCENARIO_NAMES,
     _FIXED_SCENARIO_PARAMS,
+    FIXED_SCENARIO_NAMES,
     execute_trade_path_scenario_evaluate_fixed_set,
 )
 

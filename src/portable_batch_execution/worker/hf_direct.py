@@ -5,19 +5,21 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Mapping
 from hashlib import sha256
-from typing import Any, Mapping
+from typing import Any
 
 from portable_batch_execution.contracts import ArtifactRef
+from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate import (
+    REQUEST_SCHEMA_VERSION,
+)
 from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate_fixed_set import (
     FIXED_SET_OPERATION,
     FIXED_SET_RESULT_SCHEMA_VERSION,
 )
-from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate import (
-    REQUEST_SCHEMA_VERSION,
-)
 from portable_batch_execution.transport.hf_bucket import (
     HfBucketTransport,
+    HfBucketTransportError,
     artifact_ref_from_hf_object,
     artifact_ref_to_hf_bucket_ref,
     parse_hf_object_uri,
@@ -48,7 +50,7 @@ def artifact_ref_is_hf_bucket(ref: ArtifactRef) -> bool:
     try:
         parse_hf_object_uri(ref.uri)
         return True
-    except Exception:
+    except HfBucketTransportError:
         return False
 
 
@@ -88,7 +90,7 @@ def derive_result_object_path_from_input_object_path(input_object_path: str) -> 
     prefix = match.group("prefix").split("/normalized/")[0].rstrip("/")
     manifest_digest = match.group("digest")
     batch_id = match.group("batch_id")
-    tag = sha256(f"{manifest_digest}|{batch_id}|fixed-set".encode("utf-8")).hexdigest()[:16]
+    tag = sha256(f"{manifest_digest}|{batch_id}|fixed-set".encode()).hexdigest()[:16]
     return f"{prefix}/results/{manifest_digest}/{batch_id}-{tag}.json".lstrip("/")
 
 

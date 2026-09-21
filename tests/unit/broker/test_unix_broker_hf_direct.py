@@ -65,7 +65,6 @@ def _hf_config(tmp_path):
         ),
         encoding="utf-8",
     )
-    from portable_batch_execution.broker.config import BrokerConfig
 
     return BrokerConfig.load(path)
 

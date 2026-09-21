@@ -6,9 +6,10 @@ import hashlib
 import os
 import re
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Protocol
 
 from portable_batch_execution.contracts import ArtifactRef
 
@@ -249,7 +250,7 @@ class HfBucketTransport:
                 return fn()
             except HfBucketTransportError:
                 raise
-            except Exception as exc:
+            except (OSError, TimeoutError, RuntimeError, ValueError) as exc:
                 last_exc = exc
                 if attempt >= self._retry.max_attempts:
                     break

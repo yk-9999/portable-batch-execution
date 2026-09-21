@@ -1,10 +1,10 @@
-import json
 
 import pytest
 
 from portable_batch_execution.contracts import JobSpec
 from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate import (
     REQUEST_SCHEMA_VERSION,
+    TradePathScenarioEvaluateError,
     execute_trade_path_scenario_evaluate,
 )
 
@@ -134,7 +134,7 @@ def test_job_spec_rejects_executable_operation_params():
 def test_forbidden_url_in_record():
     payload = _request()
     payload["records"][0]["model"] = "http://evil"
-    with pytest.raises(Exception):
+    with pytest.raises(TradePathScenarioEvaluateError):
         execute_trade_path_scenario_evaluate(payload)
 
 

@@ -8,7 +8,6 @@ import time
 from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
-from typing import Union
 
 from portable_batch_execution.backends.base import BackendExecutionRef
 from portable_batch_execution.backends.github_actions import (
@@ -26,7 +25,6 @@ from portable_batch_execution.transport.hf_bucket import validate_hf_bucket_ref
 from .artifact_reader import BrokerArtifactReader, build_broker_artifact_reader
 from .config import BrokerConfig
 from .hf_direct import (
-    BrokerHfDirectExecuteRequest,
     BrokerHfDirectExecuteResponse,
     hf_direct_wave_input_digest,
     parse_hf_direct_request,
@@ -47,7 +45,7 @@ from .state import BrokerRequestState, BrokerRequestStore, RequestBinding
 
 _TERMINAL_FAILURE_STATUSES = frozenset({"failed", "cancelled"})
 _HF_DIRECT_MAX_DISPATCHES = 4
-_BrokerResponse = Union[BrokerExecuteResponse, BrokerHfDirectExecuteResponse]
+_BrokerResponse = BrokerExecuteResponse | BrokerHfDirectExecuteResponse
 
 
 class UnixBrokerService:

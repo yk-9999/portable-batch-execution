@@ -6,8 +6,6 @@ import json
 from hashlib import sha256
 from typing import Any, Literal
 
-from pydantic import Field
-
 from portable_batch_execution.contracts.models import Frozen
 
 from .trade_path_scenario_evaluate import (

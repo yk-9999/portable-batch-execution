@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Any, Mapping
+from typing import Any
 
 from portable_batch_execution.contracts import JobSpec, ShardSpec, WaveSpec
 from portable_batch_execution.packs.replay_reduction.pack import ReplayReductionPack
@@ -20,9 +21,9 @@ from portable_batch_execution.transport.hf_bucket import (
     HF_BUCKET_REF_SCHEMA,
     HfBucketTransport,
     build_hf_api_storage_from_token,
+    parse_hf_object_uri,
     validate_hf_bucket_ref,
 )
-from portable_batch_execution.transport.hf_bucket import parse_hf_object_uri
 from portable_batch_execution.worker.hf_direct import (
     HfDirectExecutionError,
     assert_no_private_data_plane_dependency,
@@ -62,7 +63,7 @@ def wave_descriptor_object_path(
     wave = wave_id.strip()
     if not wave:
         raise HfDirectWaveError("wave_id required")
-    tag = sha256(f"{revision}|{digest}|{wave}|descriptor".encode("utf-8")).hexdigest()[:16]
+    tag = sha256(f"{revision}|{digest}|{wave}|descriptor".encode()).hexdigest()[:16]
     return f"{prefix}/waves/{revision}/{digest}/{wave}-descriptor-{tag}.json".lstrip("/")
 
 
@@ -83,7 +84,7 @@ def wave_result_manifest_object_path(
     wave = wave_id.strip()
     if not wave:
         raise HfDirectWaveError("wave_id required")
-    tag = sha256(f"{revision}|{digest}|{wave}|manifest".encode("utf-8")).hexdigest()[:16]
+    tag = sha256(f"{revision}|{digest}|{wave}|manifest".encode()).hexdigest()[:16]
     return f"{prefix}/wave-results/{revision}/{digest}/{wave}-manifest-{tag}.json".lstrip("/")
 
 

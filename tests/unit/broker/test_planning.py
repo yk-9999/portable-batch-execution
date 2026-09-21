@@ -12,7 +12,10 @@ from portable_batch_execution.broker.planning import (
     canonical_operation_params,
     register_broker_private_run,
 )
-from portable_batch_execution.broker.protocol import BrokerExecuteResponse, parse_request
+from portable_batch_execution.broker.protocol import (
+    BrokerExecuteResponse,
+    parse_request,
+)
 from portable_batch_execution.broker.service import UnixBrokerService
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.packs.ml import MLPack
@@ -88,7 +91,7 @@ def test_replay_batch_request_rejects_reserved_operation_param_keys():
 
 
 def test_register_broker_private_run_replay_batch_trade_path(tmp_path):
-    job, wave, shard, manifest = register_broker_private_run(
+    job, _wave, shard, manifest = register_broker_private_run(
         state_root=tmp_path,
         request_id="req-replay-plan",
         pack="replay-batch",

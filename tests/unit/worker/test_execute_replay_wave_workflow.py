@@ -66,15 +66,20 @@ def test_execute_wave_worker_invocation_and_secrets_unchanged(workflow):
     assert '"$PBE_WAVE_ID"' in workflow
     assert "PBE_WAVE_ID: ${{ inputs.wave_id }}" in workflow
     assert "PBE_RUN_ID: ${{ inputs.run_id }}" in workflow
-    assert "PBE_MODE: ${{ inputs.private && 'private' || 'public' }}" in workflow
     assert (
-        "PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}"
+        "PBE_MODE: ${{ inputs.jpx_hf_direct && 'hf-direct' || (inputs.private && 'private' || 'public') }}"
         in workflow
     )
     assert (
-        "PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}"
+        "PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ inputs.private && !inputs.jpx_hf_direct && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}"
         in workflow
     )
+    assert (
+        "PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ inputs.private && !inputs.jpx_hf_direct && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}"
+        in workflow
+    )
+    assert "hf_wave_descriptor_ref" in workflow
+    assert "PBE_HF_WAVE_DESCRIPTOR_REF" in workflow
     assert "pytest" not in workflow
 
 

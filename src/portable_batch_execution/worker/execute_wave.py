@@ -21,8 +21,6 @@ from portable_batch_execution.contracts import (
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
 from portable_batch_execution.data_plane.base import ArtifactContentStream
 from portable_batch_execution.packs.media.pack import MediaPack
-from portable_batch_execution.packs.replay_reduction.pack import ReplayReductionPack
-from portable_batch_execution.packs.tabular.pack import TabularPack
 from portable_batch_execution.packs.replay_reduction.canonicalize import (
     BUCKET_MEDIA_TYPE,
     StructuralCanonicalizeError,
@@ -34,13 +32,14 @@ from portable_batch_execution.packs.replay_reduction.canonicalize import (
 from portable_batch_execution.packs.replay_reduction.models import (
     BUCKET_COUNT_MAX,
 )
+from portable_batch_execution.packs.replay_reduction.pack import ReplayReductionPack
 from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate import (
     REQUEST_SCHEMA_VERSION as TRADE_PATH_REQUEST_SCHEMA_VERSION,
 )
 from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate_fixed_set import (
     FIXED_SET_OPERATION,
-    FIXED_SET_RESULT_SCHEMA_VERSION,
 )
+from portable_batch_execution.packs.tabular.pack import TabularPack
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})

@@ -9,7 +9,8 @@ from collections.abc import Callable
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import Request, urlopen as _default_urlopen
+from urllib.request import Request
+from urllib.request import urlopen as _default_urlopen
 
 _REPLAY_PACK = "replay-batch"
 _FALLBACK_PROFILE = "fallback"

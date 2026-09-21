@@ -16,12 +16,12 @@ from portable_batch_execution.contracts import (
 )
 from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate_fixed_set import (
     FIXED_SET_OPERATION,
-    FIXED_SET_RESULT_SCHEMA_VERSION,
 )
 from portable_batch_execution.transport.hf_bucket import (
     HF_BUCKET_ID,
     HF_BUCKET_REF_SCHEMA,
     HfBucketTransport,
+    HfBucketTransportError,
     InMemoryHfBucketStorage,
     artifact_ref_from_hf_object,
 )
@@ -89,7 +89,7 @@ def _build_descriptor(storage: InMemoryHfBucketStorage, shard_count: int = 8):
                 input_refs=(input_ref,),
                 input_digest=digest,
                 execution_fingerprint=sha256(
-                    f"{public_revision}|{shard_id}".encode("utf-8")
+                    f"{public_revision}|{shard_id}".encode()
                 ).hexdigest(),
             )
         )
@@ -243,13 +243,15 @@ class TestHfDirectWaveWorker(unittest.TestCase):
                 transport=transport,
             )
         storage.objects[manifest_path] = b"{}"
-        with mock.patch.dict(os.environ, env, clear=False):
-            with self.assertRaises(Exception):
-                execute_hf_direct_wave(
-                    wave_descriptor_ref=ref,
-                    expected_manifest_path=manifest_path,
-                    transport=transport,
-                )
+        with (
+            mock.patch.dict(os.environ, env, clear=False),
+            self.assertRaises(HfBucketTransportError),
+        ):
+            execute_hf_direct_wave(
+                wave_descriptor_ref=ref,
+                expected_manifest_path=manifest_path,
+                transport=transport,
+            )
 
 
 if __name__ == "__main__":
