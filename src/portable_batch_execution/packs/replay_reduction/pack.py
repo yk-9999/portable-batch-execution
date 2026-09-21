@@ -14,6 +14,10 @@ from .causal_grid import execute_causal_grid_extract
 from .event_window import execute_event_window_extract
 from .models import PARAM_MODELS
 from .trade_path_scenario_evaluate import execute_trade_path_scenario_evaluate
+from .trade_path_scenario_evaluate_fixed_set import (
+    FIXED_SET_OPERATION,
+    execute_trade_path_scenario_evaluate_fixed_set,
+)
 
 
 class ReplayReductionPack:
@@ -56,6 +60,14 @@ class ReplayReductionPack:
                 raise TypeError("trade path scenario evaluate requires batch")
             encoded_size = context.get("encoded_size")
             return execute_trade_path_scenario_evaluate(
+                batch, encoded_size=encoded_size
+            )
+        if operation == FIXED_SET_OPERATION:
+            batch = context.get("batch")
+            if batch is None:
+                raise TypeError("trade path scenario fixed set requires batch")
+            encoded_size = context.get("encoded_size")
+            return execute_trade_path_scenario_evaluate_fixed_set(
                 batch, encoded_size=encoded_size
             )
         raise ValueError(f"unsupported replay operation: {operation}")

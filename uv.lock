@@ -836,6 +836,7 @@ ml = [
 ]
 replay = [
     { name = "duckdb" },
+    { name = "huggingface-hub" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "polars" },
@@ -858,6 +859,7 @@ dev = [
 requires-dist = [
     { name = "duckdb", marker = "extra == 'tabular'", specifier = ">=1.1" },
     { name = "httpx", specifier = ">=0.27" },
+    { name = "huggingface-hub", marker = "extra == 'replay'", specifier = ">=1.0,<2" },
     { name = "numpy", marker = "extra == 'replay'", specifier = ">=2.0" },
     { name = "polars", marker = "extra == 'tabular'", specifier = ">=1.0" },
     { name = "portable-batch-execution", extras = ["tabular"], marker = "extra == 'replay'" },

@@ -24,7 +24,15 @@ from portable_batch_execution.data_plane.base import RevisionConflictError
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
 from portable_batch_execution.packs import MLPack, TabularPack
 from portable_batch_execution.packs.replay_reduction.models import (
+    TradePathScenarioEvaluateFixedSetJobParams,
     TradePathScenarioEvaluateJobParams,
+)
+from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate_fixed_set import (
+    FIXED_SET_OPERATION,
+)
+from portable_batch_execution.transport.hf_bucket import (
+    artifact_ref_from_hf_object,
+    validate_hf_bucket_ref,
 )
 
 _BINDING_CONFLICT = "request_binding_conflict"
@@ -36,7 +44,12 @@ _CLOSED_ML_BATCH_OPERATIONS = frozenset(
         "ml.distilbert_pair_binary_scores",
     }
 )
-_BROKER_REPLAY_BATCH_OPERATIONS = frozenset({"replay.trade_path_scenario_evaluate"})
+_BROKER_REPLAY_BATCH_OPERATIONS = frozenset(
+    {
+        "replay.trade_path_scenario_evaluate",
+        FIXED_SET_OPERATION,
+    }
+)
 _BROKER_PACKS = frozenset(
     {"tabular-batch", "ml-batch", "media-batch", "replay-batch"},
 )
@@ -66,6 +79,10 @@ def canonical_operation_params(pack: str, operation: str, params: dict[str, Any]
     if pack == "replay-batch":
         if operation not in _BROKER_REPLAY_BATCH_OPERATIONS:
             raise ValueError("unsupported broker operation")
+        if operation == FIXED_SET_OPERATION:
+            return TradePathScenarioEvaluateFixedSetJobParams.model_validate(params).model_dump(
+                mode="json"
+            )
         return TradePathScenarioEvaluateJobParams.model_validate(params).model_dump(mode="json")
     raise ValueError("unsupported broker pack")
 
@@ -288,6 +305,114 @@ def register_broker_private_run(
         ordinal=0,
         correctness=job.sharding,
         input_refs=(input_ref, *static_input_refs),
+        input_digest=input_digest,
+        execution_fingerprint=execution_fingerprint,
+    )
+    wave = WaveSpec(
+        logical_run_id=run_id,
+        wave_id=wave_id,
+        ordinal=0,
+        shard_ids=(shard.shard_id,),
+        max_parallel=1,
+    )
+    registry.register_closed_wave(job, wave, (shard,))
+    manifest = _initial_manifest(job, wave, shard)
+    plane.write_next_manifest(manifest, -1)
+    return job, wave, shard, manifest
+
+
+def register_broker_hf_direct_run(
+    *,
+    state_root,
+    request_id: str,
+    pack: str,
+    operation: str,
+    operation_params: dict[str, Any],
+    input_hf_ref: dict[str, Any],
+    input_media_type: str,
+    public_sha: str,
+) -> tuple[JobSpec, WaveSpec, ShardSpec, RunManifest]:
+    if operation != FIXED_SET_OPERATION:
+        raise ValueError("HF-direct broker registration supports fixed-set replay only")
+    plane = LocalFilesystemDataPlane(state_root)
+    registry = ClosedWaveRegistry(state_root / "controller")
+    validated_ref = validate_hf_bucket_ref(input_hf_ref)
+    input_ref = artifact_ref_from_hf_object(
+        object_path=validated_ref["object_path"],
+        sha256_hex=validated_ref["sha256"],
+        size_bytes=validated_ref["size_bytes"],
+        media_type=validated_ref["media_type"],
+    )
+    input_digest = broker_shard_input_digest(
+        json.dumps(validated_ref, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    validated_params = canonical_operation_params(pack, operation, operation_params)
+    execution_fingerprint = broker_execution_fingerprint(
+        request_id=request_id,
+        input_digest=input_digest,
+        pack=pack,
+        operation=operation,
+        operation_params=validated_params,
+        public_sha=public_sha,
+    )
+    run_id = opaque_run_id(request_id)
+    wave_id = opaque_wave_id(request_id)
+    job_id = broker_job_id(request_id, execution_fingerprint)
+    try:
+        existing = registry.resolve_wave(run_id, wave_id)
+    except KeyError:
+        existing = None
+    if existing is not None:
+        job = JobSpec.model_validate(existing["job"])
+        wave = WaveSpec.model_validate(existing["wave"])
+        shard = ShardSpec.model_validate(existing["shards"][0])
+        validate_registered_wave_binding(
+            request_id=request_id,
+            binding_input_digest=input_digest,
+            binding_pack=pack,
+            binding_operation=operation,
+            binding_operation_params=validated_params,
+            binding_execution_fingerprint=execution_fingerprint,
+            job=job,
+            shard=shard,
+        )
+        manifest = plane.read_manifest(run_id)
+        if manifest is None:
+            manifest = _initial_manifest(job, wave, shard)
+            try:
+                plane.write_next_manifest(manifest, -1)
+            except RevisionConflictError:
+                manifest = plane.read_manifest(run_id)
+            if manifest is None:
+                raise ValueError("registered run missing manifest")
+        return job, wave, shard, manifest
+    now = datetime.now(UTC)
+    job = JobSpec(
+        job_id=job_id,
+        logical_run_id=run_id,
+        pack=pack,
+        operation=operation,
+        input_manifest_ref=input_ref,
+        sharding=ShardCorrectnessSpec(mode="independent"),
+        execution=ExecutionPolicy(
+            max_parallel=1,
+            max_attempts_per_shard=4,
+            resume_enabled=True,
+        ),
+        security_profile="offline",
+        provenance=Provenance(
+            producer="a1-unix-broker-hf-direct",
+            revision="v1",
+            created_at=now,
+        ),
+        operation_params=validated_params,
+    )
+    shard = ShardSpec(
+        logical_run_id=run_id,
+        shard_id="shard-000000",
+        ordinal=0,
+        correctness=job.sharding,
+        input_refs=(input_ref,),
         input_digest=input_digest,
         execution_fingerprint=execution_fingerprint,
     )

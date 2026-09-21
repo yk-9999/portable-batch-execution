@@ -16,6 +16,11 @@ on:
         required: false
         default: false
         type: boolean
+      jpx_hf_direct:
+        description: Execute JPX pair-trading HF Bucket-direct lane (metadata-only)
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -56,3 +61,5 @@ jobs:
           PBE_MODE: ${{ inputs.private && 'private' || 'public' }}
           PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}
           PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}
+          PBE_JPX_HF_DIRECT: ${{ inputs.jpx_hf_direct && '1' || '' }}
+          HF_TOKEN: ${{ inputs.jpx_hf_direct && secrets.HF_SYSTEM_TRADING_DATA_RW_TOKEN || '' }}

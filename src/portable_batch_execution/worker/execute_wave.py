@@ -37,6 +37,10 @@ from portable_batch_execution.packs.replay_reduction.models import (
 from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate import (
     REQUEST_SCHEMA_VERSION as TRADE_PATH_REQUEST_SCHEMA_VERSION,
 )
+from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate_fixed_set import (
+    FIXED_SET_OPERATION,
+    FIXED_SET_RESULT_SCHEMA_VERSION,
+)
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})
@@ -79,6 +83,7 @@ _PRIVATE_REPLAY_BATCH_OPS = frozenset(
         "replay.event_window_extract",
         "replay.causal_grid_extract",
         "replay.trade_path_scenario_evaluate",
+        FIXED_SET_OPERATION,
     }
 )
 _MAX_REPLAY_PARQUET_INPUTS = 64
@@ -687,6 +692,43 @@ def execute_private_wave(
                                 _execution_failure_code(exc, stage="pack")
                             ) from None
                         output_rows = len(result_payload["rows"])
+                elif job.operation == FIXED_SET_OPERATION:
+                    from portable_batch_execution.transport.hf_bucket import (
+                        HfBucketTransport,
+                        build_hf_api_storage_from_token,
+                    )
+                    from portable_batch_execution.worker.hf_direct import (
+                        assert_no_private_data_plane_dependency,
+                        execute_hf_direct_trade_path_fixed_set_shard,
+                        jpx_hf_direct_enabled,
+                    )
+
+                    if not jpx_hf_direct_enabled():
+                        raise _ShardStageFailure("hf_direct_required")
+                    assert_no_private_data_plane_dependency()
+                    if len(shard.input_refs) != 1:
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    batch_ref = shard.input_refs[0]
+                    configured_output_path = str(
+                        job.operation_params.get("output_object_path") or ""
+                    )
+                    token = HfBucketTransport.token_from_environment()
+                    transport = HfBucketTransport(
+                        build_hf_api_storage_from_token(token)
+                    )
+                    out_ref, summary = execute_hf_direct_trade_path_fixed_set_shard(
+                        transport=transport,
+                        replay_pack=replay_pack,
+                        job=job,
+                        shard=shard,
+                        input_ref=batch_ref,
+                        output_object_path=configured_output_path,
+                    )
+                    input_rows = int(summary.get("record_count") or 0)
+                    output_rows = input_rows
+                    output_refs = (out_ref,)
+                    output_digest_value = out_ref.sha256.removeprefix("sha256:")
+                    publish_single_output = False
                 elif job.operation == "replay.trade_path_scenario_evaluate":
                     if len(shard.input_refs) != 1:
                         raise _ShardStageFailure("input_artifact_invalid")

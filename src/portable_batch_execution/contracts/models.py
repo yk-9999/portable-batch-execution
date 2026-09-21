@@ -60,6 +60,7 @@ PACK_OPS = {
         "replay.causal_grid_extract",
         "replay.structural_canonicalize_merge",
         "replay.trade_path_scenario_evaluate",
+        "replay.trade_path_scenario_evaluate_fixed_set",
     },
     "media-batch": {
         "media.decode",
