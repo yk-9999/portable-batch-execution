@@ -51,6 +51,7 @@ jobs:
       PBE_HF_PREFIX: ${{ inputs.hf_direct && inputs.hf_prefix || '' }}
       PBE_HF_OBJECT_LAYOUT: ${{ inputs.hf_direct && inputs.hf_object_layout || '' }}
       HF_SYSTEM_TRADING_DATA_RW_TOKEN: ${{ inputs.hf_direct && secrets.HF_SYSTEM_TRADING_DATA_RW_TOKEN || '' }}
+      HF_TOKEN: ${{ inputs.hf_direct && secrets.HF_SYSTEM_TRADING_DATA_RW_TOKEN || '' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
@@ -59,9 +60,9 @@ jobs:
       - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
       - name: Install base dependencies only
         run: uv sync --no-dev
-      - name: Install pinned Hugging Face CLI
+      - name: Install pinned huggingface_hub for hf-direct
         if: env.PBE_MODE == 'hf-direct'
-        run: uv tool install --with "click==8.2.1" --with "typer==0.23.2" "huggingface_hub==1.8.0"
+        run: uv sync --no-dev --extra hf-direct
       - name: Resolve runtime profile
         id: profile
         run: |

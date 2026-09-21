@@ -13,6 +13,7 @@ dependencies = ["pydantic>=2,<3", "httpx>=0.27"]
 [project.optional-dependencies]
 tabular = ["duckdb>=1.1", "polars>=1.0"]
 ml = ["scikit-learn>=1.5"]
+hf-direct = ["huggingface_hub==1.8.0"]
 distilbert = [
   "torch==2.11.0",
   "transformers==5.16.1",

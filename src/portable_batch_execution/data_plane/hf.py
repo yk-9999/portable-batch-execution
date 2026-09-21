@@ -21,17 +21,15 @@ in logs, in returned metadata, or in a persisted file.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from portable_batch_execution.contracts import ArtifactRef
 
@@ -42,15 +40,13 @@ REQUIRED_HF_CLI_VERSION = "1.8.0"
 
 #: Environment variable holding the token injected from the fixed GH secret.
 HF_TOKEN_ENV = "HF_SYSTEM_TRADING_DATA_RW_TOKEN"
-#: Child-process variable the ``hf`` CLI reads the token from (never argv/files).
+#: Process variable ``HfApi`` reads when the workflow maps the fixed secret.
 HF_CLI_TOKEN_ENV = "HF_TOKEN"
 
 PBE_HF_BUCKET_ENV = "PBE_HF_BUCKET"
 PBE_HF_PREFIX_ENV = "PBE_HF_PREFIX"
 PBE_HF_OBJECT_LAYOUT_ENV = "PBE_HF_OBJECT_LAYOUT"
-PBE_HF_CLI_BINARY_ENV = "PBE_HF_CLI_BINARY"
 
-DEFAULT_HF_CLI_BINARY = "hf"
 DEFAULT_MAX_OBJECT_BYTES = 1024 * 1024 * 1024
 
 _BUCKET_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
@@ -59,7 +55,24 @@ _OBJECT_ID = re.compile(r"^[0-9a-f]{64}$")
 _BARE_VERSION_LINE = re.compile(r"^([0-9][0-9A-Za-z.+-]*)$")
 _PREFIXED_VERSION_LINE = re.compile(r"^version:\s*([0-9][0-9A-Za-z.+-]*)$", re.IGNORECASE)
 
-HfRunner = Callable[..., Any]
+
+class HfBucketApi(Protocol):
+    def get_bucket_paths_info(self, bucket_id: str, paths: list[str]): ...
+
+    def download_bucket_files(
+        self,
+        bucket_id: str,
+        path_pairs: list[tuple[str, Path]],
+        *,
+        raise_on_missing_files: bool = ...,
+    ) -> None: ...
+
+    def batch_bucket_files(
+        self,
+        bucket_id: str,
+        *,
+        add: list[tuple[Path, str]] | None = ...,
+    ) -> None: ...
 
 
 class HfBucketStoreError(RuntimeError):
@@ -100,7 +113,7 @@ def validate_object_id(object_id: Any) -> str:
 
 
 def parse_hf_cli_version_output(stdout: str | None) -> str:
-    """Parse ``hf version`` stdout: one bare semver or one ``version:`` line."""
+    """Parse legacy ``hf version`` stdout: one bare semver or one ``version:`` line."""
     text = (stdout or "").strip()
     if not text:
         raise HfBucketStoreError("could not parse hf CLI version output")
@@ -186,10 +199,22 @@ class HfBucketIdentity:
         }
 
 
-def run_hf_command(argv: Sequence[str], *, env: Mapping[str, str]) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        list(argv), env=dict(env), capture_output=True, text=True, check=False
-    )
+def resolve_hf_direct_token(
+    *,
+    token: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str | None:
+    """Resolve the HF-direct token from explicit injection or bounded env vars."""
+    if token is not None:
+        return token
+    source = os.environ if env is None else env
+    return source.get(HF_TOKEN_ENV) or source.get(HF_CLI_TOKEN_ENV)
+
+
+def build_hf_api(token: str) -> HfBucketApi:
+    from huggingface_hub import HfApi
+
+    return HfApi(token=token)
 
 
 class HfBucketArtifactStore:
@@ -199,19 +224,16 @@ class HfBucketArtifactStore:
         self,
         identity: HfBucketIdentity,
         *,
-        runner: HfRunner | None = None,
+        api: HfBucketApi | None = None,
         token: str | None = None,
         spool_root: Path | None = None,
-        hf_binary: str | None = None,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
     ) -> None:
         self.identity = identity
-        self._run: HfRunner = runner or run_hf_command
+        self._api = api
+        self._lazy_api: HfBucketApi | None = None
         self._token = token
         self._spool_root = Path(spool_root) if spool_root is not None else None
-        self._hf_binary = hf_binary or os.environ.get(
-            PBE_HF_CLI_BINARY_ENV, DEFAULT_HF_CLI_BINARY
-        )
         if max_object_bytes <= 0:
             raise HfBucketStoreError("max_object_bytes must be positive")
         self._max_object_bytes = max_object_bytes
@@ -222,35 +244,32 @@ class HfBucketArtifactStore:
     ) -> HfBucketArtifactStore:
         return cls(HfBucketIdentity.from_environment(env), **kwargs)
 
-    # -- invocation ------------------------------------------------------------
+    def _resolve_token(self) -> str | None:
+        return resolve_hf_direct_token(token=self._token)
 
-    def _child_env(self) -> dict[str, str]:
-        env = dict(os.environ)
-        token = self._token if self._token is not None else os.environ.get(HF_TOKEN_ENV)
-        if token:
-            env[HF_CLI_TOKEN_ENV] = token
-        return env
+    def _client(self) -> HfBucketApi:
+        if self._api is not None:
+            return self._api
+        if self._lazy_api is None:
+            token = self._resolve_token()
+            if not token:
+                raise HfBucketStoreError("HF token is required for bucket access")
+            self._lazy_api = build_hf_api(token)
+        return self._lazy_api
 
-    def _invoke(self, argv: Sequence[str], *, operation: str) -> subprocess.CompletedProcess:
-        completed = self._run(list(argv), env=self._child_env())
-        if completed.returncode != 0:
-            raise HfBucketStoreError(
-                f"hf {operation} failed with exit code {completed.returncode}"
-            )
-        return completed
-
-    def cli_version(self) -> str:
-        completed = self._invoke([self._hf_binary, "--version"], operation="version")
-        return parse_hf_cli_version_output(completed.stdout or "")
+    def huggingface_hub_version(self) -> str:
+        try:
+            import huggingface_hub
+        except ImportError as exc:
+            raise HfBucketStoreError("huggingface_hub is not available") from exc
+        return huggingface_hub.__version__
 
     def preflight(self) -> None:
-        """Fail closed unless the pinned HF CLI is present and exactly versioned."""
-        if shutil.which(self._hf_binary) is None:
-            raise HfBucketStoreError("hf CLI binary is not available on PATH")
-        version = self.cli_version()
+        """Fail closed unless pinned ``huggingface_hub`` is importable and exact."""
+        version = self.huggingface_hub_version()
         if version != REQUIRED_HF_CLI_VERSION:
             raise HfBucketStoreError(
-                f"hf CLI version {version!r} does not match required "
+                f"huggingface_hub version {version!r} does not match required "
                 f"{REQUIRED_HF_CLI_VERSION!r}"
             )
 
@@ -259,44 +278,30 @@ class HfBucketArtifactStore:
             self._spool_root.mkdir(parents=True, exist_ok=True)
         return Path(tempfile.mkdtemp(prefix="hf-direct-", dir=self._spool_root))
 
-    # -- remote metadata -------------------------------------------------------
-
-    def _parse_list(self, stdout: str | None, object_id: str) -> int | None:
-        raw = stdout if stdout is not None else ""
-        text = raw.strip()
-        if not text or text in ("[]", "null", "(empty)"):
-            return None
-        try:
-            payload = json.loads(text)
-        except ValueError as exc:
-            raise HfBucketStoreError("invalid hf buckets list JSON response") from exc
-        if isinstance(payload, dict):
-            entries = [payload]
-        elif isinstance(payload, list):
-            entries = payload
-        else:
-            raise HfBucketStoreError("ambiguous hf buckets list response")
+    def _parse_path_info(self, entries: list[Any], object_id: str) -> int | None:
         if not entries:
             return None
         if len(entries) != 1:
             raise HfBucketStoreError("ambiguous remote object listing")
         entry = entries[0]
-        if not isinstance(entry, dict):
-            raise HfBucketStoreError("invalid hf buckets list entry")
-        path = entry.get("path") or entry.get("name")
+        path = getattr(entry, "path", None)
+        if path is None and isinstance(entry, Mapping):
+            path = entry.get("path") or entry.get("name")
         if path is None:
-            raise HfBucketStoreError("hf buckets list entry missing path")
+            raise HfBucketStoreError("hf bucket path info entry missing path")
         if str(path).replace("\\", "/") != self.identity.remote_path(object_id):
             raise HfBucketStoreError("remote object path does not match the closed identity")
-        size_raw = entry.get("size") or entry.get("size_bytes") or entry.get("Size")
+        size_raw = getattr(entry, "size", None)
+        if size_raw is None and isinstance(entry, Mapping):
+            size_raw = entry.get("size") or entry.get("size_bytes") or entry.get("Size")
         if size_raw is None:
-            raise HfBucketStoreError("hf buckets list entry missing size")
+            raise HfBucketStoreError("hf bucket path info entry missing size")
         try:
             size_bytes = int(size_raw)
         except (TypeError, ValueError) as exc:
-            raise HfBucketStoreError("hf buckets list entry has an invalid size") from exc
+            raise HfBucketStoreError("hf bucket path info entry has an invalid size") from exc
         if size_bytes < 0:
-            raise HfBucketStoreError("hf buckets list entry has an invalid size")
+            raise HfBucketStoreError("hf bucket path info entry has an invalid size")
         if size_bytes > self._max_object_bytes:
             raise HfBucketStoreError("remote object exceeds the bounded maximum size")
         return size_bytes
@@ -304,22 +309,14 @@ class HfBucketArtifactStore:
     def remote_size(self, object_id: str) -> int | None:
         """Return the exact remote size, or ``None`` when the object is absent."""
         object_id = validate_object_id(object_id)
-        completed = self._run(
-            [
-                self._hf_binary,
-                "buckets",
-                "list",
-                self.identity.object_uri(object_id),
-                "--format",
-                "json",
-            ],
-            env=self._child_env(),
-        )
-        if completed.returncode != 0:
+        remote_path = self.identity.remote_path(object_id)
+        try:
+            entries = list(
+                self._client().get_bucket_paths_info(self.identity.bucket, [remote_path])
+            )
+        except (OSError, RuntimeError, ValueError):
             return None
-        return self._parse_list(completed.stdout, object_id)
-
-    # -- artifact operations ---------------------------------------------------
+        return self._parse_path_info(entries, object_id)
 
     def _resolve_object_id(self, ref: ArtifactRef) -> str:
         object_id = validate_object_id(ref.object_id)
@@ -337,19 +334,18 @@ class HfBucketArtifactStore:
             raise HfBucketStoreError("artifact object size mismatch")
         spool = self._spool_directory()
         destination = spool / object_id
+        remote_path = self.identity.remote_path(object_id)
         try:
-            self._invoke(
-                [
-                    self._hf_binary,
-                    "buckets",
-                    "cp",
-                    self.identity.object_uri(object_id),
-                    str(destination),
-                ],
-                operation="buckets cp",
-            )
+            try:
+                self._client().download_bucket_files(
+                    self.identity.bucket,
+                    [(remote_path, destination)],
+                    raise_on_missing_files=True,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise HfBucketStoreError("hf bucket download failed") from exc
             if not destination.is_file():
-                raise HfBucketStoreError("hf buckets cp produced no local object")
+                raise HfBucketStoreError("hf bucket download produced no local object")
             data = destination.read_bytes()
         finally:
             shutil.rmtree(spool, ignore_errors=True)
@@ -373,19 +369,17 @@ class HfBucketArtifactStore:
                 raise HfBucketStoreError("existing remote object size mismatch")
         else:
             spool = self._spool_directory()
+            remote_path = self.identity.remote_path(object_id)
             try:
                 spool_path = spool / object_id
                 spool_path.write_bytes(data)
-                self._invoke(
-                    [
-                        self._hf_binary,
-                        "buckets",
-                        "cp",
-                        str(spool_path),
-                        self.identity.object_uri(object_id),
-                    ],
-                    operation="buckets cp",
-                )
+                try:
+                    self._client().batch_bucket_files(
+                        self.identity.bucket,
+                        add=[(spool_path, remote_path)],
+                    )
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise HfBucketStoreError("hf bucket upload failed") from exc
             finally:
                 shutil.rmtree(spool, ignore_errors=True)
             persisted = self.remote_size(object_id)

@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 
 import httpx
-from support.hf_bucket_cli import FakeBucketCli as _FakeBucketCli
+from support.hf_bucket_api import FakeHfApi
 
 from portable_batch_execution.contracts import ArtifactRef, ShardAttemptRecord
 from portable_batch_execution.data_plane.hf import (
@@ -48,23 +48,23 @@ def _recording_control():
 
 def _plane():
     control, seen = _recording_control()
-    cli = _FakeBucketCli()
-    store = HfBucketArtifactStore(identity=_IDENTITY, runner=cli)
-    return HfDirectDataPlane(control, store), seen, cli
+    api = FakeHfApi()
+    store = HfBucketArtifactStore(identity=_IDENTITY, api=api)
+    return HfDirectDataPlane(control, store), seen, api
 
 
 def test_control_metadata_is_delegated_to_a1():
-    plane, seen, _cli = _plane()
+    plane, seen, _api = _plane()
     plane.resolve_wave("run", "wave")
     assert [method for method, _ in seen] == ["GET"]
     assert seen[0][1] == "/v1/runs/run/waves/wave"
 
 
 def test_artifact_reads_and_writes_never_touch_a1_artifact_endpoints():
-    plane, seen, cli = _plane()
+    plane, seen, api = _plane()
     data = b"direct-bytes"
     object_id = sha256(data).hexdigest()
-    cli.objects[object_id] = data
+    api.objects[_IDENTITY.remote_path(object_id)] = data
     ref = ArtifactRef(
         object_id=object_id,
         uri=f"{_IDENTITY.objects_uri}/{object_id}",
@@ -76,7 +76,7 @@ def test_artifact_reads_and_writes_never_touch_a1_artifact_endpoints():
     assert plane.exists(written) is True
     assert plane.verify(written) is True
     assert seen == []
-    assert cli.calls
+    assert api.get_paths_calls or api.batch_calls
 
 
 def test_attempt_and_manifest_calls_stay_on_control_plane():

@@ -4,7 +4,7 @@ from hashlib import sha256
 
 import httpx
 import pytest
-from support.hf_bucket_cli import FakeBucketCli as _FakeBucketCli
+from support.hf_bucket_api import FakeHfApi
 
 from portable_batch_execution.contracts import ArtifactRef, ShardAttemptRecord
 from portable_batch_execution.data_plane.hf import (
@@ -98,17 +98,17 @@ def _hf_direct_plane(monkeypatch, resolved, appended):
         "control-token",
         client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
-    cli = _FakeBucketCli()
-    store = HfBucketArtifactStore(identity=_IDENTITY, runner=cli)
-    return HfDirectDataPlane(control, store), seen, cli
+    api = FakeHfApi()
+    store = HfBucketArtifactStore(identity=_IDENTITY, api=api)
+    return HfDirectDataPlane(control, store), seen, api
 
 
 def test_hf_direct_worker_never_issues_a1_artifact_endpoints(monkeypatch):
     _rows, input_bytes, object_id = _payloads()
     resolved, _ref = _resolved(input_bytes, object_id)
     appended: list = []
-    plane, seen, cli = _hf_direct_plane(monkeypatch, resolved, appended)
-    cli.objects[object_id] = input_bytes
+    plane, seen, api = _hf_direct_plane(monkeypatch, resolved, appended)
+    api.objects[_IDENTITY.remote_path(object_id)] = input_bytes
 
     attempts = execute_private_wave(
         "opaque-run", "opaque-wave", plane=plane, mode="hf-direct"
@@ -127,14 +127,16 @@ def test_hf_direct_worker_never_issues_a1_artifact_endpoints(monkeypatch):
     assert output_ref.uri.startswith(
         "hf://buckets/yamauchiJP/system-trading-data/live-stream-news/hf-direct-20260921/objects/sha256/"
     )
-    assert output_ref.object_id in cli.objects
+    assert output_ref.object_id in {
+        path.rsplit("/", 1)[-1] for path in api.objects
+    }
     assert _TOKEN not in json.dumps(attempts[0].model_dump(mode="json"))
 
 
 def test_hf_direct_worker_fails_closed_on_missing_remote_input(monkeypatch):
     _rows, input_bytes, object_id = _payloads()
     resolved, _ref = _resolved(input_bytes, object_id)
-    plane, seen, _cli = _hf_direct_plane(monkeypatch, resolved, [])
+    plane, seen, _api = _hf_direct_plane(monkeypatch, resolved, [])
 
     with pytest.raises(Exception) as error:
         execute_private_wave(

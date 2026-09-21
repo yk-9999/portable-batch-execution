@@ -1,9 +1,11 @@
 import json
+import sys
 from hashlib import sha256
+from types import ModuleType
+from unittest.mock import MagicMock, patch
 
 import pytest
-from support.hf_bucket_cli import FakeBucketCli as _FakeBucketCli
-from support.hf_bucket_cli import completed as _completed
+from support.hf_bucket_api import FakeHfApi
 
 from portable_batch_execution.contracts import ArtifactRef
 from portable_batch_execution.data_plane.hf import (
@@ -14,10 +16,13 @@ from portable_batch_execution.data_plane.hf import (
     HfBucketArtifactStore,
     HfBucketIdentity,
     HfBucketStoreError,
+    build_hf_api,
+    resolve_hf_direct_token,
 )
 
 _TOKEN = "hf_SENTINEL_TOKEN_DO_NOT_LEAK"
 _OBJECT_ID = sha256(b"payload-bytes").hexdigest()
+_REMOTE_PREFIX = "live-stream-news/hf-direct-20260921/objects/sha256"
 
 
 def _identity(bucket="yamauchiJP/system-trading-data", prefix="live-stream-news/hf-direct-20260921/"):
@@ -32,6 +37,10 @@ def _identity(bucket="yamauchiJP/system-trading-data", prefix="live-stream-news/
     )
 
 
+def _remote_path(object_id: str) -> str:
+    return f"{_REMOTE_PREFIX}/{object_id}"
+
+
 def _ref(data: bytes, **overrides):
     object_id = sha256(data).hexdigest()
     fields = {
@@ -42,6 +51,11 @@ def _ref(data: bytes, **overrides):
     }
     fields.update(overrides)
     return ArtifactRef(**fields)
+
+
+def _store(api: FakeHfApi | None = None, **kwargs):
+    fake = api or FakeHfApi()
+    return HfBucketArtifactStore(identity=_identity(), api=fake, **kwargs), fake
 
 
 def test_identity_maps_sha256_flat_object_layout():
@@ -108,40 +122,43 @@ def test_identity_fails_closed_on_unsafe_or_out_of_scope_paths(bucket, prefix):
 
 
 def test_read_derives_object_from_identity_then_verifies_hash_and_size():
-    cli = _FakeBucketCli()
+    api = FakeHfApi()
     data = b"payload-bytes"
-    cli.objects[_OBJECT_ID] = data
-    store = HfBucketArtifactStore(identity=_identity(), runner=cli)
+    api.objects[_remote_path(_OBJECT_ID)] = data
+    store, _ = _store(api)
     assert store.read(_ref(data)) == data
-    list_call = next(call for call in cli.calls if call[2] == "list")
-    assert list_call[3].endswith("/objects/sha256/" + _OBJECT_ID)
+    assert api.get_paths_calls[-1] == (
+        "yamauchiJP/system-trading-data",
+        [_remote_path(_OBJECT_ID)],
+    )
+    _, pairs = api.download_calls[-1]
+    assert pairs[0][0] == _remote_path(_OBJECT_ID)
 
 
 def test_read_fails_closed_when_object_missing():
-    cli = _FakeBucketCli()
-    store = HfBucketArtifactStore(identity=_identity(), runner=cli)
+    store, _ = _store(FakeHfApi())
     with pytest.raises(HfBucketStoreError):
         store.read(_ref(b"payload-bytes"))
 
 
 def test_read_fails_closed_on_size_or_digest_mismatch():
     data = b"payload-bytes"
-    cli = _FakeBucketCli()
-    cli.objects[_OBJECT_ID] = data
-    store = HfBucketArtifactStore(identity=_identity(), runner=cli)
+    api = FakeHfApi()
+    api.objects[_remote_path(_OBJECT_ID)] = data
+    store, _ = _store(api)
     with pytest.raises(HfBucketStoreError):
         store.read(_ref(data, size_bytes=len(data) + 1))
 
-    cli_corrupt = _FakeBucketCli()
-    cli_corrupt.objects[_OBJECT_ID] = b"corrupted!!"
-    store_corrupt = HfBucketArtifactStore(identity=_identity(), runner=cli_corrupt)
+    api_corrupt = FakeHfApi()
+    api_corrupt.objects[_remote_path(_OBJECT_ID)] = b"corrupted!!"
+    store_corrupt, _ = _store(api_corrupt)
     with pytest.raises(HfBucketStoreError):
         store_corrupt.read(_ref(b"corrupted!!"))
 
 
 def test_read_rejects_ref_object_id_that_is_not_lowercase_sha256():
-    cli = _FakeBucketCli()
-    store = HfBucketArtifactStore(identity=_identity(), runner=cli)
+    api = FakeHfApi()
+    store, _ = _store(api)
     ref = ArtifactRef(
         object_id="OpaqueObject",
         uri="hf://buckets/yamauchiJP/system-trading-data/objects/sha256/OpaqueObject",
@@ -149,76 +166,95 @@ def test_read_rejects_ref_object_id_that_is_not_lowercase_sha256():
     )
     with pytest.raises(HfBucketStoreError):
         store.read(ref)
-    assert cli.calls == []
+    assert api.get_paths_calls == []
 
 
 def test_write_content_addresses_and_returns_hf_reference():
-    cli = _FakeBucketCli()
-    store = HfBucketArtifactStore(identity=_identity(), runner=cli)
+    store, api = _store()
     ref = store.write(b"payload-bytes", "application/octet-stream")
     assert ref.object_id == _OBJECT_ID
     assert ref.sha256 == f"sha256:{_OBJECT_ID}"
     assert ref.size_bytes == len(b"payload-bytes")
     assert ref.uri.startswith("hf://buckets/yamauchiJP/system-trading-data/")
     assert ref.uri.endswith("/objects/sha256/" + _OBJECT_ID)
+    assert api.objects[_remote_path(_OBJECT_ID)] == b"payload-bytes"
 
 
 def test_write_is_idempotent_and_reuses_existing_exact_size_object():
-    cli = _FakeBucketCli()
-    store = HfBucketArtifactStore(identity=_identity(), runner=cli)
+    api = FakeHfApi()
+    store, _ = _store(api)
     first = store.write(b"payload-bytes")
-    uploads_after_first = [call for call in cli.calls if call[2] == "cp" and not call[3].startswith("hf://")]
+    uploads_after_first = len(api.batch_calls)
     second = store.write(b"payload-bytes")
-    uploads_after_second = [call for call in cli.calls if call[2] == "cp" and not call[3].startswith("hf://")]
+    uploads_after_second = len(api.batch_calls)
     assert first == second
-    assert len(uploads_after_first) == 1
-    assert len(uploads_after_second) == 1
+    assert uploads_after_first == 1
+    assert uploads_after_second == 1
 
 
 def test_write_rechecks_persistence_and_fails_on_size_drift():
-    class _NonPersistingCli(_FakeBucketCli):
-        def _cp(self, source, destination):
-            if source.startswith("hf://"):
-                return super()._cp(source, destination)
-            self.objects[destination.rstrip("/").rsplit("/", 1)[-1]] = b"short"
-            return _completed("")
+    class _NonPersistingApi(FakeHfApi):
+        def batch_bucket_files(self, bucket_id, *, add=None):
+            super().batch_bucket_files(bucket_id, add=add)
+            for _, remote_path in add or []:
+                self.objects[remote_path] = b"short"
 
-    store = HfBucketArtifactStore(identity=_identity(), runner=_NonPersistingCli())
+    store, _ = _store(_NonPersistingApi())
     with pytest.raises(HfBucketStoreError):
         store.write(b"payload-bytes")
 
 
 def test_exists_and_verify_are_fail_closed():
-    cli = _FakeBucketCli()
+    api = FakeHfApi()
     data = b"payload-bytes"
-    store = HfBucketArtifactStore(identity=_identity(), runner=cli)
+    store, _ = _store(api)
     assert store.exists(_ref(data)) is False
     assert store.verify(_ref(data)) is False
-    cli.objects[_OBJECT_ID] = data
+    api.objects[_remote_path(_OBJECT_ID)] = data
     assert store.exists(_ref(data)) is True
     assert store.verify(_ref(data)) is True
     assert store.verify(_ref(data, size_bytes=0)) is False
 
 
-def test_token_is_never_on_argv_or_in_returned_metadata(monkeypatch):
+def test_token_is_passed_to_hf_api_and_never_in_returned_metadata(monkeypatch):
     monkeypatch.setenv(HF_TOKEN_ENV, _TOKEN)
-    cli = _FakeBucketCli()
-    store = HfBucketArtifactStore(identity=_identity(), runner=cli)
-    ref = store.write(b"payload-bytes")
-    store.read(ref)
-    for call in cli.calls:
-        assert all(_TOKEN not in argument for argument in call)
+    captured: dict[str, str] = {}
+
+    class _RecordingApi(FakeHfApi):
+        def __init__(self, *, token=None):
+            super().__init__(token=token)
+            captured["token"] = token
+
+    with patch(
+        "portable_batch_execution.data_plane.hf.build_hf_api",
+        side_effect=lambda token: _RecordingApi(token=token),
+    ):
+        store = HfBucketArtifactStore(identity=_identity())
+        ref = store.write(b"payload-bytes")
+        store.read(ref)
+    assert captured["token"] == _TOKEN
     assert _TOKEN not in json.dumps(ref.model_dump(mode="json"))
-    assert all(_TOKEN not in value for env in cli.envs for value in env.values() if value != _TOKEN)
-    assert all(env.get(HF_CLI_TOKEN_ENV) == _TOKEN for env in cli.envs)
 
 
-def test_token_is_absent_from_child_env_when_not_configured(monkeypatch):
-    monkeypatch.delenv(HF_TOKEN_ENV, raising=False)
-    cli = _FakeBucketCli()
-    store = HfBucketArtifactStore(identity=_identity(), runner=cli)
-    store.write(b"payload-bytes")
-    assert all(HF_CLI_TOKEN_ENV not in env for env in cli.envs)
+def test_resolve_hf_direct_token_prefers_fixed_secret_then_hf_token_env():
+    assert resolve_hf_direct_token(token=_TOKEN) == _TOKEN
+    assert resolve_hf_direct_token(env={HF_TOKEN_ENV: "secret-token"}) == "secret-token"
+    assert resolve_hf_direct_token(env={HF_CLI_TOKEN_ENV: "mapped-token"}) == "mapped-token"
+    assert (
+        resolve_hf_direct_token(
+            env={HF_TOKEN_ENV: "secret-token", HF_CLI_TOKEN_ENV: "mapped-token"}
+        )
+        == "secret-token"
+    )
+
+
+def test_build_hf_api_passes_token_to_hf_api_constructor():
+    mock_hf_api = MagicMock()
+    fake_hub = ModuleType("huggingface_hub")
+    fake_hub.HfApi = mock_hf_api
+    with patch.dict(sys.modules, {"huggingface_hub": fake_hub}):
+        build_hf_api(_TOKEN)
+    mock_hf_api.assert_called_once_with(token=_TOKEN)
 
 
 def test_identity_from_environment_uses_only_bounded_metadata(monkeypatch):
@@ -270,33 +306,26 @@ def test_parse_hf_cli_version_output_rejects_malformed(stdout):
         parse_hf_cli_version_output(stdout)
 
 
-def test_preflight_fails_closed_on_absent_or_wrong_cli(monkeypatch):
-    cli = _FakeBucketCli()
-    store = HfBucketArtifactStore(
-        identity=_identity(), runner=cli, hf_binary="definitely-not-hf"
-    )
-    with pytest.raises(HfBucketStoreError):
+def test_preflight_fails_closed_on_missing_or_wrong_huggingface_hub(monkeypatch):
+    store, _ = _store()
+    with (
+        patch(
+            "portable_batch_execution.data_plane.hf.HfBucketArtifactStore.huggingface_hub_version",
+            side_effect=HfBucketStoreError("huggingface_hub is not available"),
+        ),
+        pytest.raises(HfBucketStoreError, match="not available"),
+    ):
         store.preflight()
 
-    def wrong_version(argv, *, env):
-        return _completed("2.0.0")
-
-    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/hf")
-    store_wrong = HfBucketArtifactStore(
-        identity=_identity(), runner=wrong_version, hf_binary="hf"
-    )
-    with pytest.raises(HfBucketStoreError):
+    store_wrong, _ = _store()
+    with (
+        patch.object(store_wrong, "huggingface_hub_version", return_value="2.0.0"),
+        pytest.raises(HfBucketStoreError, match="does not match required"),
+    ):
         store_wrong.preflight()
 
 
-def test_preflight_passes_on_exact_pinned_cli(monkeypatch):
-    monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/hf")
-
-    def exact_version(argv, *, env):
-        assert argv == ["hf", "--version"]
-        return _completed("version: 1.8.0\n")
-
-    store = HfBucketArtifactStore(
-        identity=_identity(), runner=exact_version, hf_binary="hf"
-    )
-    store.preflight()
+def test_preflight_passes_on_exact_pinned_huggingface_hub():
+    store, _ = _store()
+    with patch.object(store, "huggingface_hub_version", return_value="1.8.0"):
+        store.preflight()
