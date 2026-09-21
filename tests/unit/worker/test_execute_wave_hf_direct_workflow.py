@@ -68,4 +68,5 @@ def test_hf_direct_profile_sync_retains_hf_extra():
     assert "uv sync --no-dev --extra tabular --extra hf-direct" in workflow
     assert "uv sync --no-dev --extra ml --extra hf-direct" in workflow
     assert "uv sync --no-dev --extra distilbert --extra hf-direct" in workflow
+    assert workflow.count('if [ "$PBE_MODE" = "hf-direct" ]; then') == 4
 
