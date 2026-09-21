@@ -8,9 +8,10 @@ import socket
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .hf_direct import BrokerHfDirectExecuteResponse, hf_direct_response_to_json
 from .peers import read_peer_credentials
 from .protocol import BrokerExecuteResponse, response_to_json
-from .service import UnixBrokerService
+from .service import UnixBrokerService, _request_id_or_unknown
 
 
 def serve_unix_broker(
@@ -56,18 +57,31 @@ def _serve_accept_loop(
 
 
 def _handle_connection(connection: socket.socket, service: UnixBrokerService) -> None:
+    payload: object = None
     try:
         _, uid, _gid = read_peer_credentials(connection)
         frame = _read_frame(connection, service.config.max_request_frame_bytes)
         payload = json.loads(frame.decode("utf-8"))
         response = service.handle_payload(uid, payload)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        response = BrokerExecuteResponse(
-            request_id="unknown",
-            status="failed",
-            error_code="broker_internal_error",
-        )
-    connection.sendall(response_to_json(response))
+        if isinstance(payload, dict) and payload.get("schema_version") == (
+            "pbe.a1-unix-broker.hf-direct-request.v1"
+        ):
+            response = BrokerHfDirectExecuteResponse(
+                request_id=_request_id_or_unknown(payload),
+                status="failed",
+                error_code="broker_internal_error",
+            )
+        else:
+            response = BrokerExecuteResponse(
+                request_id=_request_id_or_unknown(payload),
+                status="failed",
+                error_code="broker_internal_error",
+            )
+    if isinstance(response, BrokerHfDirectExecuteResponse):
+        connection.sendall(hf_direct_response_to_json(response))
+    else:
+        connection.sendall(response_to_json(response))
 
 
 def _read_frame(connection: socket.socket, max_frame_bytes: int) -> bytes:
