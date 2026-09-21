@@ -1,0 +1,30 @@
+name: TASK-0062 stage HF fixture
+
+on:
+  push:
+    branches:
+      - validation/task0062-hf-direct-stress-20260921
+    paths:
+      - validation/task0062_stage_hf_fixture.py
+      - .github/workflows/task0062-stage-hf-fixture.yml
+
+permissions:
+  contents: read
+
+jobs:
+  stage-hf-fixture:
+    runs-on: ubuntu-latest
+    env:
+      HF_SYSTEM_TRADING_DATA_RW_TOKEN: ${{ secrets.HF_SYSTEM_TRADING_DATA_RW_TOKEN }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
+      - name: Install base dependencies
+        run: uv sync --no-dev
+      - name: Install pinned Hugging Face CLI
+        run: uv tool install "huggingface_hub[cli]==1.8.0"
+      - name: Stage synthetic non-outcome fixture directly to HF
+        run: uv run --no-sync python validation/task0062_stage_hf_fixture.py
