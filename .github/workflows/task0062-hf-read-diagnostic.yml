@@ -1,0 +1,53 @@
+name: TASK-0062 HF read diagnostic
+
+on:
+  push:
+    branches:
+      - validation/task0062-hf-read-diagnostic-20260921
+
+permissions:
+  contents: read
+
+jobs:
+  hf-read:
+    runs-on: ubuntu-latest
+    env:
+      HF_SYSTEM_TRADING_DATA_RW_TOKEN: ${{ secrets.HF_SYSTEM_TRADING_DATA_RW_TOKEN }}
+      PBE_HF_BUCKET: yamauchiJP/system-trading-data
+      PBE_HF_PREFIX: live-stream-news/tmp/task0038/
+      PBE_HF_OBJECT_LAYOUT: sha256-flat.v1
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
+      - name: Install base dependencies
+        run: uv sync --no-dev
+      - name: Install pinned Hugging Face CLI
+        run: uv tool install --with "click==8.2.1" --with "typer==0.23.2" "huggingface_hub==1.8.0"
+      - name: Read exact HF input object
+        shell: bash
+        run: |
+          uv run --no-sync python - <<'PY'
+          from hashlib import sha256
+          from portable_batch_execution.contracts import ArtifactRef
+          from portable_batch_execution.data_plane.hf import HfBucketArtifactStore
+
+          object_id = "c07ea0e17e5e98e058d4b961d8f0076aff090b139f0b7cd54c03399a146faf5a"
+          expected_size = 18_900_000
+          store = HfBucketArtifactStore.from_environment()
+          store.preflight()
+          ref = ArtifactRef(
+              object_id=object_id,
+              uri=store.identity.object_uri(object_id),
+              sha256=f"sha256:{object_id}",
+              media_type="application/json",
+              size_bytes=expected_size,
+          )
+          data = store.read(ref)
+          assert len(data) == expected_size
+          assert sha256(data).hexdigest() == object_id
+          print("task0062_hf_read_diagnostic=pass")
+          print(f"bytes={len(data)}")
+          PY
