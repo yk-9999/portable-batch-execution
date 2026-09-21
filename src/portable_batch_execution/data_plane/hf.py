@@ -240,7 +240,7 @@ class HfBucketArtifactStore:
         return completed
 
     def cli_version(self) -> str:
-        completed = self._invoke([self._hf_binary, "version"], operation="version")
+        completed = self._invoke([self._hf_binary, "--version"], operation="version")
         return parse_hf_cli_version_output(completed.stdout or "")
 
     def preflight(self) -> None:

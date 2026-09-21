@@ -293,6 +293,7 @@ def test_preflight_passes_on_exact_pinned_cli(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/hf")
 
     def exact_version(argv, *, env):
+        assert argv == ["hf", "--version"]
         return _completed("version: 1.8.0\n")
 
     store = HfBucketArtifactStore(
