@@ -42,10 +42,15 @@ def test_hf_direct_dispatch_carries_only_bounded_metadata_not_payloads():
 
 def test_hf_direct_installs_pinned_hf_cli_before_resolution():
     workflow = _text()
-    assert 'uv tool install "huggingface_hub[cli]==1.8.0"' in workflow
-    assert workflow.index('huggingface_hub[cli]==1.8.0') < workflow.index(
+    install = (
+        'uv tool install --with "click==8.1.8" --with "typer==0.23.2" '
+        '"huggingface_hub==1.8.0"'
+    )
+    assert install in workflow
+    assert workflow.index(install) < workflow.index(
         "python -m portable_batch_execution.worker.runtime_profile"
     )
+    assert "huggingface_hub[cli]" not in workflow
     assert "--mode hf-direct" in workflow
     assert workflow.count("--mode hf-direct") == 1
 

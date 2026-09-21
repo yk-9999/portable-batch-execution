@@ -61,7 +61,7 @@ jobs:
         run: uv sync --no-dev
       - name: Install pinned Hugging Face CLI
         if: env.PBE_MODE == 'hf-direct'
-        run: uv tool install "huggingface_hub[cli]==1.8.0"
+        run: uv tool install --with "click==8.1.8" --with "typer==0.23.2" "huggingface_hub==1.8.0"
       - name: Resolve runtime profile
         id: profile
         run: |
