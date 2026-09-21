@@ -21,7 +21,7 @@ class PrivateDataPlaneError(RuntimeError):
     """An error intentionally containing operation/status, never response data."""
 
 
-_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0)
+_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
 
 
 class HttpPrivateDataPlane:
@@ -116,4 +116,3 @@ class HttpPrivateDataPlane:
         if response.status_code >= 400: raise PrivateDataPlaneError(f"private data plane write manifest failed with HTTP {response.status_code}")
         try: return RunManifest.model_validate(response.json())
         except ValueError as exc: raise PrivateDataPlaneError("private data plane write manifest returned invalid contracts") from exc
-
