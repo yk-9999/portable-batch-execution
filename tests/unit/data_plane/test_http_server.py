@@ -70,7 +70,10 @@ def test_unauthorized_request_does_not_read_request_body(tmp_path):
     handler.rfile = BytesIO(payload)
     handler.wfile = BytesIO()
     handler.path = "/v1/artifacts"
-    handler.headers = {"Content-Length": str(len(payload)), "Authorization": "Bearer wrong"}
+    handler.headers = {
+        "Content-Length": str(len(payload)),
+        "Authorization": "Bearer wrong",
+    }
     handler.request_version = "HTTP/1.1"
     handler.protocol_version = "HTTP/1.1"
     handler.close_connection = True

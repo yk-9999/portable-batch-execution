@@ -399,7 +399,9 @@ def test_identity_namespace_separates_same_numeric_id(tmp_path):
     )
     assert len(result["ledger_rows"]) == 2
     assert all(item["classification"] == "singleton" for item in result["ledger_rows"])
-    assert {item["identity_namespace"]["book_id"] for item in result["ledger_rows"]} == {
+    assert {
+        item["identity_namespace"]["book_id"] for item in result["ledger_rows"]
+    } == {
         "a",
         "b",
     }
@@ -438,9 +440,7 @@ def test_signed_execution_mapping_flip(tmp_path):
             "trade_qty": 5.0,
         },
     ]
-    result = execute_paired_fill_reduce(
-        [_write(tmp_path / "p.parquet", rows)], request
-    )
+    result = execute_paired_fill_reduce([_write(tmp_path / "p.parquet", rows)], request)
     aggressor = _participant(result["ledger_rows"][0], "aggressor")
     assert aggressor["signed_execution"] == -15.0
     assert aggressor["closing_quantity"] == 10.0

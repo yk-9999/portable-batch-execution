@@ -62,7 +62,9 @@ def validate_distilbert_classifier_config(config: Any) -> None:
     _validate_raw_distilbert_config_json(config)
 
 
-def _parse_model_tensors(name: str, side: Any, row_count: int) -> tuple[list[list[int]], list[list[int]]]:
+def _parse_model_tensors(
+    name: str, side: Any, row_count: int
+) -> tuple[list[list[int]], list[list[int]]]:
     if not isinstance(side, dict):
         raise TypeError(f"{name} must be an object")
     if frozenset(side.keys()) != _MODEL_TENSOR_KEYS:
@@ -84,7 +86,9 @@ def _parse_model_tensors(name: str, side: Any, row_count: int) -> tuple[list[lis
         if len(id_row) != len(mask_row):
             raise ValueError(f"{name} input_ids and attention_mask shapes must match")
         if not (_MIN_SEQ_LEN <= len(id_row) <= _MAX_SEQ_LEN):
-            raise ValueError(f"{name} sequence length must be between {_MIN_SEQ_LEN} and {_MAX_SEQ_LEN}")
+            raise ValueError(
+                f"{name} sequence length must be between {_MIN_SEQ_LEN} and {_MAX_SEQ_LEN}"
+            )
         if seq_len is None:
             seq_len = len(id_row)
         elif len(id_row) != seq_len:
@@ -92,7 +96,11 @@ def _parse_model_tensors(name: str, side: Any, row_count: int) -> tuple[list[lis
         parsed_id_row: list[int] = []
         parsed_mask_row: list[int] = []
         for token_id, mask_value in zip(id_row, mask_row, strict=True):
-            if not isinstance(token_id, int) or isinstance(token_id, bool) or token_id < 0:
+            if (
+                not isinstance(token_id, int)
+                or isinstance(token_id, bool)
+                or token_id < 0
+            ):
                 raise ValueError(f"{name} input_ids must be non-negative integers")
             if mask_value not in (0, 1):
                 raise ValueError(f"{name} attention_mask values must be 0 or 1")
@@ -127,8 +135,12 @@ def validate_distilbert_pair_binary_scores_input(payload: Any) -> dict[str, Any]
         seen.add(row_id)
         normalized_ids.append(row_id)
     row_count = len(normalized_ids)
-    model_a_ids, model_a_mask = _parse_model_tensors("model_a", payload.get("model_a"), row_count)
-    model_b_ids, model_b_mask = _parse_model_tensors("model_b", payload.get("model_b"), row_count)
+    model_a_ids, model_a_mask = _parse_model_tensors(
+        "model_a", payload.get("model_a"), row_count
+    )
+    model_b_ids, model_b_mask = _parse_model_tensors(
+        "model_b", payload.get("model_b"), row_count
+    )
     return {
         "row_ids": tuple(normalized_ids),
         "model_a": (model_a_ids, model_a_mask),
@@ -136,7 +148,9 @@ def validate_distilbert_pair_binary_scores_input(payload: Any) -> dict[str, Any]
     }
 
 
-def _stage_model_bundle(config_bytes: bytes, weights_bytes: bytes, directory: Path) -> None:
+def _stage_model_bundle(
+    config_bytes: bytes, weights_bytes: bytes, directory: Path
+) -> None:
     try:
         config = json.loads(config_bytes.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
@@ -192,8 +206,12 @@ def execute_distilbert_pair_binary_scores(
         model_b_dir.mkdir()
         _stage_model_bundle(model_a_config, model_a_weights, model_a_dir)
         _stage_model_bundle(model_b_config, model_b_weights, model_b_dir)
-        model_a_scores = _infer_class1_probabilities(model_a_dir, model_a_ids, model_a_mask)
-        model_b_scores = _infer_class1_probabilities(model_b_dir, model_b_ids, model_b_mask)
+        model_a_scores = _infer_class1_probabilities(
+            model_a_dir, model_a_ids, model_a_mask
+        )
+        model_b_scores = _infer_class1_probabilities(
+            model_b_dir, model_b_ids, model_b_mask
+        )
     if len(model_a_scores) != len(validated["row_ids"]) or len(model_b_scores) != len(
         validated["row_ids"]
     ):

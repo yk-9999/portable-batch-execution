@@ -60,7 +60,9 @@ def test_dispatch_state_rejects_path_like_run_id(tmp_path):
 
 def test_dispatch_persists_exact_backend_execution_id(tmp_path):
     def handler(request):
-        return httpx.Response(201, json={"workflow_run_id": 424242, "html_url": "https://run"})
+        return httpx.Response(
+            201, json={"workflow_run_id": 424242, "html_url": "https://run"}
+        )
 
     controller = A1Controller(tmp_path, backend=_mock_backend(handler))
     prepared = controller.prepare_private_synthetic_run(
@@ -129,8 +131,11 @@ def test_private_client_round_trips_through_service_dispatch(tmp_path):
     )
     payload = plane.resolve_wave("opaque-run", "opaque-wave")
     assert payload["wave"]["wave_id"] == prepared.wave_id
-    with patch(
-        "portable_batch_execution.worker.execute_wave.TabularPack.execute",
-        side_effect=RuntimeError("fail"),
-    ), pytest.raises(PrivateWaveExecutionError):
+    with (
+        patch(
+            "portable_batch_execution.worker.execute_wave.TabularPack.execute",
+            side_effect=RuntimeError("fail"),
+        ),
+        pytest.raises(PrivateWaveExecutionError),
+    ):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)

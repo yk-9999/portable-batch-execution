@@ -20,16 +20,7 @@ from portable_batch_execution.contracts import (
 )
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
 from portable_batch_execution.data_plane.base import ArtifactContentStream
-from portable_batch_execution.packs import MediaPack, ReplayReductionPack, TabularPack
-from portable_batch_execution.packs.ml.char_wb_tfidf_logistic_score import (
-    execute_char_wb_tfidf_logistic_score,
-)
-from portable_batch_execution.packs.ml.cosine_similarity_matrix import (
-    execute_cosine_similarity_matrix,
-)
-from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
-    execute_distilbert_pair_binary_scores,
-)
+from portable_batch_execution.packs.media.pack import MediaPack
 from portable_batch_execution.packs.replay_reduction.canonicalize import (
     BUCKET_MEDIA_TYPE,
     StructuralCanonicalizeError,
@@ -41,9 +32,17 @@ from portable_batch_execution.packs.replay_reduction.canonicalize import (
 from portable_batch_execution.packs.replay_reduction.models import (
     BUCKET_COUNT_MAX,
 )
+from portable_batch_execution.packs.replay_reduction.pack import ReplayReductionPack
 from portable_batch_execution.packs.replay_reduction.paired_fill_reduce import (
     publish_paired_fill_reduce_artifacts,
 )
+from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate import (
+    REQUEST_SCHEMA_VERSION as TRADE_PATH_REQUEST_SCHEMA_VERSION,
+)
+from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate_fixed_set import (
+    FIXED_SET_OPERATION,
+)
+from portable_batch_execution.packs.tabular.pack import TabularPack
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")
 _PUBLIC_WAVES = frozenset({"wave-0000"})
@@ -86,6 +85,8 @@ _PRIVATE_REPLAY_BATCH_OPS = frozenset(
         "replay.event_window_extract",
         "replay.causal_grid_extract",
         "replay.paired_fill_reduce",
+        "replay.trade_path_scenario_evaluate",
+        FIXED_SET_OPERATION,
     }
 )
 _MAX_REPLAY_PARQUET_INPUTS = 64
@@ -527,6 +528,10 @@ def execute_private_wave(
                         _execution_failure_code(exc, stage="input_parse")
                     ) from None
                 try:
+                    from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
+                        execute_distilbert_pair_binary_scores,
+                    )
+
                     result_payload = execute_distilbert_pair_binary_scores(
                         parsed_input,
                         model_a_config=model_a_config,
@@ -747,12 +752,65 @@ def execute_private_wave(
                         )
                         output_digest_value = sha256(output).hexdigest()
                         publish_single_output = False
+                elif job.operation == FIXED_SET_OPERATION:
+                    raise _ShardStageFailure("hf_direct_required")
+                elif job.operation == "replay.trade_path_scenario_evaluate":
+                    if len(shard.input_refs) != 1:
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    batch_ref = shard.input_refs[0]
+                    if batch_ref.media_type != "application/json":
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    batch_payload = _read_verified_artifact_bytes(plane, batch_ref)
+                    try:
+                        parsed_batch = json.loads(batch_payload.decode("utf-8"))
+                    except (UnicodeDecodeError, ValueError) as exc:
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="input_parse")
+                        ) from None
+                    if (
+                        parsed_batch.get("schema_version")
+                        != TRADE_PATH_REQUEST_SCHEMA_VERSION
+                    ):
+                        raise _ShardStageFailure("input_artifact_invalid")
+                    input_rows = len(parsed_batch.get("records") or [])
+                    try:
+                        result_payload = replay_pack.execute(
+                            job,
+                            shard,
+                            job.operation_params,
+                            {
+                                "batch": parsed_batch,
+                                "encoded_size": len(batch_payload),
+                                "operation": job.operation,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        raise _ShardStageFailure(
+                            _execution_failure_code(exc, stage="pack")
+                        ) from None
+                    output = bytes(result_payload.get("result_json_bytes") or b"")
+                    if not output:
+                        output = json.dumps(
+                            {
+                                "schema_version": result_payload["schema_version"],
+                                "batch_id": result_payload["batch_id"],
+                                "records": result_payload["records"],
+                                "event_summary": result_payload["event_summary"],
+                            },
+                            sort_keys=True,
+                        ).encode("utf-8")
+                    output_rows = int(result_payload["summary"]["record_count"])
+                    output_digest_value = sha256(output).hexdigest()
+                    publish_single_output = True
                 else:
                     raise _ShardStageFailure(
                         _execution_failure_code(ValueError(), stage="pack")
                     )
                 if publish_single_output:
-                    output = json.dumps(result_payload, sort_keys=True).encode("utf-8")
+                    if job.operation != "replay.trade_path_scenario_evaluate":
+                        output = json.dumps(result_payload, sort_keys=True).encode(
+                            "utf-8"
+                        )
                     output_media_type = "application/json"
             else:
                 input_ref = shard.input_refs[0]
@@ -846,6 +904,10 @@ def execute_private_wave(
                             )
                         try:
                             if job.operation == "ml.cosine_similarity_matrix":
+                                from portable_batch_execution.packs.ml.cosine_similarity_matrix import (
+                                    execute_cosine_similarity_matrix,
+                                )
+
                                 result_payload = execute_cosine_similarity_matrix(
                                     parsed_input
                                 )
@@ -856,6 +918,10 @@ def execute_private_wave(
                                     result_payload["scores"][0]
                                 )
                             elif job.operation == "ml.char_wb_tfidf_logistic_score":
+                                from portable_batch_execution.packs.ml.char_wb_tfidf_logistic_score import (
+                                    execute_char_wb_tfidf_logistic_score,
+                                )
+
                                 result_payload = execute_char_wb_tfidf_logistic_score(
                                     parsed_input
                                 )
@@ -922,15 +988,38 @@ def execute_private_wave(
     return tuple(attempts)
 
 
+def execute_hf_direct_wave_entry() -> dict[str, object]:
+    from portable_batch_execution.worker.hf_direct_wave import (
+        execute_hf_direct_wave,
+        expected_manifest_path_from_environment,
+        wave_descriptor_ref_from_environment,
+    )
+
+    return execute_hf_direct_wave(
+        wave_descriptor_ref=wave_descriptor_ref_from_environment(),
+        expected_manifest_path=expected_manifest_path_from_environment(),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Execute one approved wave.")
     parser.add_argument("--wave-id", required=True)
     parser.add_argument("--run-id")
-    parser.add_argument("--mode", choices=("public", "private"), default="public")
+    parser.add_argument(
+        "--mode",
+        choices=("public", "private", "hf-direct"),
+        default="public",
+    )
     args = parser.parse_args(argv)
     if args.mode == "private" and not args.run_id:
         parser.error("--mode private requires --run-id")
+    if args.mode == "hf-direct" and not args.run_id:
+        parser.error("--mode hf-direct requires --run-id")
     try:
+        if args.mode == "hf-direct":
+            summary = execute_hf_direct_wave_entry()
+            print(json.dumps({"wave_id": args.wave_id, "hf_direct": summary}))
+            return 0
         attempts = (
             execute_private_wave(args.run_id, args.wave_id)
             if args.mode == "private"

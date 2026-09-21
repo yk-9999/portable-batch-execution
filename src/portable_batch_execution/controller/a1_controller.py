@@ -45,7 +45,9 @@ def _repository_root() -> Path:
 
 
 def _load_public_synthetic_plan() -> dict:
-    plan_path = _repository_root() / "fixtures" / "public" / "synthetic" / "wave-0000.json"
+    plan_path = (
+        _repository_root() / "fixtures" / "public" / "synthetic" / "wave-0000.json"
+    )
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     if not isinstance(plan, dict):
         raise TypeError("public synthetic wave plan must be an object")
@@ -119,7 +121,9 @@ def _inspect_dispatch_waves(waves: dict) -> dict:
         dispatches = _normalize_wave_dispatch_history(entry)
         inspected[wave_id] = {
             "dispatches": dispatches,
-            "latest_execution_id": dispatches[-1]["execution_id"] if dispatches else None,
+            "latest_execution_id": dispatches[-1]["execution_id"]
+            if dispatches
+            else None,
         }
     return inspected
 
@@ -171,7 +175,11 @@ class A1Controller:
         if not isinstance(waves, dict):
             raise TypeError("invalid dispatch waves")
         entry = waves.get(wave_id, {})
-        history = _normalize_wave_dispatch_history(entry) if isinstance(entry, dict) and entry else []
+        history = (
+            _normalize_wave_dispatch_history(entry)
+            if isinstance(entry, dict) and entry
+            else []
+        )
         record = _dispatch_record(execution)
         for existing in history:
             if existing["execution_id"] == record["execution_id"]:
@@ -283,6 +291,32 @@ class A1Controller:
         self._write_dispatch_state(run_id, state)
         return recorded
 
+    def dispatch_hf_direct_wave(
+        self,
+        run_id: str,
+        wave_id: str,
+        wave_descriptor_hf_ref: dict,
+        *,
+        result_manifest_object_path: str,
+    ) -> BackendExecutionRef:
+        if self.backend is None:
+            raise ValueError("GitHub backend is not configured")
+        submit = getattr(self.backend, "submit_hf_direct_wave", None)
+        if submit is None:
+            raise ValueError("GitHub backend does not support HF-direct dispatch")
+        run_id = opaque_identifier(run_id, "run_id")
+        wave_id = opaque_identifier(wave_id, "wave_id")
+        execution = submit(
+            run_id=run_id,
+            wave_id=wave_id,
+            wave_descriptor_hf_ref=wave_descriptor_hf_ref,
+            result_manifest_object_path=result_manifest_object_path,
+        )
+        state = self._read_dispatch_state(run_id)
+        recorded = self._record_wave_dispatch(state, wave_id, execution)
+        self._write_dispatch_state(run_id, state)
+        return recorded
+
     def inspect_run(self, run_id: str) -> dict:
         run_id = opaque_identifier(run_id, "run_id")
         manifest = self.data_plane.read_manifest(run_id)
@@ -308,7 +342,9 @@ class A1Controller:
             "logical_run_id": run_id,
             "manifest_revision": manifest.revision if manifest else None,
             "manifest_status": manifest.status if manifest else None,
-            "dispatch": _inspect_dispatch_waves(waves if isinstance(waves, dict) else {}),
+            "dispatch": _inspect_dispatch_waves(
+                waves if isinstance(waves, dict) else {}
+            ),
             "backend_status": None
             if backend_status is None
             else {

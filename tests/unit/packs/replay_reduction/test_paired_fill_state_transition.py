@@ -47,9 +47,18 @@ def _request():
             "signed_execution_column": "signed",
         },
         "row_invariants": [
-            {"schema_version": "pbe.replay.row-invariant.positive-finite.v1", "column": "price"},
-            {"schema_version": "pbe.replay.row-invariant.positive-finite.v1", "column": "size"},
-            {"schema_version": "pbe.replay.row-invariant.positive-finite.v1", "column": "notional"},
+            {
+                "schema_version": "pbe.replay.row-invariant.positive-finite.v1",
+                "column": "price",
+            },
+            {
+                "schema_version": "pbe.replay.row-invariant.positive-finite.v1",
+                "column": "size",
+            },
+            {
+                "schema_version": "pbe.replay.row-invariant.positive-finite.v1",
+                "column": "notional",
+            },
             {
                 "schema_version": "pbe.replay.row-invariant.numeric.v1",
                 "left_column": "size",
@@ -81,7 +90,9 @@ def test_state_transition_emits_distinct_non_economic_record(tmp_path):
         _row(),
         _row(role="system", start=0.0, signed=4.0),
     ]
-    result = execute_paired_fill_reduce([_write(tmp_path / "rows.parquet", rows)], _request())
+    result = execute_paired_fill_reduce(
+        [_write(tmp_path / "rows.parquet", rows)], _request()
+    )
     assert result["schema_version"] == "pbe.replay.paired-fill-reduce-result.v2"
     assert result["summary"]["state_transition_count"] == 1
     row = result["ledger_rows"][0]
@@ -97,7 +108,9 @@ def test_state_transition_is_sign_symmetric(tmp_path):
         _row(start=-4.0, signed=4.0),
         _row(role="system", start=0.0, signed=-4.0),
     ]
-    result = execute_paired_fill_reduce([_write(tmp_path / "short.parquet", rows)], _request())
+    result = execute_paired_fill_reduce(
+        [_write(tmp_path / "short.parquet", rows)], _request()
+    )
     assert result["ledger_rows"][0]["state_owner"]["post_position"] == 0.0
 
 
@@ -112,7 +125,9 @@ def test_malformed_marked_transition_fails_closed(tmp_path):
 
 def test_incomplete_marked_transition_fails_closed(tmp_path):
     with pytest.raises(StructuralCanonicalizeError):
-        execute_paired_fill_reduce([_write(tmp_path / "one.parquet", [_row()])], _request())
+        execute_paired_fill_reduce(
+            [_write(tmp_path / "one.parquet", [_row()])], _request()
+        )
 
 
 def test_ordinary_pair_remains_economic_under_v2(tmp_path):
@@ -127,7 +142,9 @@ def test_ordinary_pair_remains_economic_under_v2(tmp_path):
             signed=-4.0,
         ),
     ]
-    result = execute_paired_fill_reduce([_write(tmp_path / "trade.parquet", rows)], _request())
+    result = execute_paired_fill_reduce(
+        [_write(tmp_path / "trade.parquet", rows)], _request()
+    )
     assert result["ledger_rows"][0]["classification"] == "complete_pair"
     assert result["summary"]["state_transition_count"] == 0
 
@@ -145,9 +162,7 @@ def test_transition_pair_can_cross_input_boundary(tmp_path):
 
 def test_transition_cannot_bypass_nonzero_semantic_invariant():
     request = _request()
-    request["state_transition_handling"]["bypass_row_invariant_columns"].append(
-        "size"
-    )
+    request["state_transition_handling"]["bypass_row_invariant_columns"].append("size")
     with pytest.raises(ValueError):
         from portable_batch_execution.packs.replay_reduction.models import (
             PairedFillReduceRequest,
@@ -168,14 +183,29 @@ def _request_v3():
             "pair_role_column": "role",
             "aggressor_role_value": "owner",
             "passive_role_value": "system",
-            "measurement_core_fields": ["identity", "symbol", "price", "size", "notional"],
+            "measurement_core_fields": [
+                "identity",
+                "symbol",
+                "price",
+                "size",
+                "notional",
+            ],
             "start_position_column": "start",
             "signed_execution_column": "signed",
         },
         "row_invariants": [
-            {"schema_version": "pbe.replay.row-invariant.positive-finite.v1", "column": "price"},
-            {"schema_version": "pbe.replay.row-invariant.positive-finite.v1", "column": "size"},
-            {"schema_version": "pbe.replay.row-invariant.positive-finite.v1", "column": "notional"},
+            {
+                "schema_version": "pbe.replay.row-invariant.positive-finite.v1",
+                "column": "price",
+            },
+            {
+                "schema_version": "pbe.replay.row-invariant.positive-finite.v1",
+                "column": "size",
+            },
+            {
+                "schema_version": "pbe.replay.row-invariant.positive-finite.v1",
+                "column": "notional",
+            },
             {
                 "schema_version": "pbe.replay.row-invariant.numeric.v1",
                 "left_column": "size",
@@ -245,7 +275,9 @@ def test_v3_terminal_one_outcome_accepted(tmp_path):
         _terminal_one_row(),
         _terminal_one_row(role="system", start=0.0, signed=4.0),
     ]
-    result = execute_paired_fill_reduce([_write(tmp_path / "one.parquet", rows)], _request_v3())
+    result = execute_paired_fill_reduce(
+        [_write(tmp_path / "one.parquet", rows)], _request_v3()
+    )
     row = result["ledger_rows"][0]
     assert row["classification"] == "state_transition"
     assert row["measurement_core"]["symbol"] == "#101"
@@ -261,7 +293,9 @@ def test_v3_invalid_outcome_encoding_fail_closed(tmp_path):
         _terminal_one_row(role="system", start=0.0, signed=4.0, symbol="#122"),
     ]
     with pytest.raises(StructuralCanonicalizeError):
-        execute_paired_fill_reduce([_write(tmp_path / "bad122.parquet", rows)], _request_v3())
+        execute_paired_fill_reduce(
+            [_write(tmp_path / "bad122.parquet", rows)], _request_v3()
+        )
 
 
 def test_v3_non_outcome_price_one_settlement_fail_closed(tmp_path):
@@ -270,7 +304,9 @@ def test_v3_non_outcome_price_one_settlement_fail_closed(tmp_path):
         _terminal_one_row(role="system", start=0.0, signed=4.0, symbol="BTC"),
     ]
     with pytest.raises(StructuralCanonicalizeError):
-        execute_paired_fill_reduce([_write(tmp_path / "btc.parquet", rows)], _request_v3())
+        execute_paired_fill_reduce(
+            [_write(tmp_path / "btc.parquet", rows)], _request_v3()
+        )
 
 
 def test_v3_malformed_owner_fail_closed(tmp_path):
@@ -279,7 +315,9 @@ def test_v3_malformed_owner_fail_closed(tmp_path):
         _terminal_one_row(role="system", start=0.0, signed=2.0),
     ]
     with pytest.raises(StructuralCanonicalizeError):
-        execute_paired_fill_reduce([_write(tmp_path / "owner.parquet", rows)], _request_v3())
+        execute_paired_fill_reduce(
+            [_write(tmp_path / "owner.parquet", rows)], _request_v3()
+        )
 
 
 def test_v3_ordinary_positive_price_non_settlement(tmp_path):
@@ -294,7 +332,9 @@ def test_v3_ordinary_positive_price_non_settlement(tmp_path):
             signed=-4.0,
         ),
     ]
-    result = execute_paired_fill_reduce([_write(tmp_path / "trade.parquet", rows)], _request_v3())
+    result = execute_paired_fill_reduce(
+        [_write(tmp_path / "trade.parquet", rows)], _request_v3()
+    )
     assert result["ledger_rows"][0]["classification"] == "complete_pair"
 
 
@@ -322,9 +362,13 @@ def test_v3_tid0_administrative_sentinel_unchanged(tmp_path):
             "start": 0.0,
             "signed": 0.0,
         },
-        _row(identity=8, identity_norm="8", event_type="trade", price=10.0, notional=40.0),
+        _row(
+            identity=8, identity_norm="8", event_type="trade", price=10.0, notional=40.0
+        ),
     ]
-    result = execute_paired_fill_reduce([_write(tmp_path / "tid0.parquet", rows)], request)
+    result = execute_paired_fill_reduce(
+        [_write(tmp_path / "tid0.parquet", rows)], request
+    )
     assert result["summary"]["administrative_row_count"] == 1
     assert result["ledger_rows"][0]["classification"] == "singleton"
 

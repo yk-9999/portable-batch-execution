@@ -17,7 +17,9 @@ def test_github_backend_dispatches_a_wave_and_returns_the_backend_run_reference(
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(204, json={"workflow_run_id": 42, "html_url": "https://github.test/runs/42"})
+        return httpx.Response(
+            204, json={"workflow_run_id": 42, "html_url": "https://github.test/runs/42"}
+        )
 
     client = httpx.Client(
         base_url="https://api.github.test", transport=httpx.MockTransport(handler)
@@ -31,10 +33,21 @@ def test_github_backend_dispatches_a_wave_and_returns_the_backend_run_reference(
     )
 
     execution = backend.submit_wave(
-        WaveSubmission(WaveSpec(logical_run_id="run-1", wave_id="wave-0000", ordinal=0, shard_ids=("shard-0",), max_parallel=1))
+        WaveSubmission(
+            WaveSpec(
+                logical_run_id="run-1",
+                wave_id="wave-0000",
+                ordinal=0,
+                shard_ids=("shard-0",),
+                max_parallel=1,
+            )
+        )
     )
 
-    assert requests[0].url.path == "/repos/public-owner/public-repo/actions/workflows/wave.yml/dispatches"
+    assert (
+        requests[0].url.path
+        == "/repos/public-owner/public-repo/actions/workflows/wave.yml/dispatches"
+    )
     assert requests[0].headers["Authorization"] == "Bearer public-test-token"
     assert json.loads(requests[0].content) == {
         "ref": "main",

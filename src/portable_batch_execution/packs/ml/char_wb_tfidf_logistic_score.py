@@ -16,7 +16,11 @@ _WHITESPACE_RUNS = re.compile(r"\s{2,}")
 
 
 def _is_finite_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
 
 
 def _preprocess_text(text: str) -> str:

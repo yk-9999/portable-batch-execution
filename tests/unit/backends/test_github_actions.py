@@ -25,7 +25,15 @@ def _reject_http(_request):
 
 
 def submission() -> WaveSubmission:
-    return WaveSubmission(WaveSpec(logical_run_id="run", wave_id="wave-0000", ordinal=0, shard_ids=("shard-0",), max_parallel=1))
+    return WaveSubmission(
+        WaveSpec(
+            logical_run_id="run",
+            wave_id="wave-0000",
+            ordinal=0,
+            shard_ids=("shard-0",),
+            max_parallel=1,
+        )
+    )
 
 
 def test_submit_wave_private_data_plane_dispatches_opaque_run_and_wave():
@@ -39,7 +47,9 @@ def test_submit_wave_private_data_plane_dispatches_opaque_run_and_wave():
             },
             "return_run_details": True,
         }
-        return httpx.Response(201, json={"workflow_run_id": 9, "html_url": "https://run/9"})
+        return httpx.Response(
+            201, json={"workflow_run_id": 9, "html_url": "https://run/9"}
+        )
 
     backend = GitHubActionsBackend(
         "o",
@@ -103,9 +113,17 @@ def test_submit_wave_uses_env_token_and_returns_run_details(monkeypatch):
             "inputs": {"wave_id": "wave-0000"},
             "return_run_details": True,
         }
-        return httpx.Response(201, json={"workflow_run_id": 42, "html_url": "https://run"})
+        return httpx.Response(
+            201, json={"workflow_run_id": 42, "html_url": "https://run"}
+        )
 
-    backend = GitHubActionsBackend("o", "r", "execute-wave.yml", dispatch_ref="feature/test", client=client(handler))
+    backend = GitHubActionsBackend(
+        "o",
+        "r",
+        "execute-wave.yml",
+        dispatch_ref="feature/test",
+        client=client(handler),
+    )
     assert backend.submit_wave(submission()) == BackendExecutionRef(
         "github-actions", "42", "https://run"
     )
@@ -159,16 +177,31 @@ def test_api_error_is_structured():
         "w",
         client=client(lambda request: httpx.Response(403, json={"message": "denied"})),
     )
-    with pytest.raises(GitHubActionsAPIError, match=r"get run failed \(403\): denied") as error:
+    with pytest.raises(
+        GitHubActionsAPIError, match=r"get run failed \(403\): denied"
+    ) as error:
         backend.get_run(BackendExecutionRef("github-actions", "7"))
     assert error.value.status_code == 403
 
 
 def test_github_backend_structurally_satisfies_shared_protocol_signatures():
-    backend = GitHubActionsBackend("o", "r", "w", client=client(lambda _request: httpx.Response(200)))
+    backend = GitHubActionsBackend(
+        "o", "r", "w", client=client(lambda _request: httpx.Response(200))
+    )
 
     assert isinstance(backend, ExecutionBackend)
-    assert tuple(inspect.signature(GitHubActionsBackend.submit_wave).parameters) == ("self", "request")
-    assert tuple(inspect.signature(GitHubActionsBackend.get_run).parameters) == ("self", "execution")
-    assert tuple(inspect.signature(GitHubActionsBackend.cancel_run).parameters) == ("self", "execution")
-    assert tuple(inspect.signature(GitHubActionsBackend.collect_execution_evidence).parameters) == ("self", "execution")
+    assert tuple(inspect.signature(GitHubActionsBackend.submit_wave).parameters) == (
+        "self",
+        "request",
+    )
+    assert tuple(inspect.signature(GitHubActionsBackend.get_run).parameters) == (
+        "self",
+        "execution",
+    )
+    assert tuple(inspect.signature(GitHubActionsBackend.cancel_run).parameters) == (
+        "self",
+        "execution",
+    )
+    assert tuple(
+        inspect.signature(GitHubActionsBackend.collect_execution_evidence).parameters
+    ) == ("self", "execution")

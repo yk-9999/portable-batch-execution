@@ -77,7 +77,9 @@ def test_scores_match_sklearn_reference():
 
 
 def test_empty_rows_returns_empty_result():
-    payload = _payload(rows=[], features=[{"feature": "ab", "idf": 1.0, "coefficient": 0.0}])
+    payload = _payload(
+        rows=[], features=[{"feature": "ab", "idf": 1.0, "coefficient": 0.0}]
+    )
     result = execute_char_wb_tfidf_logistic_score(payload)
     assert result == {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -93,15 +95,9 @@ def test_empty_rows_returns_empty_result():
         lambda payload: payload["model"]["features"].append(
             {"feature": "ab", "idf": 1.0, "coefficient": 0.0}
         ),
-        lambda payload: payload["model"]["features"][0].update(
-            {"idf": float("nan")}
-        ),
-        lambda payload: payload["rows"].append(
-            {"row_id": "dup", "text": "one"}
-        ),
-        lambda payload: payload["rows"].append(
-            {"row_id": "dup", "text": "two"}
-        ),
+        lambda payload: payload["model"]["features"][0].update({"idf": float("nan")}),
+        lambda payload: payload["rows"].append({"row_id": "dup", "text": "one"}),
+        lambda payload: payload["rows"].append({"row_id": "dup", "text": "two"}),
         lambda payload: payload["rows"].append({"row_id": "", "text": "x"}),
         lambda payload: payload["rows"].append({"row_id": "x", "text": 1}),
     ),

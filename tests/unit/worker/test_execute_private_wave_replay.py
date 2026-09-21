@@ -454,6 +454,70 @@ def test_private_wave_causal_grid_extract_dispatches_typed_request():
     assert len(result["rows"]) == 1
 
 
+def test_private_wave_trade_path_scenario_evaluate_json_batch():
+    batch = {
+        "schema_version": "pbe.replay.trade-path-scenario-evaluate.v1",
+        "batch_id": "worker-batch",
+        "reference_notional": 1.0,
+        "scenario": {
+            "commission_bps_per_side": 0.0,
+            "slippage_bps_per_side": 0.0,
+            "borrow_bps_per_year": 0.0,
+            "short_available": True,
+        },
+        "records": [
+            {
+                "record_id": "r1",
+                "model": "M",
+                "window": "6m",
+                "group_label": "G",
+                "month": "2010-01",
+                "status": "closed",
+                "cancellation_reason": None,
+                "reference_notional": 1.0,
+                "price_pnl": 1.0,
+                "dividend_pnl": 0.0,
+                "gross_pnl": 1.0,
+                "entry_notional": 1.0,
+                "exit_notional": 1.0,
+                "traded_notional": 2.0,
+                "short_notional": 0.5,
+                "holding_days": 5.0,
+                "holding_sessions": 5,
+                "mae": -0.1,
+                "mfe": 0.2,
+            }
+        ],
+    }
+    batch_payload = json.dumps(batch).encode("utf-8")
+    refs = [
+        ArtifactRef(
+            object_id="batch",
+            uri="pbe://private/batch",
+            sha256="sha256:" + sha256(batch_payload).hexdigest(),
+            size_bytes=len(batch_payload),
+            media_type="application/json",
+        ),
+    ]
+    plane = _plane_for_replay(
+        operation="replay.trade_path_scenario_evaluate",
+        input_refs=refs,
+        operation_params={
+            "schema_version": "pbe.replay.trade-path-scenario-evaluate-job.v1",
+        },
+    )
+    plane._payloads["batch"] = batch_payload
+    attempts = execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert attempts[0].status == "succeeded"
+    assert len(attempts[0].output_refs) == 1
+    result = json.loads(plane._payloads[attempts[0].output_refs[0].object_id].decode())
+    assert (
+        result["schema_version"] == "pbe.replay.trade-path-scenario-evaluate-result.v1"
+    )
+    assert result["event_summary"]["n"] == 1
+    assert result["records"][0]["net_pnl"] == 1.0
+
+
 def test_private_wave_paired_fill_reduce_dispatches_typed_request():
     trade_payload = _parquet_payload(
         [

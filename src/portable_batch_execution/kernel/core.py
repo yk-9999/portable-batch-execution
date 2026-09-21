@@ -154,7 +154,14 @@ def plan_waves(
         raise ValueError("all shards must belong to run_id")
     if capabilities is None and max_per_wave is None:
         raise ValueError("backend capabilities or an explicit max_per_wave is required")
-    limits = [limit for limit in (max_per_wave, capabilities.max_shards_per_wave if capabilities else None) if limit is not None]
+    limits = [
+        limit
+        for limit in (
+            max_per_wave,
+            capabilities.max_shards_per_wave if capabilities else None,
+        )
+        if limit is not None
+    ]
     if any(limit <= 0 for limit in limits):
         raise ValueError("wave limits must be positive")
     limit = min(limits)
@@ -293,6 +300,7 @@ class RunController:
         )
         return self.state_store.write_next_manifest(next_manifest, expected_revision)
 
+
 def exhausted_shards(
     shards: Iterable[ShardSpec],
     attempts: Iterable[ShardAttemptRecord],
@@ -304,7 +312,14 @@ def exhausted_shards(
         by_shard[attempt.shard_id].append(attempt)
     exhausted = []
     for shard in sorted(shards, key=lambda item: (item.ordinal, item.shard_id)):
-        current = [record for record in by_shard[shard.shard_id] if record.input_digest == shard.input_digest and record.execution_fingerprint == shard.execution_fingerprint]
-        if len(current) >= policy.max_attempts_per_shard and not any(record.status == "succeeded" for record in current):
+        current = [
+            record
+            for record in by_shard[shard.shard_id]
+            if record.input_digest == shard.input_digest
+            and record.execution_fingerprint == shard.execution_fingerprint
+        ]
+        if len(current) >= policy.max_attempts_per_shard and not any(
+            record.status == "succeeded" for record in current
+        ):
             exhausted.append(shard)
     return tuple(exhausted)

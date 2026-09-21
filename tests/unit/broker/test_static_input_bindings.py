@@ -108,7 +108,7 @@ def test_config_rejects_duplicate_pack_operation(tmp_path):
 
 
 def test_empty_static_refs_preserve_legacy_input_digest():
-    payload = b"[{\"id\":1}]"
+    payload = b'[{"id":1}]'
     assert broker_shard_input_digest(payload, ()) == broker_input_digest(payload)
 
 
@@ -178,7 +178,8 @@ def test_register_creates_ordered_multi_ref_shard(tmp_path):
     state_root = tmp_path / "state"
     state_root.mkdir()
     static_refs = tuple(
-        ArtifactRef.model_validate(item) for item in _stage_static_artifacts(state_root, 4)
+        ArtifactRef.model_validate(item)
+        for item in _stage_static_artifacts(state_root, 4)
     )
     client_bytes = b'{"schema_version":"pbe.ml.distilbert-pair-binary-scores.v1"}'
     _, _, shard, _ = register_broker_private_run(

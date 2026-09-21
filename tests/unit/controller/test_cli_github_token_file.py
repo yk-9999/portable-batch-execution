@@ -135,10 +135,12 @@ def test_prepare_synthetic_without_github_args(tmp_path, capsys):
         patch.object(cli, "GitHubActionsBackend") as backend_cls,
         patch.object(cli, "A1Controller") as controller_cls,
     ):
-        controller_cls.return_value.prepare_private_synthetic_run.return_value = MagicMock(
-            logical_run_id="opaque-run",
-            wave_id="opaque-wave",
-            manifest=MagicMock(revision=0),
+        controller_cls.return_value.prepare_private_synthetic_run.return_value = (
+            MagicMock(
+                logical_run_id="opaque-run",
+                wave_id="opaque-wave",
+                manifest=MagicMock(revision=0),
+            )
         )
         rc = cli.main(
             [

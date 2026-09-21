@@ -10,7 +10,11 @@ from portable_batch_execution.contracts import AdapterDescriptor
 from portable_batch_execution.packs.replay_eval import ReplayEvalPack
 
 FIXTURE = (
-    Path(__file__).parents[4] / "fixtures" / "public" / "replay_eval" / "operations.json"
+    Path(__file__).parents[4]
+    / "fixtures"
+    / "public"
+    / "replay_eval"
+    / "operations.json"
 )
 
 
@@ -54,37 +58,56 @@ def _pack() -> tuple[ReplayEvalPack, FakeProjectAdapter]:
     return ReplayEvalPack(adapter), adapter
 
 
-@pytest.mark.parametrize("operation", json.loads(FIXTURE.read_text())["closed_operations"])
+@pytest.mark.parametrize(
+    "operation", json.loads(FIXTURE.read_text())["closed_operations"]
+)
 def test_every_closed_operation_delegates_replay_evaluation(operation):
     pack, adapter = _pack()
-    profile = "external-api" if operation.endswith("external_api_evaluation") else "offline"
+    profile = (
+        "external-api" if operation.endswith("external_api_evaluation") else "offline"
+    )
 
-    result = pack.execute(_job(operation, profile), "shard-0", {"scenario": "public"}, {"x": 1})
+    result = pack.execute(
+        _job(operation, profile), "shard-0", {"scenario": "public"}, {"x": 1}
+    )
 
     assert result == {"adapter": "attempt", "operation": operation}
     assert adapter.calls[-1] == (
-        "execute", operation, "shard-0", {"scenario": "public"}, {"x": 1}
+        "execute",
+        operation,
+        "shard-0",
+        {"scenario": "public"},
+        {"x": 1},
     )
 
 
 def test_compare_benchmark_sweep_walk_forward_oos_and_backtest_remain_adapter_owned():
     pack, adapter = _pack()
     operations = (
-        "replay_eval.benchmark", "replay_eval.compare", "replay_eval.parameter_sweep",
-        "replay_eval.walk_forward", "replay_eval.oos", "replay_eval.backtest",
-        "replay_eval.control", "replay_eval.robustness",
+        "replay_eval.benchmark",
+        "replay_eval.compare",
+        "replay_eval.parameter_sweep",
+        "replay_eval.walk_forward",
+        "replay_eval.oos",
+        "replay_eval.backtest",
+        "replay_eval.control",
+        "replay_eval.robustness",
     )
 
     for operation in operations:
         assert pack.execute(_job(operation), "s", {}, None)["adapter"] == "attempt"
 
-    assert [call[1] for call in adapter.calls if call[0] == "execute"] == list(operations)
+    assert [call[1] for call in adapter.calls if call[0] == "execute"] == list(
+        operations
+    )
 
 
 def test_external_api_operation_is_the_only_external_api_boundary():
     pack, _ = _pack()
 
-    pack.execute(_job("replay_eval.external_api_evaluation", "external-api"), "s", {}, None)
+    pack.execute(
+        _job("replay_eval.external_api_evaluation", "external-api"), "s", {}, None
+    )
     with pytest.raises(ValueError, match="requires external-api"):
         pack.execute(_job("replay_eval.external_api_evaluation"), "s", {}, None)
     with pytest.raises(ValueError, match="limited"):
@@ -94,18 +117,26 @@ def test_external_api_operation_is_the_only_external_api_boundary():
 def test_finalize_is_delegated_after_boundary_validation():
     pack, adapter = _pack()
 
-    assert pack.finalize(_job("replay_eval.replay"), ("attempt-a",), {"summary": True}) == {
-        "adapter": "final", "attempts": 1
-    }
-    assert adapter.calls[-1] == ("finalize", "replay_eval.replay", ("attempt-a",), {"summary": True})
+    assert pack.finalize(
+        _job("replay_eval.replay"), ("attempt-a",), {"summary": True}
+    ) == {"adapter": "final", "attempts": 1}
+    assert adapter.calls[-1] == (
+        "finalize",
+        "replay_eval.replay",
+        ("attempt-a",),
+        {"summary": True},
+    )
 
 
-@pytest.mark.parametrize("params", [
-    {"callback": "module.call"},
-    {"nested": {"import_path": "module"}},
-    {"nested": {"handler": "run"}},
-    {"n": float("nan")},
-])
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"callback": "module.call"},
+        {"nested": {"import_path": "module"}},
+        {"nested": {"handler": "run"}},
+        {"n": float("nan")},
+    ],
+)
 def test_params_cannot_carry_import_or_callback_dispatch(params):
     pack, _ = _pack()
 

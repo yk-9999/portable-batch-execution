@@ -15,7 +15,9 @@ _PARAMS = {
 
 def test_canonicalize_rejects_whole_corpus_read_and_concat(tmp_path, monkeypatch):
     path = tmp_path / "part.parquet"
-    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(path)
+    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(
+        path
+    )
 
     def forbid_read(*args, **kwargs):
         raise AssertionError("read_parquet must not be used")
@@ -80,7 +82,8 @@ def test_event_window_rejects_whole_history_to_dicts(tmp_path, monkeypatch):
 def test_canonicalize_does_not_materialize_all_bucket_lists(tmp_path):
     assert not hasattr(canonicalize, "_bucket_values")
     rows = [
-        {"identity": i, "identity_norm": str(i), "price": float(i)} for i in range(1, 5001)
+        {"identity": i, "identity_norm": str(i), "price": float(i)}
+        for i in range(1, 5001)
     ]
     path = tmp_path / "part.parquet"
     pl.DataFrame(rows).write_parquet(path)
@@ -91,14 +94,18 @@ def test_canonicalize_does_not_materialize_all_bucket_lists(tmp_path):
 
 def test_canonicalize_materialization_guard_enforced(tmp_path, monkeypatch):
     monkeypatch.setattr(canonicalize, "_MAX_IDENTITY_MATERIALIZATION", 32)
-    rows = [{"identity": i, "identity_norm": str(i), "price": 1.0} for i in range(1, 200)]
+    rows = [
+        {"identity": i, "identity_norm": str(i), "price": 1.0} for i in range(1, 200)
+    ]
     path = tmp_path / "dense.parquet"
     pl.DataFrame(rows).write_parquet(path)
     with pytest.raises(canonicalize.StructuralCanonicalizeError):
         canonicalize.execute_structural_canonicalize([path], _PARAMS)
 
 
-def test_canonicalize_avoids_global_group_and_nunique_aggregations(tmp_path, monkeypatch):
+def test_canonicalize_avoids_global_group_and_nunique_aggregations(
+    tmp_path, monkeypatch
+):
     def forbid_group_by(self, *args, **kwargs):
         raise AssertionError("group_by must not be used in canonicalize validation")
 
@@ -158,7 +165,9 @@ def test_production_publish_uses_incremental_bucket_payloads(tmp_path, monkeypat
     state = canonicalize.execute_structural_canonicalize([path], _PARAMS)
 
     def forbid_bulk(*args, **kwargs):
-        raise AssertionError("encode_state_buckets must not be used in production publish")
+        raise AssertionError(
+            "encode_state_buckets must not be used in production publish"
+        )
 
     monkeypatch.setattr(canonicalize, "encode_state_buckets", forbid_bulk)
 
@@ -192,7 +201,9 @@ def test_production_publish_uses_incremental_bucket_payloads(tmp_path, monkeypat
 def test_bucket_payload_bound_enforced(tmp_path, monkeypatch):
     monkeypatch.setattr(canonicalize, "_MAX_BUCKET_PAYLOAD_BYTES", 30)
     path = tmp_path / "part.parquet"
-    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(path)
+    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(
+        path
+    )
     state = canonicalize.execute_structural_canonicalize([path], _PARAMS)
     with pytest.raises(canonicalize.StructuralCanonicalizeError):
         for _ in canonicalize.iter_state_bucket_payloads(state):
@@ -207,7 +218,8 @@ def test_structural_canonicalize_bucket_count_1024_publish_read_merge(tmp_path):
 
     params = {**_PARAMS, "bucket_count": 1024}
     rows = [
-        {"identity": i, "identity_norm": str(i), "price": float(i)} for i in range(1, 51)
+        {"identity": i, "identity_norm": str(i), "price": float(i)}
+        for i in range(1, 51)
     ]
     path = tmp_path / "part.parquet"
     pl.DataFrame(rows).write_parquet(path)
@@ -241,23 +253,27 @@ def test_structural_canonicalize_bucket_count_1024_publish_read_merge(tmp_path):
     assert decoded.bucket_count == 1024
 
     right_path = tmp_path / "right.parquet"
-    pl.DataFrame([{"identity": 1000, "identity_norm": "1000", "price": 1.0}]).write_parquet(
-        right_path
-    )
+    pl.DataFrame(
+        [{"identity": 1000, "identity_norm": "1000", "price": 1.0}]
+    ).write_parquet(right_path)
     right = canonicalize.execute_structural_canonicalize([right_path], params)
     merged = canonicalize.merge_structural_canonicalize_states(state, right)
     assert merged.bucket_count == 1024
     assert merged.positive_group_count == state.positive_group_count + 1
 
 
-def test_read_canonicalize_state_consumes_one_bucket_payload_at_a_time(tmp_path, monkeypatch):
+def test_read_canonicalize_state_consumes_one_bucket_payload_at_a_time(
+    tmp_path, monkeypatch
+):
     from hashlib import sha256
 
     from portable_batch_execution.contracts import ArtifactRef
     from portable_batch_execution.worker import execute_wave as ew
 
     path = tmp_path / "part.parquet"
-    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(path)
+    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(
+        path
+    )
     state = canonicalize.execute_structural_canonicalize([path], _PARAMS)
 
     payloads = {}

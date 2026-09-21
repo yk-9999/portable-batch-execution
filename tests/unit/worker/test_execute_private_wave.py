@@ -38,16 +38,22 @@ def _plane(
     if binary_payload is not None:
         payload = binary_payload
     elif pack == "media-batch":
-        payload = binary_payload if binary_payload is not None else b"\x00\x01private-audio"
+        payload = (
+            binary_payload if binary_payload is not None else b"\x00\x01private-audio"
+        )
     elif pack == "ml-batch":
-        document = ml_payload if ml_payload is not None else {
-            "schema_version": "pbe.ml.char-wb-tfidf-logistic-score.v1",
-            "model": {
-                "features": [{"feature": "ab", "idf": 1.0, "coefficient": 0.0}],
-                "intercept": 0.0,
-            },
-            "rows": [{"row_id": "row-1", "text": "ab"}],
-        }
+        document = (
+            ml_payload
+            if ml_payload is not None
+            else {
+                "schema_version": "pbe.ml.char-wb-tfidf-logistic-score.v1",
+                "model": {
+                    "features": [{"feature": "ab", "idf": 1.0, "coefficient": 0.0}],
+                    "intercept": 0.0,
+                },
+                "rows": [{"row_id": "row-1", "text": "ab"}],
+            }
+        )
         payload = json.dumps(document).encode()
     else:
         if tabular_payload is not None:
@@ -154,10 +160,13 @@ def _plane(
 
 def test_failed_execution_appends_one_failed_record():
     plane = _plane()
-    with patch(
-        "portable_batch_execution.worker.execute_wave.TabularPack.execute",
-        side_effect=RuntimeError(_SENTINEL),
-    ), pytest.raises(PrivateWaveExecutionError) as error:
+    with (
+        patch(
+            "portable_batch_execution.worker.execute_wave.TabularPack.execute",
+            side_effect=RuntimeError(_SENTINEL),
+        ),
+        pytest.raises(PrivateWaveExecutionError) as error,
+    ):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)
     assert len(plane.appended) == 1
     record = plane.appended[0]
@@ -212,10 +221,13 @@ def test_stale_attempts_do_not_consume_ordinal_or_budget():
         for index in range(9)
     ]
     plane = _plane(appended=stale)
-    with patch(
-        "portable_batch_execution.worker.execute_wave.TabularPack.execute",
-        side_effect=RuntimeError(_SENTINEL),
-    ), pytest.raises(PrivateWaveExecutionError):
+    with (
+        patch(
+            "portable_batch_execution.worker.execute_wave.TabularPack.execute",
+            side_effect=RuntimeError(_SENTINEL),
+        ),
+        pytest.raises(PrivateWaveExecutionError),
+    ):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)
     assert plane.appended[-1].attempt_id == _private_attempt_id(
         "opaque-wave",
@@ -248,10 +260,13 @@ def test_new_generation_reuses_ordinal_without_colliding_with_stale_generation()
         failure="shard_execution_failed",
     )
     plane = _plane(appended=[stale])
-    with patch(
-        "portable_batch_execution.worker.execute_wave.TabularPack.execute",
-        side_effect=RuntimeError(_SENTINEL),
-    ), pytest.raises(PrivateWaveExecutionError):
+    with (
+        patch(
+            "portable_batch_execution.worker.execute_wave.TabularPack.execute",
+            side_effect=RuntimeError(_SENTINEL),
+        ),
+        pytest.raises(PrivateWaveExecutionError),
+    ):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)
     current_attempt_id = _private_attempt_id(
         "opaque-wave",
@@ -454,10 +469,7 @@ def test_ml_char_wb_success_records_row_counts():
     assert record.status == "succeeded"
     assert record.counts == {"input_rows": 2, "output_rows": 2}
     output = json.loads(plane.last_written.decode())
-    assert (
-        output["schema_version"]
-        == "pbe.ml.char-wb-tfidf-logistic-score-result.v1"
-    )
+    assert output["schema_version"] == "pbe.ml.char-wb-tfidf-logistic-score-result.v1"
     assert [item["row_id"] for item in output["rows"]] == ["a", "b"]
 
 
@@ -593,10 +605,13 @@ def test_media_asr_normalize_flac_success_writes_flac_bytes():
 
 def test_media_pack_failure_records_sanitized_failure():
     plane = _plane(pack="media-batch", operation="media.asr_normalize_flac")
-    with patch(
-        "portable_batch_execution.worker.execute_wave.MediaPack.execute",
-        side_effect=RuntimeError(_SENTINEL),
-    ), pytest.raises(PrivateWaveExecutionError) as error:
+    with (
+        patch(
+            "portable_batch_execution.worker.execute_wave.MediaPack.execute",
+            side_effect=RuntimeError(_SENTINEL),
+        ),
+        pytest.raises(PrivateWaveExecutionError) as error,
+    ):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)
     record = plane.appended[0]
     assert record.failure == "shard_pack_execution_failed"
@@ -737,6 +752,7 @@ def test_private_wave_json_record_array_input_remains_compatible():
     assert attempts[0].status == "succeeded"
     assert attempts[0].counts == {"input_rows": 2, "output_rows": 2}
 
+
 def test_private_wave_parquet_oversize_stream_fails_before_pack_execution():
     import io
 
@@ -765,6 +781,7 @@ def test_private_wave_parquet_oversize_stream_fails_before_pack_execution():
         execute.assert_not_called()
     assert plane.appended[0].failure == "input_artifact_mismatch"
 
+
 def test_parquet_row_count_uses_scan_not_eager_read_parquet(tmp_path):
     import io
 
@@ -777,8 +794,13 @@ def test_parquet_row_count_uses_scan_not_eager_read_parquet(tmp_path):
     path = tmp_path / "input.parquet"
     path.write_bytes(buffer.getvalue())
 
-    with patch.object(
-        pl, "read_parquet", side_effect=AssertionError("read_parquet must not be used")
-    ), patch.object(pl, "scan_parquet", wraps=pl.scan_parquet) as scan:
+    with (
+        patch.object(
+            pl,
+            "read_parquet",
+            side_effect=AssertionError("read_parquet must not be used"),
+        ),
+        patch.object(pl, "scan_parquet", wraps=pl.scan_parquet) as scan,
+    ):
         assert _parquet_row_count(path) == 2
         scan.assert_called_once()

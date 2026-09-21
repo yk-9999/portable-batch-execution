@@ -21,7 +21,9 @@ def _write_config(tmp_path, max_input_bytes: int) -> BrokerConfig:
                 "schema_version": "pbe.a1-unix-broker.config.v1",
                 "public_sha": _PUBLIC_SHA,
                 "max_input_bytes": max_input_bytes,
-                "allowed_operations_by_uid": {"1000": [["tabular-batch", "tabular.sort"]]},
+                "allowed_operations_by_uid": {
+                    "1000": [["tabular-batch", "tabular.sort"]]
+                },
             }
         ),
         encoding="utf-8",
@@ -36,7 +38,9 @@ def test_default_max_input_bytes_unchanged(tmp_path):
             {
                 "schema_version": "pbe.a1-unix-broker.config.v1",
                 "public_sha": _PUBLIC_SHA,
-                "allowed_operations_by_uid": {"1000": [["tabular-batch", "tabular.sort"]]},
+                "allowed_operations_by_uid": {
+                    "1000": [["tabular-batch", "tabular.sort"]]
+                },
             }
         ),
         encoding="utf-8",

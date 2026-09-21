@@ -67,7 +67,9 @@ class ClosedWaveRegistry:
             run_dir = self._run_dir(run_id)
             job_path = run_dir / "job.json"
             if job_path.exists():
-                existing = JobSpec.model_validate_json(job_path.read_text(encoding="utf-8"))
+                existing = JobSpec.model_validate_json(
+                    job_path.read_text(encoding="utf-8")
+                )
                 if existing != job:
                     raise ValueError("run already registered with a different job")
             else:

@@ -86,7 +86,9 @@ class BrokerConfig:
                     or len(item) != 2
                     or not all(isinstance(part, str) and part for part in item)
                 ):
-                    raise ValueError("allowed operation entries must be [pack, operation]")
+                    raise ValueError(
+                        "allowed operation entries must be [pack, operation]"
+                    )
                 pairs.add((item[0], item[1]))
             allowed[uid] = frozenset(pairs)
         static_input_bindings = _parse_static_input_bindings(
@@ -101,7 +103,9 @@ class BrokerConfig:
             static_input_bindings=static_input_bindings,
         )
 
-    def static_input_refs_for(self, pack: str, operation: str) -> tuple[ArtifactRef, ...]:
+    def static_input_refs_for(
+        self, pack: str, operation: str
+    ) -> tuple[ArtifactRef, ...]:
         return self.static_input_bindings.get((pack, operation), ())
 
     def authorize(self, uid: int, pack: str, operation: str) -> bool:
@@ -142,18 +146,24 @@ def _parse_static_input_bindings(
         if not isinstance(pack, str) or not pack:
             raise ValueError("static_input_bindings pack must be a nonempty string")
         if not isinstance(operation, str) or not operation:
-            raise ValueError("static_input_bindings operation must be a nonempty string")
+            raise ValueError(
+                "static_input_bindings operation must be a nonempty string"
+            )
         key = (pack, operation)
         if key in bindings:
             raise ValueError("duplicate static_input_bindings pack and operation")
         raw_refs = entry.get("input_refs")
         if not isinstance(raw_refs, list) or not raw_refs:
-            raise ValueError("static_input_bindings input_refs must be a nonempty array")
+            raise ValueError(
+                "static_input_bindings input_refs must be a nonempty array"
+            )
         if len(raw_refs) > _MAX_STATIC_INPUT_REFS:
             raise ValueError("static_input_bindings input_refs exceeds bound")
         refs = tuple(ArtifactRef.model_validate(item) for item in raw_refs)
         object_ids = [ref.object_id for ref in refs]
         if len(set(object_ids)) != len(object_ids):
-            raise ValueError("static_input_bindings input_refs contain duplicate object_id")
+            raise ValueError(
+                "static_input_bindings input_refs contain duplicate object_id"
+            )
         bindings[key] = refs
     return bindings

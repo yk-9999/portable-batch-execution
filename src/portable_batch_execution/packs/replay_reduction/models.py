@@ -567,6 +567,8 @@ class PairedFillPartitionSpec(Frozen):
 
 class PairedFillReduceJobParams(Frozen):
     schema_version: Literal["pbe.replay.paired-fill-reduce-job.v1"]
+    transport_profile: Literal["hf_bucket_direct", "hf_direct"] | None = None
+    bucket_prefix: str | None = None
 
 
 class PairedFillReduceRequest(Frozen):
@@ -645,10 +647,22 @@ class PairedFillReduceRequest(Frozen):
         raise ValueError("state_transition_handling requires paired-fill v2 or v3")
 
 
+class TradePathScenarioEvaluateJobParams(Frozen):
+    schema_version: Literal["pbe.replay.trade-path-scenario-evaluate-job.v1"]
+
+
+class TradePathScenarioEvaluateFixedSetJobParams(Frozen):
+    schema_version: Literal["pbe.replay.trade-path-scenario-evaluate-fixed-set-job.v1"]
+    transport_profile: Literal["hf_bucket_direct"] = "hf_bucket_direct"
+    bucket_prefix: str | None = None
+
+
 PARAM_MODELS = {
     "replay.structural_canonicalize": StructuralCanonicalizeParams,
     "replay.event_window_extract": EventWindowExtractJobParams,
     "replay.causal_grid_extract": CausalGridExtractJobParams,
     "replay.structural_canonicalize_merge": StructuralCanonicalizeMergeParams,
     "replay.paired_fill_reduce": PairedFillReduceJobParams,
+    "replay.trade_path_scenario_evaluate": TradePathScenarioEvaluateJobParams,
+    "replay.trade_path_scenario_evaluate_fixed_set": TradePathScenarioEvaluateFixedSetJobParams,
 }

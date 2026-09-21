@@ -21,5 +21,7 @@ def peer_credentials_available() -> bool:
 def read_peer_credentials(connection: socket.socket) -> tuple[int, int, int]:
     if not peer_credentials_available():
         raise OSError("SO_PEERCRED is only available on Linux AF_UNIX sockets")
-    data = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    data = connection.getsockopt(
+        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+    )
     return struct.unpack("3i", data)

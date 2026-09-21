@@ -14,12 +14,24 @@ from portable_batch_execution.backends.github_actions import (
     GitHubActionsAPIError,
     GitHubActionsBackend,
 )
-from portable_batch_execution.contracts import PACK_OPS, ShardAttemptRecord, ShardSpec
+from portable_batch_execution.contracts import ShardAttemptRecord, ShardSpec
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.kernel import completeness, exhausted_shards
+from portable_batch_execution.packs.replay_reduction.trade_path_scenario_evaluate_fixed_set import (
+    FIXED_SET_OPERATION,
+)
+from portable_batch_execution.transport.hf_bucket import validate_hf_bucket_ref
 
+from .artifact_reader import BrokerArtifactReader, build_broker_artifact_reader
 from .config import BrokerConfig
+from .hf_direct import (
+    BrokerHfDirectExecuteResponse,
+    hf_direct_wave_input_digest,
+    parse_hf_direct_request,
+    reject_legacy_byte_fields,
+)
 from .planning import (
+    broker_allows_operation,
     broker_execution_fingerprint,
     broker_shard_input_digest,
     canonical_operation_params,
@@ -32,6 +44,8 @@ from .protocol import BrokerExecuteRequest, BrokerExecuteResponse, parse_request
 from .state import BrokerRequestState, BrokerRequestStore, RequestBinding
 
 _TERMINAL_FAILURE_STATUSES = frozenset({"failed", "cancelled"})
+_HF_DIRECT_MAX_DISPATCHES = 4
+_BrokerResponse = BrokerExecuteResponse | BrokerHfDirectExecuteResponse
 
 
 class UnixBrokerService:
@@ -45,6 +59,7 @@ class UnixBrokerService:
         controller: A1Controller,
         poll_interval_seconds: float = 1.0,
         sleeper: Callable[[float], None] | None = None,
+        artifact_reader: BrokerArtifactReader | None = None,
     ):
         self.state_root = state_root.resolve()
         self.config = config
@@ -52,9 +67,17 @@ class UnixBrokerService:
         self.poll_interval_seconds = poll_interval_seconds
         self._sleep = sleeper or time.sleep
         self._store = BrokerRequestStore(self.state_root / "controller")
+        self._artifact_reader = artifact_reader or build_broker_artifact_reader(
+            controller.data_plane
+        )
 
-    def handle_payload(self, peer_uid: int, payload: object) -> BrokerExecuteResponse:
+    def handle_payload(self, peer_uid: int, payload: object) -> _BrokerResponse:
+        if isinstance(payload, dict) and payload.get("schema_version") == (
+            "pbe.a1-unix-broker.hf-direct-request.v1"
+        ):
+            return self._handle_hf_direct_payload(peer_uid, payload)
         try:
+            reject_legacy_byte_fields(payload)
             request = parse_request(payload)
         except (TypeError, ValueError):
             return BrokerExecuteResponse(
@@ -62,9 +85,9 @@ class UnixBrokerService:
                 status="failed",
                 error_code="request_invalid",
             )
-        if request.pack not in {"tabular-batch", "ml-batch", "media-batch"}:
-            return self._failed(request.request_id, "operation_not_allowed")
-        if request.operation not in PACK_OPS[request.pack]:
+        if request.operation == FIXED_SET_OPERATION:
+            return self._failed(request.request_id, "request_invalid")
+        if not broker_allows_operation(request.pack, request.operation):
             return self._failed(request.request_id, "operation_not_allowed")
         if not self.config.authorize(peer_uid, request.pack, request.operation):
             return self._failed(request.request_id, "peer_not_authorized")
@@ -112,7 +135,7 @@ class UnixBrokerService:
                     return self._failed(request.request_id, "broker_internal_error")
             else:
                 try:
-                    state = self.recover_request_state(request, binding)
+                    state = self.recover_request_state(request.request_id, binding)
                 except ValueError as exc:
                     if str(exc) == "request_binding_conflict":
                         return self._failed(request.request_id, "request_id_conflict")
@@ -120,10 +143,155 @@ class UnixBrokerService:
         elif not state.binding.matches(binding):
             return self._failed(request.request_id, "request_id_conflict")
         if state.status == "succeeded":
-            return self._success_from_state(state)
+            return self._success_from_state(state, hf_direct=False)
         if state.status == "exhausted":
-            return self._exhausted(state)
-        return self._drive_to_terminal(request.request_id, state)
+            return self._exhausted(state, hf_direct=False)
+        return self._drive_to_terminal(request.request_id, state, hf_direct=False)
+
+    def _handle_hf_direct_payload(
+        self, peer_uid: int, payload: object
+    ) -> BrokerHfDirectExecuteResponse:
+        try:
+            reject_legacy_byte_fields(payload)
+            request = parse_hf_direct_request(payload)
+        except (TypeError, ValueError):
+            return self._failed_hf(_request_id_or_unknown(payload), "request_invalid")
+        if not broker_allows_operation(request.pack, request.operation):
+            return self._failed_hf(request.request_id, "operation_not_allowed")
+        if not self.config.authorize(peer_uid, request.pack, request.operation):
+            return self._failed_hf(request.request_id, "peer_not_authorized")
+        try:
+            validated_params = canonical_operation_params(
+                request.pack, request.operation, request.operation_params
+            )
+        except ValueError:
+            return self._failed_hf(request.request_id, "operation_params_invalid")
+        if request.public_revision != self.config.public_sha:
+            return self._failed_hf(request.request_id, "public_revision_mismatch")
+        validated_ref = validate_hf_bucket_ref(request.wave_descriptor_hf_ref)
+        input_digest = hf_direct_wave_input_digest(
+            wave_descriptor_hf_ref=validated_ref,
+            result_manifest_object_path=request.result_manifest_object_path,
+            logical_run_id=request.logical_run_id,
+            wave_id=request.wave_id,
+            public_revision=request.public_revision,
+            shard_count=request.shard_count,
+        )
+        binding = RequestBinding(
+            input_digest=input_digest,
+            pack=request.pack,
+            operation=request.operation,
+            operation_params=validated_params,
+            execution_fingerprint=broker_execution_fingerprint(
+                request_id=request.request_id,
+                input_digest=input_digest,
+                pack=request.pack,
+                operation=request.operation,
+                operation_params=validated_params,
+                public_sha=self.config.public_sha,
+            ),
+            public_sha=self.config.public_sha,
+        )
+        state = self._store.load(request.request_id)
+        if state is None:
+            state = BrokerRequestState(
+                request_id=request.request_id,
+                binding=binding,
+                logical_run_id=request.logical_run_id,
+                wave_id=request.wave_id,
+                shard_id="wave",
+                status="active",
+                result_manifest_object_path=request.result_manifest_object_path,
+                wave_descriptor_hf_ref=dict(validated_ref),
+            )
+            self._store.save(state)
+        elif not state.binding.matches(binding):
+            return self._failed_hf(request.request_id, "request_id_conflict")
+        if state.status == "succeeded":
+            return self._success_hf_wave(state)
+        if state.status == "exhausted":
+            return self._exhausted(state, hf_direct=True)
+        return self._drive_hf_wave_to_terminal(request.request_id, state)
+
+    def _drive_hf_wave_to_terminal(
+        self, request_id: str, state: BrokerRequestState
+    ) -> BrokerHfDirectExecuteResponse:
+        if self.controller.backend is None:
+            return self._failed_hf(request_id, "backend_unavailable")
+        if (
+            state.wave_descriptor_hf_ref is None
+            or state.result_manifest_object_path is None
+        ):
+            return self._failed_hf(request_id, "broker_internal_error")
+        self._sync_hf_dispatch_from_controller(state)
+        while True:
+            backend_status = self._backend_status(state)
+            if state.status == "succeeded":
+                return self._success_hf_wave(state)
+            if backend_status == "running":
+                self._sleep(self.poll_interval_seconds)
+                continue
+            if backend_status == "succeeded":
+                state.status = "succeeded"
+                self._store.save(state)
+                return self._success_hf_wave(state)
+            backend_terminal = backend_status in _TERMINAL_FAILURE_STATUSES | {
+                "succeeded"
+            }
+            if state.dispatch_count >= _HF_DIRECT_MAX_DISPATCHES and backend_terminal:
+                state.status = "exhausted"
+                self._store.save(state)
+                return self._exhausted(state, hf_direct=True)
+            should_dispatch = state.dispatch_count == 0 or (
+                state.dispatch_count < _HF_DIRECT_MAX_DISPATCHES
+                and backend_status in {"failed", "cancelled", None}
+            )
+            if not should_dispatch:
+                self._sleep(self.poll_interval_seconds)
+                continue
+            try:
+                execution = self.controller.dispatch_hf_direct_wave(
+                    state.logical_run_id,
+                    state.wave_id,
+                    state.wave_descriptor_hf_ref,
+                    result_manifest_object_path=state.result_manifest_object_path,
+                )
+            except GitHubActionsAPIError:
+                return self._failed_hf(request_id, "backend_transient")
+            except ValueError:
+                return self._failed_hf(request_id, "dispatch_failed")
+            state.execution_id = execution.execution_id
+            state.dispatch_count += 1
+            self._store.save(state)
+            self._sleep(self.poll_interval_seconds)
+
+    def _sync_hf_dispatch_from_controller(self, state: BrokerRequestState) -> None:
+        history = self.controller.read_wave_dispatch_history(
+            state.logical_run_id, state.wave_id
+        )
+        if not history:
+            return
+        recorded_count = len(history)
+        if recorded_count <= state.dispatch_count:
+            return
+        state.dispatch_count = recorded_count
+        state.execution_id = history[-1]["execution_id"]
+        self._store.save(state)
+
+    def _success_hf_wave(
+        self, state: BrokerRequestState
+    ) -> BrokerHfDirectExecuteResponse:
+        manifest_path = (state.result_manifest_object_path or "").lstrip("/")
+        return BrokerHfDirectExecuteResponse(
+            request_id=state.request_id,
+            status="succeeded",
+            logical_run_id=state.logical_run_id,
+            wave_id=state.wave_id,
+            execution_id=state.execution_id,
+            input_digest=state.binding.input_digest,
+            execution_fingerprint=state.binding.execution_fingerprint,
+            result_manifest_object_path=manifest_path,
+        )
 
     def _register_request(
         self,
@@ -155,7 +323,10 @@ class UnixBrokerService:
         return state
 
     def _reconcile_if_attempts_changed(
-        self, state: BrokerRequestState, shard: ShardSpec, attempts: list[ShardAttemptRecord]
+        self,
+        state: BrokerRequestState,
+        shard: ShardSpec,
+        attempts: list[ShardAttemptRecord],
     ) -> None:
         marker = _attempt_marker(shard, attempts)
         if marker == state.last_reconciled_attempt_marker:
@@ -196,13 +367,21 @@ class UnixBrokerService:
         self._store.save(state)
 
     def _drive_to_terminal(
-        self, request_id: str, state: BrokerRequestState
-    ) -> BrokerExecuteResponse:
+        self, request_id: str, state: BrokerRequestState, *, hf_direct: bool
+    ) -> _BrokerResponse:
         if self.controller.backend is None:
-            return self._failed(request_id, "backend_unavailable")
+            return (
+                self._failed_hf(request_id, "backend_unavailable")
+                if hf_direct
+                else self._failed(request_id, "backend_unavailable")
+            )
         shards = self.controller.registry.load_shards_for_run(state.logical_run_id)
         if len(shards) != 1:
-            return self._failed(request_id, "broker_internal_error")
+            return (
+                self._failed_hf(request_id, "broker_internal_error")
+                if hf_direct
+                else self._failed(request_id, "broker_internal_error")
+            )
         shard = shards[0]
         job_payload = self.controller.registry.resolve_wave(
             state.logical_run_id, state.wave_id
@@ -213,45 +392,37 @@ class UnixBrokerService:
         max_dispatches = execution_policy.max_attempts_per_shard
         self._sync_dispatch_from_controller(state, shard)
         while True:
-            attempts = list(self.controller.data_plane.read_attempts(state.logical_run_id))
+            attempts = list(
+                self.controller.data_plane.read_attempts(state.logical_run_id)
+            )
             self._reconcile_if_attempts_changed(state, shard, attempts)
             terminal_count = len(_matching_terminal_attempts(shard, attempts))
             if terminal_count >= execution_policy.max_attempts_per_shard:
                 state.status = "exhausted"
                 self._store.save(state)
-                return self._exhausted(state)
+                return self._exhausted(state, hf_direct=hf_direct)
             exhausted = exhausted_shards((shard,), attempts, execution_policy)
             if exhausted:
                 state.status = "exhausted"
                 self._store.save(state)
-                return self._exhausted(state)
+                return self._exhausted(state, hf_direct=hf_direct)
             canonical, missing, duplicate = completeness(
                 {shard.shard_id}, attempts, (shard,)
             )
             if canonical and not missing and not duplicate:
                 attempt = canonical[0]
-                output_bytes, media_type, digest = self._read_attempt_output(attempt)
                 state.status = "succeeded"
-                state.output_sha256 = digest
-                state.output_media_type = media_type
                 self._store.save(state)
                 self._reconcile_if_attempts_changed(state, shard, attempts)
-                return BrokerExecuteResponse(
-                    request_id=state.request_id,
-                    status="succeeded",
-                    logical_run_id=state.logical_run_id,
-                    wave_id=state.wave_id,
-                    execution_id=state.execution_id,
-                    input_digest=state.binding.input_digest,
-                    execution_fingerprint=state.binding.execution_fingerprint,
-                    output_media_type=media_type,
-                    output_sha256=digest,
-                    output_b64=base64.b64encode(output_bytes).decode("ascii"),
-                )
+                return self._success_from_attempt(state, attempt, hf_direct=hf_direct)
             try:
                 backend_status = self._backend_status(state)
             except GitHubActionsAPIError:
-                return self._failed(request_id, "backend_transient")
+                return (
+                    self._failed_hf(request_id, "backend_transient")
+                    if hf_direct
+                    else self._failed(request_id, "backend_transient")
+                )
             backend_terminal = backend_status in {"failed", "cancelled", "succeeded"}
             if backend_status == "running":
                 self._sleep(self.poll_interval_seconds)
@@ -266,15 +437,12 @@ class UnixBrokerService:
             if backend_terminal and state.dispatch_count >= max_dispatches:
                 state.status = "exhausted"
                 self._store.save(state)
-                return self._exhausted(state)
-            should_dispatch = (
-                state.dispatch_count == 0
-                or (
-                    state.dispatch_count < max_dispatches
-                    and (
-                        terminal_count > state.last_dispatched_failure_count
-                        or backend_terminal
-                    )
+                return self._exhausted(state, hf_direct=hf_direct)
+            should_dispatch = state.dispatch_count == 0 or (
+                state.dispatch_count < max_dispatches
+                and (
+                    terminal_count > state.last_dispatched_failure_count
+                    or backend_terminal
                 )
             )
             if not should_dispatch:
@@ -285,9 +453,17 @@ class UnixBrokerService:
                     state.logical_run_id, state.wave_id
                 )
             except GitHubActionsAPIError:
-                return self._failed(request_id, "backend_transient")
+                return (
+                    self._failed_hf(request_id, "backend_transient")
+                    if hf_direct
+                    else self._failed(request_id, "backend_transient")
+                )
             except ValueError:
-                return self._failed(request_id, "dispatch_failed")
+                return (
+                    self._failed_hf(request_id, "dispatch_failed")
+                    if hf_direct
+                    else self._failed(request_id, "dispatch_failed")
+                )
             state.execution_id = execution.execution_id
             state.last_dispatched_failure_count = terminal_count
             state.dispatch_count += 1
@@ -308,22 +484,24 @@ class UnixBrokerService:
         if not attempt.output_refs:
             raise ValueError("successful attempt missing output")
         ref = attempt.output_refs[0]
-        payload = self.controller.data_plane.read(ref)
+        payload = self._artifact_reader.read(ref)
         digest = sha256(payload).hexdigest()
         media_type = ref.media_type or "application/octet-stream"
         return payload, media_type, f"sha256:{digest}"
 
-    def _success_from_state(self, state: BrokerRequestState) -> BrokerExecuteResponse:
-        shards = self.controller.registry.load_shards_for_run(state.logical_run_id)
-        attempts = list(self.controller.data_plane.read_attempts(state.logical_run_id))
-        if len(shards) == 1:
-            self._reconcile_if_attempts_changed(state, shards[0], attempts)
-        canonical, missing, duplicate = completeness(
-            {state.shard_id}, list(attempts), shards
-        )
-        if not canonical or missing or duplicate:
-            return self._failed(state.request_id, "broker_internal_error")
-        output_bytes, media_type, digest = self._read_attempt_output(canonical[0])
+    def _success_from_attempt(
+        self,
+        state: BrokerRequestState,
+        attempt: ShardAttemptRecord,
+        *,
+        hf_direct: bool,
+    ) -> _BrokerResponse:
+        if hf_direct:
+            return self._success_hf_wave(state)
+        output_bytes, media_type, digest = self._read_attempt_output(attempt)
+        state.output_sha256 = digest
+        state.output_media_type = media_type
+        self._store.save(state)
         return BrokerExecuteResponse(
             request_id=state.request_id,
             status="succeeded",
@@ -337,8 +515,37 @@ class UnixBrokerService:
             output_b64=base64.b64encode(output_bytes).decode("ascii"),
         )
 
+    def _success_from_state(
+        self, state: BrokerRequestState, *, hf_direct: bool
+    ) -> _BrokerResponse:
+        shards = self.controller.registry.load_shards_for_run(state.logical_run_id)
+        attempts = list(self.controller.data_plane.read_attempts(state.logical_run_id))
+        if len(shards) == 1:
+            self._reconcile_if_attempts_changed(state, shards[0], attempts)
+        canonical, missing, duplicate = completeness(
+            {state.shard_id}, list(attempts), shards
+        )
+        if not canonical or missing or duplicate:
+            return (
+                self._failed_hf(state.request_id, "broker_internal_error")
+                if hf_direct
+                else self._failed(state.request_id, "broker_internal_error")
+            )
+        return self._success_from_attempt(state, canonical[0], hf_direct=hf_direct)
+
     @staticmethod
-    def _exhausted(state: BrokerRequestState) -> BrokerExecuteResponse:
+    def _exhausted(state: BrokerRequestState, *, hf_direct: bool) -> _BrokerResponse:
+        if hf_direct:
+            return BrokerHfDirectExecuteResponse(
+                request_id=state.request_id,
+                status="exhausted",
+                logical_run_id=state.logical_run_id,
+                wave_id=state.wave_id,
+                execution_id=state.execution_id,
+                input_digest=state.binding.input_digest,
+                execution_fingerprint=state.binding.execution_fingerprint,
+                error_code="attempt_budget_exhausted",
+            )
         return BrokerExecuteResponse(
             request_id=state.request_id,
             status="exhausted",
@@ -358,12 +565,22 @@ class UnixBrokerService:
             error_code=error_code,
         )
 
-    def recover_request_state(self, request: BrokerExecuteRequest, binding: RequestBinding) -> BrokerRequestState:
+    @staticmethod
+    def _failed_hf(request_id: str, error_code: str) -> BrokerHfDirectExecuteResponse:
+        return BrokerHfDirectExecuteResponse(
+            request_id=request_id,
+            status="failed",
+            error_code=error_code,
+        )
+
+    def recover_request_state(
+        self, request_id: str, binding: RequestBinding
+    ) -> BrokerRequestState:
         """Rebuild durable broker state when registration exists but state file is missing."""
         from portable_batch_execution.contracts import JobSpec
 
-        run_id = opaque_run_id(request.request_id)
-        wave_id = opaque_wave_id(request.request_id)
+        run_id = opaque_run_id(request_id)
+        wave_id = opaque_wave_id(request_id)
         payload = self.controller.registry.resolve_wave(run_id, wave_id)
         job = JobSpec.model_validate(payload["job"])
         shard = ShardSpec.model_validate(payload["shards"][0])
@@ -372,7 +589,7 @@ class UnixBrokerService:
         )
         try:
             validate_registered_wave_binding(
-                request_id=request.request_id,
+                request_id=request_id,
                 binding_input_digest=binding.input_digest,
                 binding_pack=binding.pack,
                 binding_operation=binding.operation,
@@ -387,7 +604,7 @@ class UnixBrokerService:
                 raise
             raise ValueError("request_binding_conflict") from exc
         state = BrokerRequestState(
-            request_id=request.request_id,
+            request_id=request_id,
             binding=binding,
             logical_run_id=run_id,
             wave_id=wave_id,
@@ -448,14 +665,22 @@ def build_service_from_environment(
     state_root: Path,
     backend: GitHubActionsBackend | None,
     poll_interval_seconds: float,
+    artifact_read_base_url: str | None = None,
+    artifact_read_token_file: Path | None = None,
 ) -> UnixBrokerService:
     config = BrokerConfig.load(Path(_required_env("PBE_BROKER_CONFIG")))
     controller = A1Controller(state_root, backend=backend)
+    artifact_reader = build_broker_artifact_reader(
+        controller.data_plane,
+        artifact_read_base_url=artifact_read_base_url,
+        artifact_read_token_file=artifact_read_token_file,
+    )
     return UnixBrokerService(
         state_root=state_root,
         config=config,
         controller=controller,
         poll_interval_seconds=poll_interval_seconds,
+        artifact_reader=artifact_reader,
     )
 
 

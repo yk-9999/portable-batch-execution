@@ -57,6 +57,7 @@ class BrokerExecuteRequest(_StrictModel):
         "tabular-batch",
         "ml-batch",
         "media-batch",
+        "replay-batch",
     ]
     operation: str
     operation_params: dict[str, Any] = Field(default_factory=dict)

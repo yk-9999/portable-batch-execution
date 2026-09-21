@@ -55,7 +55,7 @@ def test_artifact_write_read_and_head(tmp_path):
         "/v1/artifacts",
         authorization="Bearer plane-token",
         headers={"content-type": "application/json"},
-        body=b"[{\"value\":1}]",
+        body=b'[{"value":1}]',
     )
     assert status == 200
     ref = json.loads(body or b"{}")
@@ -68,7 +68,7 @@ def test_artifact_write_read_and_head(tmp_path):
     assert get_status == 200
     assert get_headers["Content-Type"] == "application/octet-stream"
     assert get_headers["Content-Length"] == "13"
-    assert b"".join(payload.chunks) == b"[{\"value\":1}]"
+    assert b"".join(payload.chunks) == b'[{"value":1}]'
     head_status, head_headers, _ = service.dispatch(
         "HEAD",
         f"/v1/artifacts/{object_id}/content",
@@ -133,9 +133,9 @@ def test_attempts_are_immutable(tmp_path):
         "POST",
         "/v1/runs/opaque-run/attempts",
         authorization="Bearer plane-token",
-        body=record.model_copy(update={"failure": "other"}).model_dump_json().encode(
-            "utf-8"
-        ),
+        body=record.model_copy(update={"failure": "other"})
+        .model_dump_json()
+        .encode("utf-8"),
     )
     assert conflict == 409
 
@@ -163,9 +163,9 @@ def test_manifest_put_is_controller_only(tmp_path):
         "/v1/runs/opaque-run/manifest",
         authorization="Bearer plane-token",
         headers={"if-match": "0"},
-        body=manifest.model_copy(update={"revision": 1, "status": "running"}).model_dump_json().encode(
-            "utf-8"
-        ),
+        body=manifest.model_copy(update={"revision": 1, "status": "running"})
+        .model_dump_json()
+        .encode("utf-8"),
     )
     assert put_status == 403
     assert json.loads(put_body or b"{}") == {"error": "controller-only"}

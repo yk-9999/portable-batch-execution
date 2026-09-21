@@ -224,14 +224,21 @@ def _source_lineage(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _row_matches_transition_marker(row: dict[str, Any], model: PairedFillReduceRequest) -> bool:
+def _row_matches_transition_marker(
+    row: dict[str, Any], model: PairedFillReduceRequest
+) -> bool:
     spec = model.state_transition_handling
     if spec is None:
         return False
-    return all(row.get(column) == expected for column, expected in spec.marker_exact_match_fields.items())
+    return all(
+        row.get(column) == expected
+        for column, expected in spec.marker_exact_match_fields.items()
+    )
 
 
-def _validate_transition_row_invariants(row: dict[str, Any], model: PairedFillReduceRequest) -> None:
+def _validate_transition_row_invariants(
+    row: dict[str, Any], model: PairedFillReduceRequest
+) -> None:
     spec = model.state_transition_handling
     if spec is None:
         validate_row_invariants(row, model.row_invariants)
@@ -249,7 +256,9 @@ def _numeric_close(left: Any, right: float, *, atol: float, rtol: float) -> bool
         value = float(left)
     except (TypeError, ValueError):
         return False
-    return math.isfinite(value) and math.isclose(value, right, abs_tol=atol, rel_tol=rtol)
+    return math.isfinite(value) and math.isclose(
+        value, right, abs_tol=atol, rel_tol=rtol
+    )
 
 
 def _outcome_asset_encoding(symbol: Any) -> int | None:
@@ -358,7 +367,9 @@ def _validate_transition_value_constraints(
                     atol=spec.absolute_tolerance,
                     rtol=spec.relative_tolerance,
                 ):
-                    raise StructuralCanonicalizeError("state transition zero field invalid")
+                    raise StructuralCanonicalizeError(
+                        "state transition zero field invalid"
+                    )
         return
     if isinstance(spec, PairedFillStateTransitionHandlingV2):
         if not _rows_match_any_value_branch(rows, model):
@@ -387,7 +398,10 @@ def _state_transition_ledger_row(
 
     role_column = model.pair_mapping.pair_role_column
     by_role = {row.get(role_column): row for row in rows}
-    if set(by_role) != {spec.state_owner_role_value, spec.protocol_counterparty_role_value}:
+    if set(by_role) != {
+        spec.state_owner_role_value,
+        spec.protocol_counterparty_role_value,
+    }:
         raise StructuralCanonicalizeError("state transition roles invalid")
     owner = by_role[spec.state_owner_role_value]
     counterparty = by_role[spec.protocol_counterparty_role_value]
@@ -427,14 +441,18 @@ def _state_transition_ledger_row(
         abs_tol=spec.absolute_tolerance,
         rel_tol=spec.relative_tolerance,
     ):
-        raise StructuralCanonicalizeError("state transition owner post position invalid")
+        raise StructuralCanonicalizeError(
+            "state transition owner post position invalid"
+        )
     if not math.isclose(
         counterparty_signed,
         -owner_signed,
         abs_tol=spec.absolute_tolerance,
         rel_tol=spec.relative_tolerance,
     ):
-        raise StructuralCanonicalizeError("state transition counterparty quantity invalid")
+        raise StructuralCanonicalizeError(
+            "state transition counterparty quantity invalid"
+        )
 
     owner_role = _role_name(
         owner,
@@ -456,7 +474,9 @@ def _state_transition_ledger_row(
         "identity_namespace": _identity_namespace(group_key, model),
         "ledger_identity": _ledger_identity(group_key),
         "classification": "state_transition",
-        "measurement_core": _measurement_core(rows[0], model.pair_mapping.measurement_core_fields),
+        "measurement_core": _measurement_core(
+            rows[0], model.pair_mapping.measurement_core_fields
+        ),
         **lineage,
         "state_owner": owner_record,
         "protocol_counterparty": {
@@ -468,7 +488,9 @@ def _state_transition_ledger_row(
     }
 
 
-def _participants_same_identity(rows: list[dict[str, Any]], pair_mapping) -> bool | None:
+def _participants_same_identity(
+    rows: list[dict[str, Any]], pair_mapping
+) -> bool | None:
     column = pair_mapping.participant_identity_column
     if column is None:
         return None
@@ -499,7 +521,9 @@ def _ledger_row(
         )
         if role is None:
             raise StructuralCanonicalizeError("pair role invalid")
-        participants.append(_participant_record(row, role=role, pair_mapping=pair_mapping))
+        participants.append(
+            _participant_record(row, role=role, pair_mapping=pair_mapping)
+        )
     if classification == "complete_pair":
         roles = {item["role"] for item in participants}
         if roles != {"aggressor", "passive"}:
@@ -597,7 +621,9 @@ class _Reducer:
         self.closed_group_keys.add(group_key)
         self._clear_pending()
 
-    def _ingest_economic_row(self, row: dict[str, Any], group_key: tuple[Any, ...]) -> None:
+    def _ingest_economic_row(
+        self, row: dict[str, Any], group_key: tuple[Any, ...]
+    ) -> None:
         if group_key in self.closed_group_keys:
             raise StructuralCanonicalizeError("identity is not contiguous")
 
@@ -754,7 +780,9 @@ def _required_columns(model: PairedFillReduceRequest) -> tuple[str, ...]:
             for branch in transition.value_branches:
                 if isinstance(branch, PairedFillStateTransitionValueZeroBranch):
                     extra_fields.extend(branch.zero_numeric_fields)
-                elif isinstance(branch, PairedFillStateTransitionOutcomeTerminalOneBranch):
+                elif isinstance(
+                    branch, PairedFillStateTransitionOutcomeTerminalOneBranch
+                ):
                     extra_fields.extend(
                         (
                             branch.symbol_column,

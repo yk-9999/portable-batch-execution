@@ -111,11 +111,15 @@ def test_structural_canonicalize_projects_positive_integer_identity(tmp_path):
         [
             _chain_row(
                 identity_norm="42",
-                raw_json=_raw_json(event_id=42, direction="neutral", event_time_ms=1000),
+                raw_json=_raw_json(
+                    event_id=42, direction="neutral", event_time_ms=1000
+                ),
             ),
             _chain_row(
                 identity_norm="43",
-                raw_json=_raw_json(event_id=43, direction="neutral", event_time_ms=1001),
+                raw_json=_raw_json(
+                    event_id=43, direction="neutral", event_time_ms=1001
+                ),
             ),
         ],
     )
@@ -217,14 +221,18 @@ def test_causal_grid_with_projected_identity_and_timestamp(tmp_path):
             _chain_row(
                 identity_norm="1",
                 block=90,
-                raw_json=_raw_json(event_id=1, direction="neutral", event_time_ms=8_000),
+                raw_json=_raw_json(
+                    event_id=1, direction="neutral", event_time_ms=8_000
+                ),
                 price=10.0,
                 notional=50.0,
             ),
             _chain_row(
                 identity_norm="2",
                 block=100,
-                raw_json=_raw_json(event_id=2, direction="neutral", event_time_ms=9_500),
+                raw_json=_raw_json(
+                    event_id=2, direction="neutral", event_time_ms=9_500
+                ),
                 price=10.0,
                 notional=25.0,
             ),
@@ -347,9 +355,7 @@ def test_projection_rejects_output_column_collision(tmp_path):
         "identity_source_column": "identity",
         "identity_normalized_column": "identity_norm",
         "measurement_core_fields": ["price"],
-        "json_scalar_projections": (
-            _identity_projection(output_column="price"),
-        ),
+        "json_scalar_projections": (_identity_projection(output_column="price"),),
     }
     with pytest.raises(StructuralCanonicalizeError, match="collides"):
         execute_structural_canonicalize([path], params)

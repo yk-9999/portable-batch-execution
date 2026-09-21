@@ -63,7 +63,11 @@ def test_hierarchical_merge_matches_naive_many_runs(tmp_path, monkeypatch):
         frame.write_parquet(path)
         runs.append(path)
     naive = sorted(
-        (row["k"] for path in runs for row in pl.read_parquet(path).iter_rows(named=True)),
+        (
+            row["k"]
+            for path in runs
+            for row in pl.read_parquet(path).iter_rows(named=True)
+        ),
     )
     reduced = _reduce_sorted_runs(
         runs,
@@ -98,9 +102,7 @@ def test_reduce_terminates_when_merge_emits_multiple_parts(tmp_path, monkeypatch
         pl.DataFrame({"k": keys}).write_parquet(path)
         runs.append(path)
     naive = sorted(
-        int(value)
-        for path in runs
-        for value in pl.read_parquet(path)["k"].to_list()
+        int(value) for path in runs for value in pl.read_parquet(path)["k"].to_list()
     )
 
     max_logical_fan_in = 0
@@ -154,7 +156,8 @@ def test_many_witness_batches_equivalent_to_single_batch(tmp_path, monkeypatch):
         [_trade_row(identity=1, identity_norm="1", block=100, timestamp_ms=8_000)],
     )
     witness_rows = [
-        _witness_row(block=100 + index, timestamp_ms=8_000 + index) for index in range(12)
+        _witness_row(block=100 + index, timestamp_ms=8_000 + index)
+        for index in range(12)
     ]
     witness = _write(tmp_path / "w.parquet", witness_rows)
     request = _request(

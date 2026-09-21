@@ -42,7 +42,11 @@ def _request(**overrides):
         "canonical_trade_profile": _PROFILE,
         "as_of_offsets_ms": (0, 200),
         "trailing_windows": (
-            {"fact_id": "trail", "measurement_field": "price", "trailing_width_ms": 2000},
+            {
+                "fact_id": "trail",
+                "measurement_field": "price",
+                "trailing_width_ms": 2000,
+            },
         ),
         "future_windows": (
             {
@@ -129,7 +133,14 @@ def test_future_window_uses_timestamp_bounds_and_min_block_exclusive(tmp_path):
         [
             _row(identity=1, identity_norm="1", block=4, timestamp_ms=6200, price=1.0),
             _row(identity=2, identity_norm="2", block=5, timestamp_ms=6200, price=2.0),
-            _row(identity=3, identity_norm="3", block=6, timestamp_ms=6200, price=4.0, seq=1),
+            _row(
+                identity=3,
+                identity_norm="3",
+                block=6,
+                timestamp_ms=6200,
+                price=4.0,
+                seq=1,
+            ),
             _row(identity=4, identity_norm="4", block=6, timestamp_ms=6200, price=8.0),
         ],
     )

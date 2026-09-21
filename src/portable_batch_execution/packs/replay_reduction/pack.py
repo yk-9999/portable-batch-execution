@@ -14,6 +14,11 @@ from .causal_grid import execute_causal_grid_extract
 from .event_window import execute_event_window_extract
 from .models import PARAM_MODELS
 from .paired_fill_reduce import execute_paired_fill_reduce
+from .trade_path_scenario_evaluate import execute_trade_path_scenario_evaluate
+from .trade_path_scenario_evaluate_fixed_set import (
+    FIXED_SET_OPERATION,
+    execute_trade_path_scenario_evaluate_fixed_set,
+)
 
 
 class ReplayReductionPack:
@@ -56,6 +61,22 @@ class ReplayReductionPack:
             if paths is None:
                 raise TypeError("paired fill reduce requires parquet_paths")
             return execute_paired_fill_reduce(paths, request)
+        if operation == "replay.trade_path_scenario_evaluate":
+            batch = context.get("batch")
+            if batch is None:
+                raise TypeError("trade path scenario evaluate requires batch")
+            encoded_size = context.get("encoded_size")
+            return execute_trade_path_scenario_evaluate(
+                batch, encoded_size=encoded_size
+            )
+        if operation == FIXED_SET_OPERATION:
+            batch = context.get("batch")
+            if batch is None:
+                raise TypeError("trade path scenario fixed set requires batch")
+            encoded_size = context.get("encoded_size")
+            return execute_trade_path_scenario_evaluate_fixed_set(
+                batch, encoded_size=encoded_size
+            )
         raise ValueError(f"unsupported replay operation: {operation}")
 
     def finalize(self, job, canonical_attempts, context):
@@ -81,4 +102,9 @@ class ReplayReductionPack:
             return execute_causal_grid_extract(paths or [], request or {})
         if operation == "replay.paired_fill_reduce":
             return execute_paired_fill_reduce(paths or [], request or {})
+        if operation == "replay.trade_path_scenario_evaluate":
+            batch = params or request
+            if batch is None:
+                raise TypeError("trade path scenario evaluate requires batch payload")
+            return execute_trade_path_scenario_evaluate(batch)
         raise ValueError(f"unsupported replay operation: {operation}")

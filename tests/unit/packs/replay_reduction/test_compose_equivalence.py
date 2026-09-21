@@ -14,7 +14,10 @@ _PROFILE = {
     "identity_source_column": "identity",
     "identity_normalized_column": "identity_norm",
     "measurement_core_fields": ["price"],
-    "sentinel": {"identity_equals": -1, "exact_match_fields": {"identity_norm": "witness"}},
+    "sentinel": {
+        "identity_equals": -1,
+        "exact_match_fields": {"identity_norm": "witness"},
+    },
 }
 
 _REQUEST = {
@@ -154,7 +157,10 @@ def test_event_window_matches_hand_computed_reference(tmp_path):
             "identity_source_column": "identity",
             "identity_normalized_column": "identity_norm",
             "measurement_core_fields": ["price"],
-            "sentinel": {"identity_equals": -1, "exact_match_fields": {"identity_norm": "witness"}},
+            "sentinel": {
+                "identity_equals": -1,
+                "exact_match_fields": {"identity_norm": "witness"},
+            },
         },
     )
     assert canonical.witness_row_count == 1

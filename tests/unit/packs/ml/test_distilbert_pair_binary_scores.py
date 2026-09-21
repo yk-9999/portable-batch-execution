@@ -35,10 +35,14 @@ def _tiny_model_bundle(tmp_path: Path, seed: int) -> tuple[bytes, bytes]:
     directory = tmp_path / f"model-{seed}"
     directory.mkdir()
     model.save_pretrained(directory, safe_serialization=True)
-    return (directory / "config.json").read_bytes(), (directory / "model.safetensors").read_bytes()
+    return (directory / "config.json").read_bytes(), (
+        directory / "model.safetensors"
+    ).read_bytes()
 
 
-def _tensor_request(row_ids: list[str], input_ids: list[list[int]], attention_mask: list[list[int]]):
+def _tensor_request(
+    row_ids: list[str], input_ids: list[list[int]], attention_mask: list[list[int]]
+):
     return {
         "schema_version": INPUT_SCHEMA_VERSION,
         "row_ids": row_ids,
@@ -146,7 +150,11 @@ def test_execute_matches_reference_scores_and_preserves_row_order(tmp_path):
     )
     assert result["schema_version"] == OUTPUT_SCHEMA_VERSION
     assert result["row_ids"] == row_ids
-    expected_a = _reference_scores(model_a[0], model_a[1], input_ids, attention_mask, tmp_path)
-    expected_b = _reference_scores(model_b[0], model_b[1], input_ids, attention_mask, tmp_path)
+    expected_a = _reference_scores(
+        model_a[0], model_a[1], input_ids, attention_mask, tmp_path
+    )
+    expected_b = _reference_scores(
+        model_b[0], model_b[1], input_ids, attention_mask, tmp_path
+    )
     assert result["model_a_scores"] == expected_a
     assert result["model_b_scores"] == expected_b

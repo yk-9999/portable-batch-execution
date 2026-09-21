@@ -37,9 +37,7 @@ def _request(**overrides):
         "schema_version": "pbe.replay.causal-grid-extract.v1",
         "request_id": "grid-1",
         "target_symbols": ("AAA",),
-        "input_roles": (
-            {"input_index": 0, "role": "canonical_trade"},
-        ),
+        "input_roles": ({"input_index": 0, "role": "canonical_trade"},),
         "causal_witness_mapping": {
             "block_column": "block",
             "timestamp_column": "timestamp_ms",
@@ -107,9 +105,29 @@ def test_positive_identity_duplicate_collapse(tmp_path):
     path = _write(
         tmp_path / "trades.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, price=10.0, notional=50.0),
-            _trade_row(identity=1, identity_norm="1", block=91, timestamp_ms=8_100, price=10.0, notional=50.0),
-            _trade_row(identity=2, identity_norm="2", block=100, timestamp_ms=9_500, notional=25.0),
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=90,
+                timestamp_ms=8_000,
+                price=10.0,
+                notional=50.0,
+            ),
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=91,
+                timestamp_ms=8_100,
+                price=10.0,
+                notional=50.0,
+            ),
+            _trade_row(
+                identity=2,
+                identity_norm="2",
+                block=100,
+                timestamp_ms=9_500,
+                notional=25.0,
+            ),
         ],
     )
     witness = _write(
@@ -140,8 +158,20 @@ def test_sentinel_exclusion(tmp_path):
         tmp_path / "trades.parquet",
         [
             _trade_row(identity=0, identity_norm=None, price=1.0, notional=999.0),
-            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, notional=10.0),
-            _trade_row(identity=2, identity_norm="2", block=110, timestamp_ms=9_000, notional=1.0),
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=90,
+                timestamp_ms=8_000,
+                notional=10.0,
+            ),
+            _trade_row(
+                identity=2,
+                identity_norm="2",
+                block=110,
+                timestamp_ms=9_000,
+                notional=1.0,
+            ),
         ],
     )
     request = _request()
@@ -165,7 +195,9 @@ def test_sentinel_exclusion(tmp_path):
 
 
 def test_malformed_identity_fail_closed(tmp_path):
-    path = _write(tmp_path / "trades.parquet", [_trade_row(identity=-1, identity_norm="-1")])
+    path = _write(
+        tmp_path / "trades.parquet", [_trade_row(identity=-1, identity_norm="-1")]
+    )
     with pytest.raises(StructuralCanonicalizeError):
         execute_causal_grid_extract([path], _request())
 
@@ -215,7 +247,9 @@ def test_witness_block_excluded_from_measurement(tmp_path):
             ),
         ],
     )
-    liq = _write(tmp_path / "liq.parquet", [_witness_row(block=120, timestamp_ms=9_500)])
+    liq = _write(
+        tmp_path / "liq.parquet", [_witness_row(block=120, timestamp_ms=9_500)]
+    )
     row = execute_causal_grid_extract(
         [trades, liq],
         _request(
@@ -231,7 +265,9 @@ def test_witness_block_excluded_from_measurement(tmp_path):
 
 
 def test_no_predecessor_emits_unavailable(tmp_path):
-    path = _write(tmp_path / "trades.parquet", [_trade_row(block=100, timestamp_ms=9_000)])
+    path = _write(
+        tmp_path / "trades.parquet", [_trade_row(block=100, timestamp_ms=9_000)]
+    )
     row = execute_causal_grid_extract([path], _request())["rows"][0]
     assert row["causal_cutoff_block"] is None
     facts = _facts_by_id(row)
@@ -262,15 +298,47 @@ def test_as_of_tie_breaking(tmp_path):
     path = _write(
         tmp_path / "trades.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=100, timestamp_ms=10_000, price=1.0, seq=0),
-            _trade_row(identity=2, identity_norm="2", block=101, timestamp_ms=10_000, price=2.0, seq=1),
-            _trade_row(identity=3, identity_norm="3", block=91, timestamp_ms=5_000, price=3.0, seq=0),
-            _trade_row(identity=4, identity_norm="4", block=92, timestamp_ms=5_000, price=4.0, seq=1),
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=100,
+                timestamp_ms=10_000,
+                price=1.0,
+                seq=0,
+            ),
+            _trade_row(
+                identity=2,
+                identity_norm="2",
+                block=101,
+                timestamp_ms=10_000,
+                price=2.0,
+                seq=1,
+            ),
+            _trade_row(
+                identity=3,
+                identity_norm="3",
+                block=91,
+                timestamp_ms=5_000,
+                price=3.0,
+                seq=0,
+            ),
+            _trade_row(
+                identity=4,
+                identity_norm="4",
+                block=92,
+                timestamp_ms=5_000,
+                price=4.0,
+                seq=1,
+            ),
         ],
     )
     request = _request(
         input_roles=({"input_index": 0, "role": "canonical_trade"},),
-        emit_grid={"start_timestamp_ms": 10_000, "end_timestamp_ms": 10_000, "step_ms": 5_000},
+        emit_grid={
+            "start_timestamp_ms": 10_000,
+            "end_timestamp_ms": 10_000,
+            "step_ms": 5_000,
+        },
     )
     request["canonical_trade_mapping"]["canonical_trade_profile"] = {
         **_PROFILE,
@@ -299,8 +367,20 @@ def test_trailing_60s_notional(tmp_path):
     path = _write(
         tmp_path / "trades.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=95, timestamp_ms=9_000, notional=10.0),
-            _trade_row(identity=2, identity_norm="2", block=102, timestamp_ms=9_500, notional=20.0),
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=95,
+                timestamp_ms=9_000,
+                notional=10.0,
+            ),
+            _trade_row(
+                identity=2,
+                identity_norm="2",
+                block=102,
+                timestamp_ms=9_500,
+                notional=20.0,
+            ),
             _trade_row(
                 identity=3,
                 identity_norm="3",
@@ -345,9 +425,15 @@ def test_partition_carry_equivalence(tmp_path):
     trades = _write(
         tmp_path / "trades.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", timestamp_ms=40_000, notional=1.0),
-            _trade_row(identity=2, identity_norm="2", timestamp_ms=80_000, notional=2.0),
-            _trade_row(identity=3, identity_norm="3", timestamp_ms=120_000, notional=4.0),
+            _trade_row(
+                identity=1, identity_norm="1", timestamp_ms=40_000, notional=1.0
+            ),
+            _trade_row(
+                identity=2, identity_norm="2", timestamp_ms=80_000, notional=2.0
+            ),
+            _trade_row(
+                identity=3, identity_norm="3", timestamp_ms=120_000, notional=4.0
+            ),
         ],
     )
     witness = _write(
@@ -364,7 +450,11 @@ def test_partition_carry_equivalence(tmp_path):
             {"input_index": 0, "role": "canonical_trade"},
             {"input_index": 1, "role": "causal_witness"},
         ),
-        emit_grid={"start_timestamp_ms": 50_000, "end_timestamp_ms": 120_000, "step_ms": 10_000},
+        emit_grid={
+            "start_timestamp_ms": 50_000,
+            "end_timestamp_ms": 120_000,
+            "step_ms": 10_000,
+        },
         partition={
             "emit_start_ms": 50_000,
             "emit_end_ms": 120_000,
@@ -390,7 +480,10 @@ def test_partition_carry_equivalence(tmp_path):
         "hard_gap_missing_dates": (),
         "incoming_carry": first_result["outgoing_carry"],
     }
-    merged = first_result["rows"] + execute_causal_grid_extract([trades, witness], second)["rows"]
+    merged = (
+        first_result["rows"]
+        + execute_causal_grid_extract([trades, witness], second)["rows"]
+    )
     assert merged == one_pass
 
 
@@ -398,9 +491,27 @@ def test_outgoing_carry_excludes_post_emit_end_state(tmp_path):
     trades = _write(
         tmp_path / "trades.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=40_000, notional=1.0),
-            _trade_row(identity=2, identity_norm="2", block=95, timestamp_ms=80_000, notional=2.0),
-            _trade_row(identity=3, identity_norm="3", block=100, timestamp_ms=120_000, notional=4.0),
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=90,
+                timestamp_ms=40_000,
+                notional=1.0,
+            ),
+            _trade_row(
+                identity=2,
+                identity_norm="2",
+                block=95,
+                timestamp_ms=80_000,
+                notional=2.0,
+            ),
+            _trade_row(
+                identity=3,
+                identity_norm="3",
+                block=100,
+                timestamp_ms=120_000,
+                notional=4.0,
+            ),
         ],
     )
     witness = _write(
@@ -419,7 +530,11 @@ def test_outgoing_carry_excludes_post_emit_end_state(tmp_path):
             {"input_index": 0, "role": "canonical_trade"},
             {"input_index": 1, "role": "causal_witness"},
         ),
-        emit_grid={"start_timestamp_ms": 50_000, "end_timestamp_ms": 80_000, "step_ms": 10_000},
+        emit_grid={
+            "start_timestamp_ms": 50_000,
+            "end_timestamp_ms": 80_000,
+            "step_ms": 10_000,
+        },
         partition={
             "emit_start_ms": 50_000,
             "emit_end_ms": 80_000,
@@ -456,7 +571,9 @@ def test_insufficient_partition_overlap_fails_closed(tmp_path):
             "hard_gap_missing_dates": (),
         },
     )
-    with pytest.raises(ValueError, match="overlap_ms shorter than required replay lookback"):
+    with pytest.raises(
+        ValueError, match="overlap_ms shorter than required replay lookback"
+    ):
         execute_causal_grid_extract([path], request)
 
 
@@ -504,9 +621,27 @@ def test_non_contiguous_same_file_duplicate_identity_collapses(tmp_path):
     path = _write(
         tmp_path / "trades.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, notional=10.0),
-            _trade_row(identity=2, identity_norm="2", block=91, timestamp_ms=8_100, notional=20.0),
-            _trade_row(identity=1, identity_norm="1", block=92, timestamp_ms=8_200, notional=30.0),
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=90,
+                timestamp_ms=8_000,
+                notional=10.0,
+            ),
+            _trade_row(
+                identity=2,
+                identity_norm="2",
+                block=91,
+                timestamp_ms=8_100,
+                notional=20.0,
+            ),
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=92,
+                timestamp_ms=8_200,
+                notional=30.0,
+            ),
         ],
     )
     witness = _write(
@@ -536,13 +671,33 @@ def test_cross_shard_duplicate_identity_collapses_once(tmp_path):
     path_a = _write(
         tmp_path / "a.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, notional=10.0),
-            _trade_row(identity=2, identity_norm="2", block=91, timestamp_ms=8_050, notional=20.0),
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=90,
+                timestamp_ms=8_000,
+                notional=10.0,
+            ),
+            _trade_row(
+                identity=2,
+                identity_norm="2",
+                block=91,
+                timestamp_ms=8_050,
+                notional=20.0,
+            ),
         ],
     )
     path_b = _write(
         tmp_path / "b.parquet",
-        [_trade_row(identity=1, identity_norm="1", block=92, timestamp_ms=8_100, notional=5.0)],
+        [
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=92,
+                timestamp_ms=8_100,
+                notional=5.0,
+            )
+        ],
     )
     witness = _write(
         tmp_path / "w.parquet",
@@ -572,8 +727,12 @@ def test_conflicting_duplicate_core_fail_closed(tmp_path):
     path = _write(
         tmp_path / "trades.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, price=10.0),
-            _trade_row(identity=1, identity_norm="1", block=91, timestamp_ms=8_100, price=11.0),
+            _trade_row(
+                identity=1, identity_norm="1", block=90, timestamp_ms=8_000, price=10.0
+            ),
+            _trade_row(
+                identity=1, identity_norm="1", block=91, timestamp_ms=8_100, price=11.0
+            ),
         ],
     )
     with pytest.raises(StructuralCanonicalizeError):
@@ -584,15 +743,25 @@ def test_cross_shard_conflicting_core_fail_closed(tmp_path):
     path_a = _write(
         tmp_path / "a.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=8_000, price=10.0),
-            _trade_row(identity=2, identity_norm="2", block=91, timestamp_ms=8_050, price=20.0),
+            _trade_row(
+                identity=1, identity_norm="1", block=90, timestamp_ms=8_000, price=10.0
+            ),
+            _trade_row(
+                identity=2, identity_norm="2", block=91, timestamp_ms=8_050, price=20.0
+            ),
         ],
     )
     path_b = _write(
         tmp_path / "b.parquet",
-        [_trade_row(identity=1, identity_norm="1", block=92, timestamp_ms=8_100, price=11.0)],
+        [
+            _trade_row(
+                identity=1, identity_norm="1", block=92, timestamp_ms=8_100, price=11.0
+            )
+        ],
     )
-    witness = _write(tmp_path / "w.parquet", [_witness_row(block=90, timestamp_ms=8_000)])
+    witness = _write(
+        tmp_path / "w.parquet", [_witness_row(block=90, timestamp_ms=8_000)]
+    )
     with pytest.raises(StructuralCanonicalizeError):
         execute_causal_grid_extract(
             [path_a, path_b, witness],
@@ -625,9 +794,27 @@ def test_rolling_window_eviction_at_carry_boundary(tmp_path):
     trades = _write(
         tmp_path / "trades.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=90, timestamp_ms=40_000, notional=1.0),
-            _trade_row(identity=2, identity_norm="2", block=95, timestamp_ms=80_000, notional=2.0),
-            _trade_row(identity=3, identity_norm="3", block=100, timestamp_ms=120_000, notional=4.0),
+            _trade_row(
+                identity=1,
+                identity_norm="1",
+                block=90,
+                timestamp_ms=40_000,
+                notional=1.0,
+            ),
+            _trade_row(
+                identity=2,
+                identity_norm="2",
+                block=95,
+                timestamp_ms=80_000,
+                notional=2.0,
+            ),
+            _trade_row(
+                identity=3,
+                identity_norm="3",
+                block=100,
+                timestamp_ms=120_000,
+                notional=4.0,
+            ),
         ],
     )
     witness = _write(
@@ -644,7 +831,11 @@ def test_rolling_window_eviction_at_carry_boundary(tmp_path):
             {"input_index": 0, "role": "canonical_trade"},
             {"input_index": 1, "role": "causal_witness"},
         ),
-        emit_grid={"start_timestamp_ms": 50_000, "end_timestamp_ms": 80_000, "step_ms": 10_000},
+        emit_grid={
+            "start_timestamp_ms": 50_000,
+            "end_timestamp_ms": 80_000,
+            "step_ms": 10_000,
+        },
         partition={
             "emit_start_ms": 50_000,
             "emit_end_ms": 80_000,
@@ -691,7 +882,9 @@ def test_unsorted_witness_matches_sorted_equivalent(tmp_path):
         ),
     )
     sorted_rows = execute_causal_grid_extract([trades, sorted_witness], request)["rows"]
-    unsorted_rows = execute_causal_grid_extract([trades, unsorted_witness], request)["rows"]
+    unsorted_rows = execute_causal_grid_extract([trades, unsorted_witness], request)[
+        "rows"
+    ]
     assert sorted_rows == unsorted_rows
 
 
@@ -720,7 +913,11 @@ def test_large_observation_count_compact_carry_and_cutoff(tmp_path):
     ]
     trades = _write(
         tmp_path / "trades.parquet",
-        [_trade_row(identity=1, identity_norm="1", block=200_000, timestamp_ms=100_000)],
+        [
+            _trade_row(
+                identity=1, identity_norm="1", block=200_000, timestamp_ms=100_000
+            )
+        ],
     )
     witness = _write(tmp_path / "w.parquet", witness_rows)
     result = execute_causal_grid_extract(
@@ -778,7 +975,9 @@ def test_same_timestamp_witness_block_excluded_from_cutoff(tmp_path):
     trades = _write(
         tmp_path / "trades.parquet",
         [
-            _trade_row(identity=1, identity_norm="1", block=100, timestamp_ms=10_000, price=1.0),
+            _trade_row(
+                identity=1, identity_norm="1", block=100, timestamp_ms=10_000, price=1.0
+            ),
             _trade_row(
                 identity=2,
                 identity_norm="2",
@@ -828,7 +1027,9 @@ def test_default_request_serializes_and_executes_unchanged(tmp_path):
 
 
 def test_same_index_bound_to_both_roles_accepted_and_exact_duplicate_rejected(tmp_path):
-    path = _write(tmp_path / "trades.parquet", [_trade_row(block=100, timestamp_ms=9_000)])
+    path = _write(
+        tmp_path / "trades.parquet", [_trade_row(block=100, timestamp_ms=9_000)]
+    )
     request = _request(
         input_roles=(
             {"input_index": 0, "role": "canonical_trade"},
@@ -836,7 +1037,10 @@ def test_same_index_bound_to_both_roles_accepted_and_exact_duplicate_rejected(tm
         ),
     )
     CausalGridExtractRequest.model_validate(request)
-    assert execute_causal_grid_extract([path], request)["rows"][0]["causal_cutoff_block"] is None
+    assert (
+        execute_causal_grid_extract([path], request)["rows"][0]["causal_cutoff_block"]
+        is None
+    )
 
     duplicate = _request(
         input_roles=(
@@ -911,7 +1115,10 @@ def test_witness_iso8601_matches_integer_ms_and_rejects_naive_or_invalid(tmp_pat
 def _tie_witness(tmp_path):
     return _write(
         tmp_path / "w.parquet",
-        [_witness_row(block=100, timestamp_ms=8_000), _witness_row(block=110, timestamp_ms=9_500)],
+        [
+            _witness_row(block=100, timestamp_ms=8_000),
+            _witness_row(block=110, timestamp_ms=9_500),
+        ],
     )
 
 
@@ -1053,7 +1260,10 @@ def test_sparse_emit_points_validate_against_request(tmp_path):
     base = _request()
     with pytest.raises(ValidationError):
         CausalGridExtractRequest.model_validate(
-            {**base, "sparse_emit_points": [{"timestamp_ms": 10_000, "symbols": ["ZZZ"]}]}
+            {
+                **base,
+                "sparse_emit_points": [{"timestamp_ms": 10_000, "symbols": ["ZZZ"]}],
+            }
         )
     with pytest.raises(ValidationError):
         CausalGridExtractRequest.model_validate(
@@ -1067,9 +1277,17 @@ def test_sparse_emit_points_validate_against_request(tmp_path):
         )
     with pytest.raises(ValidationError):
         CausalGridExtractRequest.model_validate(
-            {**base, "sparse_emit_points": [{"timestamp_ms": 10_000, "symbols": ["AAA", "AAA"]}]}
+            {
+                **base,
+                "sparse_emit_points": [
+                    {"timestamp_ms": 10_000, "symbols": ["AAA", "AAA"]}
+                ],
+            }
         )
     with pytest.raises(ValidationError):
         CausalGridExtractRequest.model_validate(
-            {**base, "sparse_emit_points": [{"timestamp_ms": 9_999, "symbols": ["AAA"]}]}
+            {
+                **base,
+                "sparse_emit_points": [{"timestamp_ms": 9_999, "symbols": ["AAA"]}],
+            }
         )

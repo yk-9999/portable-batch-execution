@@ -31,12 +31,19 @@ def fixture_server():
                 body = (FIXTURES / "catalog-page-2.html").read_bytes()
             elif path == "/incremental":
                 since = int(parse_qs(urlsplit(self.path).query).get("since", [0])[0])
-                body = json.dumps({"items": [{"id": n} for n in range(since + 1, 4)]}).encode()
+                body = json.dumps(
+                    {"items": [{"id": n} for n in range(since + 1, 4)]}
+                ).encode()
             else:
                 self.send_error(404)
                 return
             self.send_response(200)
-            self.send_header("Content-Type", "application/json" if path.startswith("/rest") or path == "/incremental" else "text/html")
+            self.send_header(
+                "Content-Type",
+                "application/json"
+                if path.startswith("/rest") or path == "/incremental"
+                else "text/html",
+            )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -58,7 +65,12 @@ def test_rest_link_pagination_is_finite_and_uses_local_server(fixture_server):
     base_url, requests = fixture_server
     result = AcquisitionPack().acquire(
         "acquisition.rest",
-        {"url": f"{base_url}/rest/page-1", "items_path": "items", "max_pages": 4, "pagination": {"kind": "link", "next_field": "next"}},
+        {
+            "url": f"{base_url}/rest/page-1",
+            "items_path": "items",
+            "max_pages": 4,
+            "pagination": {"kind": "link", "next_field": "next"},
+        },
     )
     assert [record["id"] for record in result.records] == [1, 2, 3]
     assert result.pages_fetched == 2
@@ -69,7 +81,13 @@ def test_html_link_pagination_extracts_configured_fields(fixture_server):
     base_url, _ = fixture_server
     result = AcquisitionPack().acquire(
         "acquisition.html",
-        {"url": f"{base_url}/html/page-1", "item_selector": "article.product", "fields": {"id": "@data-id", "name": "h2", "price": ".price"}, "max_pages": 4, "pagination": {"kind": "link", "next_selector": "a.next"}},
+        {
+            "url": f"{base_url}/html/page-1",
+            "item_selector": "article.product",
+            "fields": {"id": "@data-id", "name": "h2", "price": ".price"},
+            "max_pages": 4,
+            "pagination": {"kind": "link", "next_selector": "a.next"},
+        },
     )
     assert list(result.records) == [
         {"id": "a1", "name": "Alpha", "price": "10"},
@@ -81,14 +99,29 @@ def test_html_link_pagination_extracts_configured_fields(fixture_server):
 def test_incremental_uses_and_advances_local_context_state(fixture_server):
     base_url, requests = fixture_server
     context = {"acquisition_state": {"catalog": 1}}
-    params = {"url": f"{base_url}/incremental", "items_path": "items", "incremental": {"cursor_field": "id", "cursor_param": "since", "state_key": "catalog"}}
+    params = {
+        "url": f"{base_url}/incremental",
+        "items_path": "items",
+        "incremental": {
+            "cursor_field": "id",
+            "cursor_param": "since",
+            "state_key": "catalog",
+        },
+    }
     result = AcquisitionPack().acquire("acquisition.incremental", params, context)
     assert [record["id"] for record in result.records] == [2, 3]
     assert context["acquisition_state"]["catalog"] == 3
     assert requests == ["/incremental?since=1"]
 
 
-@pytest.mark.parametrize("params", [{"url": "file:///not-http"}, {"url": "http://user:pass@example.test/x"}, {"url": "http://example.test/x", "max_pages": 0}])
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"url": "file:///not-http"},
+        {"url": "http://user:pass@example.test/x"},
+        {"url": "http://example.test/x", "max_pages": 0},
+    ],
+)
 def test_validation_rejects_unbounded_or_credential_urls(params):
     with pytest.raises(ValueError):
         AcquisitionPack().validate_params("acquisition.rest", params)

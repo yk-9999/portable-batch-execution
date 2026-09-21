@@ -61,10 +61,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="A1 private batch controller")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    serve = sub.add_parser("serve-data-plane", help="Run loopback private data plane HTTP")
+    serve = sub.add_parser(
+        "serve-data-plane", help="Run loopback private data plane HTTP"
+    )
     serve.set_defaults(command="serve-data-plane")
 
-    prepare = sub.add_parser("prepare-synthetic", help="Register a private synthetic run")
+    prepare = sub.add_parser(
+        "prepare-synthetic", help="Register a private synthetic run"
+    )
     prepare.add_argument("--state-root", required=True)
     prepare.add_argument("--run-id")
     prepare.add_argument("--wave-id")
@@ -108,6 +112,21 @@ def main(argv: list[str] | None = None) -> int:
     broker.add_argument("--github-workflow", required=True)
     broker.add_argument("--github-ref", default="main")
     broker.add_argument("--github-token-file")
+    broker.add_argument(
+        "--max-concurrent-requests",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Maximum in-flight broker requests (default: 1, serial)",
+    )
+    broker.add_argument(
+        "--artifact-read-base-url",
+        help="Optional HTTPS origin or loopback HTTP origin for broker output artifact reads",
+    )
+    broker.add_argument(
+        "--artifact-read-token-file",
+        help="Bearer token file for --artifact-read-base-url (never logged)",
+    )
     broker.set_defaults(command="serve-unix-broker")
 
     args = parser.parse_args(argv)
@@ -160,19 +179,36 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "serve-unix-broker":
         import os
 
-        os.environ.setdefault("PBE_BROKER_CONFIG", os.environ.get("PBE_BROKER_CONFIG", ""))
+        os.environ.setdefault(
+            "PBE_BROKER_CONFIG", os.environ.get("PBE_BROKER_CONFIG", "")
+        )
         if not os.environ.get("PBE_BROKER_CONFIG"):
             parser.error("serve-unix-broker requires PBE_BROKER_CONFIG")
         backend = _controller(args).backend
+        artifact_read_token_file = (
+            Path(args.artifact_read_token_file)
+            if args.artifact_read_token_file
+            else None
+        )
+        if bool(args.artifact_read_base_url) != bool(artifact_read_token_file):
+            parser.error(
+                "serve-unix-broker requires both --artifact-read-base-url and "
+                "--artifact-read-token-file when configuring artifact reads"
+            )
         service = build_service_from_environment(
             state_root=Path(args.state_root),
             backend=backend,
             poll_interval_seconds=args.poll_interval_seconds,
+            artifact_read_base_url=args.artifact_read_base_url,
+            artifact_read_token_file=artifact_read_token_file,
         )
+        if args.max_concurrent_requests < 1:
+            parser.error("--max-concurrent-requests must be at least 1")
         serve_unix_broker(
             socket_path=Path(args.socket_path),
             service=service,
             socket_mode=service.config.socket_mode,
+            max_concurrent_requests=args.max_concurrent_requests,
         )
         return 0
 

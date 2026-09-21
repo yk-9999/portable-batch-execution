@@ -63,7 +63,9 @@ def test_run_id_must_be_safe_file_component(tmp_path, run_id):
     store = LocalFilesystemDataPlane(tmp_path)
     sentinel = tmp_path / "escaped-run.json"
     with pytest.raises(ValueError, match="opaque identifier"):
-        store.write_next_manifest(manifest(0).model_copy(update={"logical_run_id": run_id}), -1)
+        store.write_next_manifest(
+            manifest(0).model_copy(update={"logical_run_id": run_id}), -1
+        )
     assert not sentinel.exists()
     assert list((tmp_path / "runs").glob("**/*")) == [] or run_id == ""
 

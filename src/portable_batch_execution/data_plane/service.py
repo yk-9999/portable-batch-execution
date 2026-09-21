@@ -51,20 +51,45 @@ class PrivateDataPlaneService:
         body: bytes | None = None,
     ) -> tuple[int, dict[str, str], bytes | ArtifactContentStream | None]:
         if not self.authorize(authorization):
-            return 401, {"Content-Type": "application/json"}, b'{"error":"unauthorized"}'
+            return (
+                401,
+                {"Content-Type": "application/json"},
+                b'{"error":"unauthorized"}',
+            )
         headers = {key.lower(): value for key, value in (headers or {}).items()}
         normalized = path.split("?", 1)[0].rstrip("/") or "/"
         segments = [unquote(part) for part in normalized.split("/") if part]
         try:
-            if method == "GET" and len(segments) == 5 and segments[:2] == ["v1", "runs"] and segments[3] == "waves":
+            if (
+                method == "GET"
+                and len(segments) == 5
+                and segments[:2] == ["v1", "runs"]
+                and segments[3] == "waves"
+            ):
                 payload = self.resolve_wave(segments[2], segments[4])
-                return 200, {"Content-Type": "application/json"}, json.dumps(payload).encode("utf-8")
-            if method in {"GET", "HEAD"} and len(segments) == 4 and segments[:2] == ["v1", "artifacts"] and segments[3] == "content":
+                return (
+                    200,
+                    {"Content-Type": "application/json"},
+                    json.dumps(payload).encode("utf-8"),
+                )
+            if (
+                method in {"GET", "HEAD"}
+                and len(segments) == 4
+                and segments[:2] == ["v1", "artifacts"]
+                and segments[3] == "content"
+            ):
                 object_id = opaque_identifier(segments[2], "artifact object_id")
                 artifact_path = (self.store.root / "artifacts" / object_id).resolve()
                 artifacts_root = (self.store.root / "artifacts").resolve()
-                if artifact_path.parent != artifacts_root or not artifact_path.is_file():
-                    return 404, {"Content-Type": "application/json"}, b'{"error":"not found"}'
+                if (
+                    artifact_path.parent != artifacts_root
+                    or not artifact_path.is_file()
+                ):
+                    return (
+                        404,
+                        {"Content-Type": "application/json"},
+                        b'{"error":"not found"}',
+                    )
                 ref = ArtifactRef(
                     object_id=object_id,
                     uri=artifact_path.as_uri(),
@@ -83,33 +108,81 @@ class PrivateDataPlaneService:
                 )
             if method == "POST" and segments == ["v1", "artifacts"]:
                 ref = self.store.write(body or b"", headers.get("content-type"))
-                return 200, {"Content-Type": "application/json"}, ref.model_dump_json().encode("utf-8")
-            if method == "GET" and len(segments) == 4 and segments[:2] == ["v1", "runs"] and segments[3] == "attempts":
+                return (
+                    200,
+                    {"Content-Type": "application/json"},
+                    ref.model_dump_json().encode("utf-8"),
+                )
+            if (
+                method == "GET"
+                and len(segments) == 4
+                and segments[:2] == ["v1", "runs"]
+                and segments[3] == "attempts"
+            ):
                 run_id = opaque_identifier(segments[2], "run_id")
                 payload = [
                     item.model_dump(mode="json")
                     for item in self.store.read_attempts(run_id)
                 ]
-                return 200, {"Content-Type": "application/json"}, json.dumps(payload).encode("utf-8")
-            if method == "POST" and len(segments) == 4 and segments[:2] == ["v1", "runs"] and segments[3] == "attempts":
+                return (
+                    200,
+                    {"Content-Type": "application/json"},
+                    json.dumps(payload).encode("utf-8"),
+                )
+            if (
+                method == "POST"
+                and len(segments) == 4
+                and segments[:2] == ["v1", "runs"]
+                and segments[3] == "attempts"
+            ):
                 run_id = opaque_identifier(segments[2], "run_id")
                 record = ShardAttemptRecord.model_validate_json(body or b"{}")
                 if record.logical_run_id != run_id:
-                    return 400, {"Content-Type": "application/json"}, b'{"error":"run mismatch"}'
+                    return (
+                        400,
+                        {"Content-Type": "application/json"},
+                        b'{"error":"run mismatch"}',
+                    )
                 try:
                     self.store.append_attempt(record)
                 except ValueError:
-                    return 409, {"Content-Type": "application/json"}, b'{"error":"attempt conflict"}'
+                    return (
+                        409,
+                        {"Content-Type": "application/json"},
+                        b'{"error":"attempt conflict"}',
+                    )
                 return 204, {}, b""
-            if method == "GET" and len(segments) == 4 and segments[:2] == ["v1", "runs"] and segments[3] == "manifest":
+            if (
+                method == "GET"
+                and len(segments) == 4
+                and segments[:2] == ["v1", "runs"]
+                and segments[3] == "manifest"
+            ):
                 run_id = opaque_identifier(segments[2], "run_id")
                 manifest = self.store.read_manifest(run_id)
                 if manifest is None:
-                    return 404, {"Content-Type": "application/json"}, b'{"error":"not found"}'
-                return 200, {"Content-Type": "application/json"}, manifest.model_dump_json().encode("utf-8")
-            if method == "PUT" and len(segments) == 4 and segments[:2] == ["v1", "runs"] and segments[3] == "manifest":
+                    return (
+                        404,
+                        {"Content-Type": "application/json"},
+                        b'{"error":"not found"}',
+                    )
+                return (
+                    200,
+                    {"Content-Type": "application/json"},
+                    manifest.model_dump_json().encode("utf-8"),
+                )
+            if (
+                method == "PUT"
+                and len(segments) == 4
+                and segments[:2] == ["v1", "runs"]
+                and segments[3] == "manifest"
+            ):
                 opaque_identifier(segments[2], "run_id")
-                return 403, {"Content-Type": "application/json"}, b'{"error":"controller-only"}'
+                return (
+                    403,
+                    {"Content-Type": "application/json"},
+                    b'{"error":"controller-only"}',
+                )
         except KeyError:
             return 404, {"Content-Type": "application/json"}, b'{"error":"not found"}'
         except ValueError:

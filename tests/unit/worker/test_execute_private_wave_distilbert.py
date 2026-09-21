@@ -46,7 +46,9 @@ def _tiny_model_bundle(tmp_path: Path, seed: int) -> tuple[bytes, bytes]:
     directory = tmp_path / f"model-{seed}"
     directory.mkdir()
     model.save_pretrained(directory, safe_serialization=True)
-    return (directory / "config.json").read_bytes(), (directory / "model.safetensors").read_bytes()
+    return (directory / "config.json").read_bytes(), (
+        directory / "model.safetensors"
+    ).read_bytes()
 
 
 def _distilbert_plane(tmp_path, *, input_refs=None, read_map=None):

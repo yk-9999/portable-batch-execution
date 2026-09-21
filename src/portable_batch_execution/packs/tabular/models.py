@@ -30,7 +30,9 @@ class NormalizeParams(TabularParams):
 
 
 class CastParams(TabularParams):
-    columns: dict[str, Literal["string", "integer", "float", "boolean", "date", "datetime"]]
+    columns: dict[
+        str, Literal["string", "integer", "float", "boolean", "date", "datetime"]
+    ]
     strict: bool = True
 
 
@@ -84,7 +86,10 @@ class RollingParams(TabularParams):
 
 class StatisticsParams(TabularParams):
     columns: tuple[str, ...] = Field(min_length=1)
-    aggregations: tuple[Literal["count", "null_count", "mean", "sum", "min", "max", "std", "median"], ...] = ("count", "mean")
+    aggregations: tuple[
+        Literal["count", "null_count", "mean", "sum", "min", "max", "std", "median"],
+        ...,
+    ] = ("count", "mean")
     group_by: tuple[str, ...] = ()
 
 
@@ -93,9 +98,16 @@ class FormatMigrationParams(TabularParams):
 
 
 OperationParams = (
-    NormalizeParams | CastParams | SortParams | DedupParams | JoinParams |
-    PitJoinParams | WindowParams | RollingParams | StatisticsParams |
-    FormatMigrationParams
+    NormalizeParams
+    | CastParams
+    | SortParams
+    | DedupParams
+    | JoinParams
+    | PitJoinParams
+    | WindowParams
+    | RollingParams
+    | StatisticsParams
+    | FormatMigrationParams
 )
 
 PARAM_MODELS = {

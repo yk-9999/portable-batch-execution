@@ -3,6 +3,7 @@ import json
 import os
 import socket
 import threading
+import time
 from datetime import UTC, datetime
 from hashlib import sha256
 from unittest.mock import patch
@@ -14,6 +15,7 @@ from portable_batch_execution.backends.github_actions import (
     GitHubActionsAPIError,
     GitHubActionsBackend,
 )
+from portable_batch_execution.broker.artifact_reader import build_broker_artifact_reader
 from portable_batch_execution.broker.config import BrokerConfig, max_request_frame_bytes
 from portable_batch_execution.broker.planning import (
     broker_execution_fingerprint,
@@ -22,7 +24,12 @@ from portable_batch_execution.broker.planning import (
     opaque_run_id,
     register_broker_private_run,
 )
-from portable_batch_execution.broker.server import _handle_connection, serve_unix_broker
+from portable_batch_execution.broker.protocol import BrokerExecuteResponse
+from portable_batch_execution.broker.server import (
+    _handle_connection,
+    _serve_accept_loop,
+    serve_unix_broker,
+)
 from portable_batch_execution.broker.service import UnixBrokerService
 from portable_batch_execution.broker.state import (
     BrokerRequestState,
@@ -49,6 +56,10 @@ def _config(tmp_path, *, max_input_bytes: int = 1_048_576) -> BrokerConfig:
                     str(_UID): [
                         ["tabular-batch", "tabular.sort"],
                         ["ml-batch", "ml.cosine_similarity_matrix"],
+                        [
+                            "replay-batch",
+                            "replay.trade_path_scenario_evaluate",
+                        ],
                     ]
                 },
             }
@@ -79,7 +90,9 @@ def _request(
     payload: bytes | None = None,
     input_media_type: str = "application/json",
 ) -> dict:
-    body = payload if payload is not None else json.dumps([{"id": 2}, {"id": 1}]).encode()
+    body = (
+        payload if payload is not None else json.dumps([{"id": 2}, {"id": 1}]).encode()
+    )
     return {
         "schema_version": "pbe.a1-unix-broker.request.v1",
         "request_id": request_id,
@@ -129,7 +142,9 @@ def _failure_progress_sleeper(service: UnixBrokerService, request_id: str):
             and item.status in {"failed", "cancelled"}
         ]
         if state.dispatch_count > len(terminal) and len(terminal) < 4:
-            _append_failed_attempt(service.controller, request_id, f"fail-{len(terminal)}")
+            _append_failed_attempt(
+                service.controller, request_id, f"fail-{len(terminal)}"
+            )
 
     return sleeper
 
@@ -192,10 +207,152 @@ def test_operation_not_in_allowlist(tmp_path):
     config = _config(tmp_path)
     service = _service(tmp_path, config, lambda request: httpx.Response(500))
     response = service.handle_payload(
-        _UID, _request(operation="tabular.rolling", operation_params={"column": "id", "window_size": 2, "output_column": "x"})
+        _UID,
+        _request(
+            operation="tabular.rolling",
+            operation_params={"column": "id", "window_size": 2, "output_column": "x"},
+        ),
     )
     assert response.status == "failed"
     assert response.error_code == "peer_not_authorized"
+
+
+_REPLAY_TRADE_PATH_JOB_PARAMS = {
+    "schema_version": "pbe.replay.trade-path-scenario-evaluate-job.v1",
+}
+
+
+def _replay_trade_path_request(**overrides) -> dict:
+    body = overrides.pop(
+        "payload", json.dumps({"batch_id": "b1", "records": []}).encode()
+    )
+    request = {
+        "schema_version": "pbe.a1-unix-broker.request.v1",
+        "request_id": overrides.pop("request_id", "req-replay-trade-path"),
+        "pack": "replay-batch",
+        "operation": "replay.trade_path_scenario_evaluate",
+        "operation_params": overrides.pop(
+            "operation_params", _REPLAY_TRADE_PATH_JOB_PARAMS
+        ),
+        "input_media_type": "application/json",
+        "input_b64": base64.b64encode(body).decode("ascii"),
+    }
+    request.update(overrides)
+    return request
+
+
+def test_completion_reads_output_via_configured_http_artifact_reader(tmp_path):
+    config = _config(tmp_path)
+    output = b'[{"id":1}]'
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(
+                201, json={"workflow_run_id": 1, "html_url": "https://run"}
+            )
+        return httpx.Response(
+            200,
+            json={"status": "completed", "conclusion": "success", "updated_at": "t"},
+        )
+
+    service = _service(tmp_path, config, handler)
+    token_path = tmp_path / "artifact-token"
+    token_path.write_text("reader-token", encoding="utf-8")
+    output_ref_holder: dict[str, object] = {}
+
+    def artifact_handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer reader-token"
+        ref = output_ref_holder["ref"]
+        assert request.url.path.endswith(f"/{ref.object_id}/content")
+        return httpx.Response(200, content=output)
+
+    artifact_client = httpx.Client(
+        base_url="http://127.0.0.1:18090",
+        transport=httpx.MockTransport(artifact_handler),
+    )
+    service._artifact_reader = build_broker_artifact_reader(
+        service.controller.data_plane,
+        artifact_read_base_url="http://127.0.0.1:18090",
+        artifact_read_token_file=token_path,
+        client=artifact_client,
+    )
+    real_dispatch = service.controller.dispatch_private_wave
+
+    def dispatch_with_success(run_id, wave_id):
+        ref = real_dispatch(run_id, wave_id)
+        _append_success_attempt(service.controller, "req-http-read", output)
+        attempt = list(service.controller.data_plane.read_attempts(run_id))[-1]
+        output_ref_holder["ref"] = attempt.output_refs[0]
+        digest = attempt.output_refs[0].sha256.removeprefix("sha256:")
+        local_artifact = tmp_path / "artifacts" / digest
+        if local_artifact.exists():
+            local_artifact.unlink()
+        return ref
+
+    original_read = service.controller.data_plane.read
+
+    def guarded_read(ref):
+        held = output_ref_holder.get("ref")
+        if held is not None and ref.object_id == held.object_id:
+            raise FileNotFoundError("local artifact missing")
+        return original_read(ref)
+
+    with (
+        patch.object(service.controller.data_plane, "read", side_effect=guarded_read),
+        patch.object(
+            service.controller, "dispatch_private_wave", dispatch_with_success
+        ),
+    ):
+        response = service.handle_payload(_UID, _request(request_id="req-http-read"))
+    assert response.status == "succeeded"
+    assert response.request_id == "req-http-read"
+    assert base64.b64decode(response.output_b64) == output
+
+
+def test_replay_batch_trade_path_service_accepts_closed_request(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    stub = BrokerExecuteResponse(request_id="req-replay-trade-path", status="succeeded")
+    with patch.object(UnixBrokerService, "_drive_to_terminal", return_value=stub):
+        response = service.handle_payload(_UID, _replay_trade_path_request())
+    assert response.error_code != "operation_params_invalid"
+    assert response.error_code != "operation_not_allowed"
+    assert response.status == "succeeded"
+
+
+def test_replay_batch_unknown_operation_rejected_before_authorization(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    response = service.handle_payload(
+        _UID,
+        _replay_trade_path_request(
+            operation="replay.structural_canonicalize",
+            operation_params={
+                "schema_version": "pbe.replay.structural-canonicalize.v1",
+            },
+        ),
+    )
+    assert response.status == "failed"
+    assert response.error_code == "operation_not_allowed"
+
+
+def test_replay_batch_invalid_operation_params_rejected(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    response = service.handle_payload(
+        _UID,
+        _replay_trade_path_request(
+            operation_params={
+                **_REPLAY_TRADE_PATH_JOB_PARAMS,
+                "batch_id": "forbidden-extra",
+            }
+        ),
+    )
+    assert response.status == "failed"
+    assert response.error_code == "operation_params_invalid"
 
 
 def test_malformed_base64_and_payload_bound(tmp_path):
@@ -216,7 +373,9 @@ def test_request_id_conflict(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 1, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 1, "html_url": "https://run"}
+            )
         return httpx.Response(
             200,
             json={"status": "completed", "conclusion": "success", "updated_at": "t"},
@@ -227,7 +386,7 @@ def test_request_id_conflict(tmp_path):
 
     def wrapped_dispatch(run_id, wave_id):
         ref = real_dispatch(run_id, wave_id)
-        _append_success_attempt(service.controller, "req-1", b"[{\"id\":1}]")
+        _append_success_attempt(service.controller, "req-1", b'[{"id":1}]')
         return ref
 
     with patch.object(service.controller, "dispatch_private_wave", wrapped_dispatch):
@@ -248,7 +407,9 @@ def test_success_and_reuse_without_redispatch(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 9, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 9, "html_url": "https://run"}
+            )
         return httpx.Response(
             200,
             json={"status": "completed", "conclusion": "success", "updated_at": "t"},
@@ -260,10 +421,12 @@ def test_success_and_reuse_without_redispatch(tmp_path):
 
     def dispatch_with_success(run_id, wave_id):
         ref = real_dispatch(run_id, wave_id)
-        _append_success_attempt(service.controller, "req-2", b"[{\"id\":1}]")
+        _append_success_attempt(service.controller, "req-2", b'[{"id":1}]')
         return ref
 
-    with patch.object(service.controller, "dispatch_private_wave", dispatch_with_success):
+    with patch.object(
+        service.controller, "dispatch_private_wave", dispatch_with_success
+    ):
         first = service.handle_payload(_UID, _request(request_id="req-2"))
         second = service.handle_payload(_UID, _request(request_id="req-2"))
     assert first.status == "succeeded"
@@ -281,7 +444,9 @@ def test_active_dispatch_reuses_existing_execution(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 11, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 11, "html_url": "https://run"}
+            )
         return httpx.Response(
             200,
             json={"status": "completed", "conclusion": "success", "updated_at": "t"},
@@ -292,7 +457,7 @@ def test_active_dispatch_reuses_existing_execution(tmp_path):
 
     def dispatch_once(run_id, wave_id):
         ref = real_dispatch(run_id, wave_id)
-        _append_success_attempt(service.controller, "req-3", b"[{\"id\":1}]")
+        _append_success_attempt(service.controller, "req-3", b'[{"id":1}]')
         return ref
 
     with patch.object(service.controller, "dispatch_private_wave", dispatch_once):
@@ -316,7 +481,9 @@ def test_stale_attempts_do_not_consume_budget(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 3, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 3, "html_url": "https://run"}
+            )
         return httpx.Response(
             200,
             json={"status": "completed", "conclusion": "success", "updated_at": "t"},
@@ -343,7 +510,7 @@ def test_stale_attempts_do_not_consume_budget(tmp_path):
                 )
             )
         ref = real_dispatch(run_id_arg, wave_id)
-        _append_success_attempt(service.controller, "req-stale", b"[{\"id\":1}]")
+        _append_success_attempt(service.controller, "req-stale", b'[{"id":1}]')
         return ref
 
     with patch.object(
@@ -362,7 +529,9 @@ def test_sequential_four_dispatches_then_exhausted_without_fifth(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 4, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 4, "html_url": "https://run"}
+            )
         return httpx.Response(
             200,
             json={"status": "completed", "conclusion": "success", "updated_at": "t"},
@@ -510,10 +679,12 @@ def test_response_does_not_leak_private_payload_or_secrets(tmp_path):
 
     def dispatch_with_success(run_id, wave_id):
         ref = real_dispatch(run_id, wave_id)
-        _append_success_attempt(service.controller, "req-leak", b"[{\"id\":1}]")
+        _append_success_attempt(service.controller, "req-leak", b'[{"id":1}]')
         return ref
 
-    with patch.object(service.controller, "dispatch_private_wave", dispatch_with_success):
+    with patch.object(
+        service.controller, "dispatch_private_wave", dispatch_with_success
+    ):
         response = service.handle_payload(_UID, _request(request_id="req-leak"))
     blob = json.dumps(response.model_dump(mode="json"))
     assert _SENTINEL not in blob
@@ -528,7 +699,9 @@ def test_backend_transient_error_preserves_durable_state(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 6, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 6, "html_url": "https://run"}
+            )
         return httpx.Response(500, json={"message": "rate limited"})
 
     service = _service(tmp_path, config, handler)
@@ -549,7 +722,9 @@ def test_server_survives_transient_backend_lookup(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 6, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 6, "html_url": "https://run"}
+            )
         return httpx.Response(500, json={"message": "rate limited"})
 
     service = _service(tmp_path, config, handler)
@@ -566,7 +741,9 @@ def test_server_survives_transient_backend_lookup(tmp_path):
             "get_run",
             side_effect=GitHubActionsAPIError(
                 "get run",
-                httpx.Response(500, request=httpx.Request("GET", "https://api.github.com")),
+                httpx.Response(
+                    500, request=httpx.Request("GET", "https://api.github.com")
+                ),
             ),
         ),
     ):
@@ -586,7 +763,9 @@ def test_reconcile_updates_manifest_on_success(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 8, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 8, "html_url": "https://run"}
+            )
         return httpx.Response(
             200,
             json={"status": "completed", "conclusion": "success", "updated_at": "t"},
@@ -597,11 +776,13 @@ def test_reconcile_updates_manifest_on_success(tmp_path):
 
     def dispatch_with_success(run_id, wave_id):
         ref = real_dispatch(run_id, wave_id)
-        _append_success_attempt(service.controller, "req-reconcile", b"[{\"id\":1}]")
+        _append_success_attempt(service.controller, "req-reconcile", b'[{"id":1}]')
         return ref
 
     with (
-        patch.object(service.controller, "dispatch_private_wave", dispatch_with_success),
+        patch.object(
+            service.controller, "dispatch_private_wave", dispatch_with_success
+        ),
         patch.object(
             service.controller, "reconcile_run", wraps=service.controller.reconcile_run
         ) as reconcile,
@@ -609,7 +790,9 @@ def test_reconcile_updates_manifest_on_success(tmp_path):
         response = service.handle_payload(_UID, _request(request_id="req-reconcile"))
     assert response.status == "succeeded"
     assert reconcile.call_count >= 1
-    manifest = service.controller.data_plane.read_manifest(opaque_run_id("req-reconcile"))
+    manifest = service.controller.data_plane.read_manifest(
+        opaque_run_id("req-reconcile")
+    )
     assert manifest is not None and manifest.revision >= 1
 
 
@@ -621,7 +804,9 @@ def test_registration_recovery_after_state_file_loss(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 12, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 12, "html_url": "https://run"}
+            )
         return httpx.Response(
             200,
             json={"status": "completed", "conclusion": "success", "updated_at": "t"},
@@ -632,13 +817,17 @@ def test_registration_recovery_after_state_file_loss(tmp_path):
 
     def dispatch_with_success(run_id, wave_id):
         ref = real_dispatch(run_id, wave_id)
-        _append_success_attempt(service.controller, "req-recover", b"[{\"id\":1}]")
+        _append_success_attempt(service.controller, "req-recover", b'[{"id":1}]')
         return ref
 
-    with patch.object(service.controller, "dispatch_private_wave", dispatch_with_success):
+    with patch.object(
+        service.controller, "dispatch_private_wave", dispatch_with_success
+    ):
         first = service.handle_payload(_UID, _request(request_id="req-recover"))
     assert first.status == "succeeded"
-    state_path = BrokerRequestStore(service.state_root / "controller")._path("req-recover")
+    state_path = BrokerRequestStore(service.state_root / "controller")._path(
+        "req-recover"
+    )
     state_path.unlink()
     second = service.handle_payload(_UID, _request(request_id="req-recover"))
     assert second.status == "succeeded"
@@ -649,7 +838,9 @@ def test_cancelled_attempts_count_toward_exhaustion(tmp_path):
     service = _service(tmp_path, config, lambda request: httpx.Response(500))
     request = _request(request_id="req-cancel")
     body = base64.b64decode(request["input_b64"])
-    params = canonical_operation_params("tabular-batch", "tabular.sort", request["operation_params"])
+    params = canonical_operation_params(
+        "tabular-batch", "tabular.sort", request["operation_params"]
+    )
     binding = RequestBinding(
         input_digest=broker_input_digest(body),
         pack="tabular-batch",
@@ -755,7 +946,9 @@ def test_reconcile_skips_unchanged_attempts_during_polling(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 20, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 20, "html_url": "https://run"}
+            )
         return httpx.Response(
             200,
             json={"status": "in_progress", "conclusion": None, "updated_at": "t"},
@@ -824,17 +1017,25 @@ def test_reconcile_skips_unchanged_attempts_during_polling(tmp_path):
     ):
         service.handle_payload(_UID, _request(request_id="req-rev", payload=rows))
     reconcile.assert_not_called()
-    assert service.controller.data_plane.read_manifest(run_id).revision == revision_before
-    _append_success_attempt(service.controller, "req-rev", b"[{\"id\":1}]")
-    with patch.object(service.controller, "reconcile_run", wraps=service.controller.reconcile_run) as reconcile:
-        response = service.handle_payload(_UID, _request(request_id="req-rev", payload=rows))
+    assert (
+        service.controller.data_plane.read_manifest(run_id).revision == revision_before
+    )
+    _append_success_attempt(service.controller, "req-rev", b'[{"id":1}]')
+    with patch.object(
+        service.controller, "reconcile_run", wraps=service.controller.reconcile_run
+    ) as reconcile:
+        response = service.handle_payload(
+            _UID, _request(request_id="req-rev", payload=rows)
+        )
     assert response.status == "succeeded"
     revision_after = service.controller.data_plane.read_manifest(run_id).revision
     assert revision_after == revision_before + 1
     assert reconcile.call_count == 1
     again = service.handle_payload(_UID, _request(request_id="req-rev", payload=rows))
     assert again.status == "succeeded"
-    assert service.controller.data_plane.read_manifest(run_id).revision == revision_after
+    assert (
+        service.controller.data_plane.read_manifest(run_id).revision == revision_after
+    )
 
 
 def test_dispatch_history_sync_prevents_duplicate_submit_after_crash(tmp_path):
@@ -845,7 +1046,9 @@ def test_dispatch_history_sync_prevents_duplicate_submit_after_crash(tmp_path):
         nonlocal dispatch_calls
         if request.method == "POST":
             dispatch_calls += 1
-            return httpx.Response(201, json={"workflow_run_id": 21, "html_url": "https://run"})
+            return httpx.Response(
+                201, json={"workflow_run_id": 21, "html_url": "https://run"}
+            )
         return httpx.Response(
             200,
             json={"status": "in_progress", "conclusion": None, "updated_at": "t"},
@@ -877,11 +1080,14 @@ def test_dispatch_history_sync_prevents_duplicate_submit_after_crash(tmp_path):
     wave_id = f"wave-{sha256(b'req-dispatch-sync').hexdigest()[:12]}"
     service.controller.dispatch_private_wave(run_id, wave_id)
     rows = json.dumps([{"id": 1}]).encode()
-    with patch.object(
-        service.controller,
-        "dispatch_private_wave",
-        side_effect=AssertionError("must not duplicate dispatch"),
-    ), pytest.raises(_PollLimit):
+    with (
+        patch.object(
+            service.controller,
+            "dispatch_private_wave",
+            side_effect=AssertionError("must not duplicate dispatch"),
+        ),
+        pytest.raises(_PollLimit),
+    ):
         service.handle_payload(
             _UID, _request(request_id="req-dispatch-sync", payload=rows)
         )
@@ -964,3 +1170,174 @@ def test_execution_fingerprint_binds_public_sha(tmp_path):
         public_sha="different-sha",
     )
     assert fingerprint != other
+
+
+class _QueuedListener:
+    def __init__(self, connections: list[socket.socket]) -> None:
+        self._connections = list(connections)
+        self.accept_count = 0
+
+    def accept(self) -> tuple[socket.socket, object]:
+        self.accept_count += 1
+        if self._connections:
+            return self._connections.pop(0), None
+        threading.Event().wait()
+        raise RuntimeError("unreachable queued listener wait")
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair required")
+def test_max_concurrent_requests_must_be_positive(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    with pytest.raises(ValueError, match="at least 1"):
+        serve_unix_broker(
+            socket_path=tmp_path / "broker.sock",
+            service=service,
+            max_concurrent_requests=0,
+        )
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair required")
+def test_serve_accept_loop_serial_waits_for_handle_before_next_accept(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    pairs = [socket.socketpair() for _ in range(2)]
+    clients = [pair[0] for pair in pairs]
+    servers = [pair[1] for pair in pairs]
+    for index, client in enumerate(clients):
+        request = _request(request_id=f"req-serial-{index}")
+        client.sendall((json.dumps(request) + "\n").encode())
+
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    handle_calls = 0
+
+    def gated_handle(
+        connection: socket.socket, broker_service: UnixBrokerService
+    ) -> None:
+        nonlocal handle_calls
+        handle_calls += 1
+        if handle_calls == 1:
+            entered_first.set()
+            assert release_first.wait(5)
+        _handle_connection(connection, broker_service)
+
+    listener = _QueuedListener(servers)
+
+    def run_loop() -> None:
+        with (
+            patch(
+                "portable_batch_execution.broker.server.read_peer_credentials",
+                return_value=(1, _UID, 1),
+            ),
+            patch(
+                "portable_batch_execution.broker.server._handle_connection",
+                side_effect=gated_handle,
+            ),
+        ):
+            _serve_accept_loop(listener, service, 1)
+
+    loop_thread = threading.Thread(target=run_loop, daemon=True)
+    loop_thread.start()
+    assert entered_first.wait(5)
+    assert listener.accept_count == 1
+    release_first.set()
+    deadline = time.monotonic() + 5
+    while listener.accept_count < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert listener.accept_count == 2
+    for client in clients:
+        client.close()
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair required")
+def test_serve_accept_loop_bounded_concurrency_overlaps_handles(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    pairs = [socket.socketpair() for _ in range(2)]
+    clients = [pair[0] for pair in pairs]
+    servers = [pair[1] for pair in pairs]
+    for index, client in enumerate(clients):
+        request = _request(request_id=f"req-parallel-{index}")
+        client.sendall((json.dumps(request) + "\n").encode())
+
+    overlap_barrier = threading.Barrier(2, timeout=5)
+
+    def gated_handle(
+        connection: socket.socket, broker_service: UnixBrokerService
+    ) -> None:
+        overlap_barrier.wait()
+        _handle_connection(connection, broker_service)
+
+    listener = _QueuedListener(servers)
+    loop_error: list[BaseException] = []
+
+    def run_loop() -> None:
+        try:
+            with (
+                patch(
+                    "portable_batch_execution.broker.server.read_peer_credentials",
+                    return_value=(1, _UID, 1),
+                ),
+                patch(
+                    "portable_batch_execution.broker.server._handle_connection",
+                    side_effect=gated_handle,
+                ),
+            ):
+                _serve_accept_loop(listener, service, 2)
+        except BaseException as exc:  # pragma: no cover - surfaced in test  # noqa: BLE001
+            loop_error.append(exc)
+
+    loop_thread = threading.Thread(target=run_loop, daemon=True)
+    loop_thread.start()
+    overlap_barrier.wait(5)
+    assert listener.accept_count == 2
+    assert not loop_error
+    for client in clients:
+        client.close()
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair required")
+def test_serve_accept_loop_responses_match_request_ids(tmp_path):
+    config = _config(tmp_path)
+    service = _service(tmp_path, config, lambda request: httpx.Response(500))
+    pairs = [socket.socketpair() for _ in range(2)]
+    clients = [pair[0] for pair in pairs]
+    servers = [pair[1] for pair in pairs]
+    request_ids = ("req-resp-a", "req-resp-b")
+    for client, request_id in zip(clients, request_ids, strict=True):
+        request = _request(request_id=request_id)
+        client.sendall((json.dumps(request) + "\n").encode())
+
+    release = threading.Event()
+
+    def gated_handle(
+        connection: socket.socket, broker_service: UnixBrokerService
+    ) -> None:
+        release.wait(5)
+        _handle_connection(connection, broker_service)
+
+    listener = _QueuedListener(servers)
+
+    def run_loop() -> None:
+        with (
+            patch(
+                "portable_batch_execution.broker.server.read_peer_credentials",
+                return_value=(1, _UID, 1),
+            ),
+            patch(
+                "portable_batch_execution.broker.server._handle_connection",
+                side_effect=gated_handle,
+            ),
+        ):
+            _serve_accept_loop(listener, service, 2)
+
+    loop_thread = threading.Thread(target=run_loop, daemon=True)
+    loop_thread.start()
+    release.set()
+    responses: list[str] = []
+    for client in clients:
+        payload = json.loads(client.recv(65536).decode())
+        responses.append(payload["request_id"])
+        client.close()
+    assert responses == list(request_ids)

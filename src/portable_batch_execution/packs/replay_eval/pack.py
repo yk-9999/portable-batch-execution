@@ -77,9 +77,13 @@ class ReplayEvalPack:
         profile = getattr(job, "security_profile", None)
         if operation == "replay_eval.external_api_evaluation":
             if profile != "external-api":
-                raise ValueError("external API evaluation requires external-api security")
+                raise ValueError(
+                    "external API evaluation requires external-api security"
+                )
         elif profile == "external-api":
-            raise ValueError("external-api security is limited to external API evaluation")
+            raise ValueError(
+                "external-api security is limited to external API evaluation"
+            )
         if operation not in self._adapter.descriptor.supported_operations:
             raise ValueError("adapter does not support replay evaluation operation")
         self._adapter.validate_job(job)
@@ -104,7 +108,9 @@ class ReplayEvalPack:
         if isinstance(value, dict):
             forbidden = cls._RESERVED_PARAMETER_KEYS.intersection(value)
             if forbidden:
-                raise ValueError("executable replay evaluation parameters are forbidden")
+                raise ValueError(
+                    "executable replay evaluation parameters are forbidden"
+                )
             for item in value.values():
                 cls._validate_json(item)
         elif isinstance(value, (list, tuple)):

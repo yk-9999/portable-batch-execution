@@ -17,14 +17,18 @@ def test_public_worker_executes_committed_wave_and_only_appends_attempts(tmp_pat
     assert state.read_manifest("public-synthetic-rolling-v1") is None
 
 
-@pytest.mark.parametrize("wave_id", ["", "wave-0001", "../wave-0000", "wave-0000; echo x", "$(whoami)"])
+@pytest.mark.parametrize(
+    "wave_id", ["", "wave-0001", "../wave-0000", "wave-0000; echo x", "$(whoami)"]
+)
 def test_public_worker_rejects_non_allowlisted_or_executable_wave_input(wave_id):
     with pytest.raises(ValueError):
         execute_public_wave(wave_id)
 
 
 def test_execute_wave_workflow_invokes_worker_with_environment_boundary():
-    workflow = (Path(__file__).parents[3] / ".github" / "workflows" / "execute-wave.yml").read_text()
+    workflow = (
+        Path(__file__).parents[3] / ".github" / "workflows" / "execute-wave.yml"
+    ).read_text()
 
     assert "python -m portable_batch_execution.worker.execute_wave" in workflow
     assert '"$PBE_WAVE_ID"' in workflow

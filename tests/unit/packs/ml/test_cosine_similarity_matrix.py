@@ -106,7 +106,9 @@ def test_order_preservation_and_rectangular_output():
         lambda payload: payload["left"].append({"row_id": "z", "vector": ["1"]}),
         lambda payload: payload["left"].append({"row_id": "z", "vector": []}),
         lambda payload: payload["left"].append({"row_id": "", "vector": [1.0]}),
-        lambda payload: payload["left"].append({"row_id": "z", "vector": [1.0], "extra": 1}),
+        lambda payload: payload["left"].append(
+            {"row_id": "z", "vector": [1.0], "extra": 1}
+        ),
         lambda payload: payload.update({"callback": "run"}),
         lambda payload: payload["left"].append(1),
     ),

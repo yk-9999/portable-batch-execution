@@ -71,13 +71,19 @@ def test_summary_cardinality_independent_of_identity_count(tmp_path):
     small = state_summary(
         _state(
             tmp_path,
-            [{"identity": i, "identity_norm": str(i), "price": float(i)} for i in range(1, 11)],
+            [
+                {"identity": i, "identity_norm": str(i), "price": float(i)}
+                for i in range(1, 11)
+            ],
         )
     )
     large = state_summary(
         _state(
             tmp_path,
-            [{"identity": i, "identity_norm": str(i), "price": float(i)} for i in range(1, 10001)],
+            [
+                {"identity": i, "identity_norm": str(i), "price": float(i)}
+                for i in range(1, 10001)
+            ],
         )
     )
     assert sorted(small) == sorted(large)
@@ -87,7 +93,10 @@ def test_summary_cardinality_independent_of_identity_count(tmp_path):
 
 
 def test_bucket_artifacts_carry_exact_identities(tmp_path):
-    rows = [{"identity": value, "identity_norm": str(value), "price": 1.0} for value in (5, 1, 9, 300)]
+    rows = [
+        {"identity": value, "identity_norm": str(value), "price": 1.0}
+        for value in (5, 1, 9, 300)
+    ]
     state = _state(tmp_path, rows)
     carried = {
         value
@@ -99,7 +108,9 @@ def test_bucket_artifacts_carry_exact_identities(tmp_path):
         values = read_bucket_values(state, index)
         assert list(values) == sorted(set(values))
     for identity in carried:
-        assert identity in read_bucket_values(state, bucket_index(identity, state.bucket_count))
+        assert identity in read_bucket_values(
+            state, bucket_index(identity, state.bucket_count)
+        )
 
 
 def test_non_monotonic_unique_identities_pass(tmp_path):
@@ -260,7 +271,9 @@ def test_bucket_count_must_be_power_of_two_in_range():
     with pytest.raises(ValueError):
         StructuralCanonicalizeParams.model_validate({**_PARAMS, "bucket_count": 0})
     assert (
-        StructuralCanonicalizeParams.model_validate({**_PARAMS, "bucket_count": 512}).bucket_count
+        StructuralCanonicalizeParams.model_validate(
+            {**_PARAMS, "bucket_count": 512}
+        ).bucket_count
         == 512
     )
 
@@ -294,7 +307,13 @@ def test_sentinel_exact_match_accepts_matching_witness(tmp_path):
                 "marker_kind": "boundary",
                 "marker_rank": 7,
             },
-            {"identity": 1, "identity_norm": "1", "price": 1.0, "marker_kind": "a", "marker_rank": 1},
+            {
+                "identity": 1,
+                "identity_norm": "1",
+                "price": 1.0,
+                "marker_kind": "a",
+                "marker_rank": 1,
+            },
         ],
     )
     result = execute_structural_canonicalize(paths, _EXACT_PARAMS)
@@ -321,7 +340,14 @@ def test_sentinel_exact_match_wrong_field_value_fails_closed(tmp_path):
 def test_sentinel_exact_match_missing_predicate_field_fails_closed(tmp_path):
     paths = _paths(
         tmp_path,
-        [{"identity": -1, "identity_norm": "x", "price": 0.0, "marker_kind": "boundary"}],
+        [
+            {
+                "identity": -1,
+                "identity_norm": "x",
+                "price": 0.0,
+                "marker_kind": "boundary",
+            }
+        ],
     )
     with pytest.raises(StructuralCanonicalizeError):
         execute_structural_canonicalize(paths, _EXACT_PARAMS)
@@ -372,7 +398,9 @@ def test_structural_canonicalize_rejects_core_field_disagreement_within_group(tm
 
 
 def test_singleton_positive_rejects_null_normalized_identity(tmp_path):
-    with pytest.raises(StructuralCanonicalizeError, match="identity normalized column mismatch"):
+    with pytest.raises(
+        StructuralCanonicalizeError, match="identity normalized column mismatch"
+    ):
         execute_structural_canonicalize(
             _paths(tmp_path, [{"identity": 1, "identity_norm": None, "price": 1.0}]),
             _PARAMS,
@@ -380,7 +408,9 @@ def test_singleton_positive_rejects_null_normalized_identity(tmp_path):
 
 
 def test_singleton_positive_rejects_null_measurement_core_field(tmp_path):
-    with pytest.raises(StructuralCanonicalizeError, match="measurement core fields disagree"):
+    with pytest.raises(
+        StructuralCanonicalizeError, match="measurement core fields disagree"
+    ):
         execute_structural_canonicalize(
             _paths(tmp_path, [{"identity": 1, "identity_norm": "1", "price": None}]),
             _PARAMS,
@@ -388,7 +418,9 @@ def test_singleton_positive_rejects_null_measurement_core_field(tmp_path):
 
 
 def test_multi_shard_path_rejects_null_normalized_identity(tmp_path):
-    with pytest.raises(StructuralCanonicalizeError, match="identity normalized column mismatch"):
+    with pytest.raises(
+        StructuralCanonicalizeError, match="identity normalized column mismatch"
+    ):
         execute_structural_canonicalize(
             _paths(
                 tmp_path,
@@ -400,7 +432,9 @@ def test_multi_shard_path_rejects_null_normalized_identity(tmp_path):
 
 
 def test_multi_shard_path_rejects_null_measurement_core_field(tmp_path):
-    with pytest.raises(StructuralCanonicalizeError, match="measurement core fields disagree"):
+    with pytest.raises(
+        StructuralCanonicalizeError, match="measurement core fields disagree"
+    ):
         execute_structural_canonicalize(
             _paths(
                 tmp_path,
@@ -447,26 +481,35 @@ def test_rejects_lossy_or_non_integer_source_identity_singleton(
             "price": pl.Float64,
         },
     ).write_parquet(path)
-    with pytest.raises(StructuralCanonicalizeError, match="identity is missing or not positive"):
+    with pytest.raises(
+        StructuralCanonicalizeError, match="identity is missing or not positive"
+    ):
         execute_structural_canonicalize([path], _PARAMS)
 
 
 def test_multi_shard_rejects_lossy_source_identity(tmp_path):
     good = tmp_path / "good.parquet"
-    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(good)
+    pl.DataFrame([{"identity": 1, "identity_norm": "1", "price": 1.0}]).write_parquet(
+        good
+    )
     bad = tmp_path / "bad.parquet"
     pl.DataFrame(
         [{"identity": 2.5, "identity_norm": "2", "price": 2.0}],
         schema={"identity": pl.Float64, "identity_norm": pl.Utf8, "price": pl.Float64},
     ).write_parquet(bad)
-    with pytest.raises(StructuralCanonicalizeError, match="identity is missing or not positive"):
+    with pytest.raises(
+        StructuralCanonicalizeError, match="identity is missing or not positive"
+    ):
         execute_structural_canonicalize([good, bad], _PARAMS)
 
 
 def test_roundtrip_preserves_state_across_binary_buckets(tmp_path):
     state = _state(
         tmp_path,
-        [{"identity": value, "identity_norm": str(value), "price": float(value)} for value in (7, 3, 11, 300)],
+        [
+            {"identity": value, "identity_norm": str(value), "price": float(value)}
+            for value in (7, 3, 11, 300)
+        ],
     )
     decoded = decode_state(state_summary(state), encode_state_buckets(state))
     assert states_equal(decoded, state)
@@ -487,7 +530,10 @@ def test_malformed_bucket_state_fails_closed(tmp_path):
         decode_state(summary, tuple(reordered))
 
     with pytest.raises(StructuralCanonicalizeError):
-        decode_state({**summary, "bucket_format": "pbe.replay.exact-id-bucket.v0"}, tuple(buckets))
+        decode_state(
+            {**summary, "bucket_format": "pbe.replay.exact-id-bucket.v0"},
+            tuple(buckets),
+        )
 
     with pytest.raises(StructuralCanonicalizeError):
         decode_state({**summary, "positive_group_count": 999}, tuple(buckets))
@@ -511,8 +557,9 @@ def test_decode_bucket_rejects_unsorted_values():
     import struct
 
     header = struct.Struct("<8sHIIQ")
-    payload = header.pack(b"PBEBKT01", BUCKET_FORMAT_VERSION, 256, 0, 2) + struct.pack("<2Q", 5, 3)
+    payload = header.pack(b"PBEBKT01", BUCKET_FORMAT_VERSION, 256, 0, 2) + struct.pack(
+        "<2Q", 5, 3
+    )
     with pytest.raises(StructuralCanonicalizeError):
         decode_bucket(payload, 256, 0)
     assert BUCKET_FORMAT == "pbe.replay.exact-id-bucket.v1"
-
