@@ -193,14 +193,88 @@ def test_write_is_idempotent_and_reuses_existing_exact_size_object():
 
 
 def test_write_rechecks_persistence_and_fails_on_size_drift():
-    class _NonPersistingApi(FakeHfApi):
+    class _WrongSizeApi(FakeHfApi):
         def batch_bucket_files(self, bucket_id, *, add=None):
             super().batch_bucket_files(bucket_id, add=add)
             for _, remote_path in add or []:
                 self.objects[remote_path] = b"short"
 
-    store, _ = _store(_NonPersistingApi())
-    with pytest.raises(HfBucketStoreError):
+    store, _ = _store(
+        _WrongSizeApi(),
+        persistence_verify_attempts=3,
+        persistence_verify_delay_seconds=0,
+    )
+    with pytest.raises(HfBucketStoreError, match="wrong size"):
+        store.write(b"payload-bytes")
+
+
+def test_write_retries_bounded_post_upload_visibility_lag():
+    class _DelayedVisibilityApi(FakeHfApi):
+        def __init__(self):
+            super().__init__()
+            self.uploaded = False
+            self.hidden_checks = 2
+
+        def batch_bucket_files(self, bucket_id, *, add=None):
+            super().batch_bucket_files(bucket_id, add=add)
+            self.uploaded = True
+
+        def get_bucket_paths_info(self, bucket_id, paths):
+            if self.uploaded and self.hidden_checks:
+                self.get_paths_calls.append((bucket_id, list(paths)))
+                self.hidden_checks -= 1
+                return
+            yield from super().get_bucket_paths_info(bucket_id, paths)
+
+    store, api = _store(
+        _DelayedVisibilityApi(),
+        persistence_verify_attempts=4,
+        persistence_verify_delay_seconds=0,
+    )
+    ref = store.write(b"payload-bytes")
+    assert ref.object_id == _OBJECT_ID
+    assert api.hidden_checks == 0
+
+
+def test_write_retries_transient_post_upload_metadata_error():
+    class _TransientMetadataApi(FakeHfApi):
+        def __init__(self):
+            super().__init__()
+            self.uploaded = False
+            self.failures_left = 2
+
+        def batch_bucket_files(self, bucket_id, *, add=None):
+            super().batch_bucket_files(bucket_id, add=add)
+            self.uploaded = True
+
+        def get_bucket_paths_info(self, bucket_id, paths):
+            if self.uploaded and self.failures_left:
+                self.get_paths_calls.append((bucket_id, list(paths)))
+                self.failures_left -= 1
+                raise RuntimeError("transient metadata failure")
+            yield from super().get_bucket_paths_info(bucket_id, paths)
+
+    store, api = _store(
+        _TransientMetadataApi(),
+        persistence_verify_attempts=4,
+        persistence_verify_delay_seconds=0,
+    )
+    ref = store.write(b"payload-bytes")
+    assert ref.object_id == _OBJECT_ID
+    assert api.failures_left == 0
+
+
+def test_write_fails_closed_when_uploaded_object_remains_missing():
+    class _MissingAfterUploadApi(FakeHfApi):
+        def batch_bucket_files(self, bucket_id, *, add=None):
+            self.batch_calls.append((bucket_id, list(add or [])))
+
+    store, _ = _store(
+        _MissingAfterUploadApi(),
+        persistence_verify_attempts=3,
+        persistence_verify_delay_seconds=0,
+    )
+    with pytest.raises(HfBucketStoreError, match="not persisted with exact size"):
         store.write(b"payload-bytes")
 
 

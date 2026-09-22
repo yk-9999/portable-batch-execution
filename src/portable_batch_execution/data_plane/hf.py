@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
@@ -48,6 +49,8 @@ PBE_HF_PREFIX_ENV = "PBE_HF_PREFIX"
 PBE_HF_OBJECT_LAYOUT_ENV = "PBE_HF_OBJECT_LAYOUT"
 
 DEFAULT_MAX_OBJECT_BYTES = 1024 * 1024 * 1024
+DEFAULT_PERSISTENCE_VERIFY_ATTEMPTS = 6
+DEFAULT_PERSISTENCE_VERIFY_DELAY_SECONDS = 1.0
 
 _BUCKET_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _PREFIX_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -228,6 +231,8 @@ class HfBucketArtifactStore:
         token: str | None = None,
         spool_root: Path | None = None,
         max_object_bytes: int = DEFAULT_MAX_OBJECT_BYTES,
+        persistence_verify_attempts: int = DEFAULT_PERSISTENCE_VERIFY_ATTEMPTS,
+        persistence_verify_delay_seconds: float = DEFAULT_PERSISTENCE_VERIFY_DELAY_SECONDS,
     ) -> None:
         self.identity = identity
         self._api = api
@@ -236,7 +241,13 @@ class HfBucketArtifactStore:
         self._spool_root = Path(spool_root) if spool_root is not None else None
         if max_object_bytes <= 0:
             raise HfBucketStoreError("max_object_bytes must be positive")
+        if persistence_verify_attempts <= 0:
+            raise HfBucketStoreError("persistence_verify_attempts must be positive")
+        if persistence_verify_delay_seconds < 0:
+            raise HfBucketStoreError("persistence_verify_delay_seconds must be non-negative")
         self._max_object_bytes = max_object_bytes
+        self._persistence_verify_attempts = persistence_verify_attempts
+        self._persistence_verify_delay_seconds = persistence_verify_delay_seconds
 
     @classmethod
     def from_environment(
@@ -318,6 +329,18 @@ class HfBucketArtifactStore:
             return None
         return self._parse_path_info(entries, object_id)
 
+    def _wait_for_exact_persistence(self, object_id: str, size_bytes: int) -> None:
+        """Allow bounded post-upload metadata lag while preserving exact-size checks."""
+        for attempt in range(self._persistence_verify_attempts):
+            persisted = self.remote_size(object_id)
+            if persisted == size_bytes:
+                return
+            if persisted is not None:
+                raise HfBucketStoreError("uploaded object was persisted with wrong size")
+            if attempt + 1 < self._persistence_verify_attempts:
+                time.sleep(self._persistence_verify_delay_seconds)
+        raise HfBucketStoreError("uploaded object was not persisted with exact size")
+
     def _resolve_object_id(self, ref: ArtifactRef) -> str:
         object_id = validate_object_id(ref.object_id)
         if ref.sha256 != f"sha256:{object_id}":
@@ -382,9 +405,7 @@ class HfBucketArtifactStore:
                     raise HfBucketStoreError("hf bucket upload failed") from exc
             finally:
                 shutil.rmtree(spool, ignore_errors=True)
-            persisted = self.remote_size(object_id)
-            if persisted != size_bytes:
-                raise HfBucketStoreError("uploaded object was not persisted with exact size")
+            self._wait_for_exact_persistence(object_id, size_bytes)
         return ArtifactRef(
             object_id=object_id,
             uri=self.identity.object_uri(object_id),
