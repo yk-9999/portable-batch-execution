@@ -124,7 +124,11 @@ def _load_holds(state_root: Path, index: ReachabilityIndex) -> tuple[HoldRecord,
     return tuple(records)
 
 
-def _scan_closed_waves(controller_root: Path, index: ReachabilityIndex) -> None:
+def _scan_closed_waves(
+    controller_root: Path,
+    index: ReachabilityIndex,
+    live_run_ids: set[str],
+) -> None:
     waves_root = controller_root / "closed_waves"
     if not waves_root.is_dir():
         return
@@ -155,6 +159,8 @@ def _scan_closed_waves(controller_root: Path, index: ReachabilityIndex) -> None:
             digest = job.input_manifest_ref.sha256
             index.run_ids_by_digest[digest].add(run_id)
             _touch(index, digest, when)
+            if run_id in live_run_ids:
+                index.protected_by_digest[digest].add(f"closed_wave_input:{run_id}")
             for shard_payload in payload.get("shards", ()):
                 try:
                     shard = ShardSpec.model_validate(shard_payload)
@@ -166,6 +172,10 @@ def _scan_closed_waves(controller_root: Path, index: ReachabilityIndex) -> None:
                 for ref in shard.input_refs:
                     index.run_ids_by_digest[ref.sha256].add(run_id)
                     _touch(index, ref.sha256, when)
+                    if run_id in live_run_ids:
+                        index.protected_by_digest[ref.sha256].add(
+                            f"closed_wave_input:{run_id}"
+                        )
 
 
 def build_reachability_index(
@@ -175,6 +185,7 @@ def build_reachability_index(
     state_root = state_root.resolve()
     index = ReachabilityIndex()
     controller_root = state_root / "controller"
+    live_run_ids: set[str] = set()
 
     deliveries = _load_deliveries(state_root, index)
     delivery_by_request = {record.request_id: record for record in deliveries}
@@ -194,6 +205,7 @@ def build_reachability_index(
             continue
         broker_runs.add(state.logical_run_id)
         if state.status not in BROKER_TERMINAL_REQUEST_STATUSES:
+            live_run_ids.add(state.logical_run_id)
             index.protected_by_digest.setdefault("__broker_request__", set()).add(
                 f"broker:{state.request_id}:{state.status}"
             )
@@ -249,6 +261,7 @@ def build_reachability_index(
                     live_manifest
                     and broker_status not in BROKER_TERMINAL_REQUEST_STATUSES
                 ):
+                    live_run_ids.add(run_id)
                     index.protected_by_digest.setdefault("__run__", set()).add(
                         f"manifest:{run_id}:{manifest.status}"
                     )
@@ -300,7 +313,7 @@ def build_reachability_index(
                                 f"attempt:{attempt.attempt_id}"
                             )
 
-    _scan_closed_waves(controller_root, index)
+    _scan_closed_waves(controller_root, index, live_run_ids)
 
     if policy is not None:
         apply_policy_external_references(index, policy)

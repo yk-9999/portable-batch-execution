@@ -19,15 +19,21 @@ from portable_batch_execution.broker.planning import (
 )
 from portable_batch_execution.broker.service import UnixBrokerService
 from portable_batch_execution.broker.state import (
+    BROKER_TERMINAL_REQUEST_STATUSES,
     BrokerRequestState,
     BrokerRequestStore,
     RequestBinding,
 )
 from portable_batch_execution.contracts import (
     ArtifactRef,
+    ExecutionPolicy,
+    JobSpec,
     Provenance,
     RunManifest,
     ShardAttemptRecord,
+    ShardCorrectnessSpec,
+    ShardSpec,
+    WaveSpec,
 )
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
@@ -531,6 +537,48 @@ def test_terminal_broker_manifest_final_ref_does_not_block_gc(tmp_path):
     assert digest in {item.digest for item in report.candidates}
 
 
+def _register_closed_wave_input(
+    tmp_path: Path,
+    *,
+    run_id: str,
+    input_ref: ArtifactRef,
+    wave_id: str = "wave-000001",
+) -> None:
+    now = datetime.now(UTC)
+    job = JobSpec(
+        job_id="job",
+        logical_run_id=run_id,
+        pack="tabular-batch",
+        operation="tabular.sort",
+        input_manifest_ref=input_ref,
+        sharding=ShardCorrectnessSpec(mode="independent"),
+        execution=ExecutionPolicy(max_parallel=1, max_attempts_per_shard=4),
+        security_profile="offline",
+        provenance=Provenance(producer="test", revision="1", created_at=now),
+    )
+    shard = ShardSpec(
+        logical_run_id=run_id,
+        shard_id="shard-000000",
+        ordinal=0,
+        correctness=job.sharding,
+        input_refs=(input_ref,),
+        input_digest="sha256:" + "1" * 64,
+        execution_fingerprint="fp",
+    )
+    wave = WaveSpec(
+        logical_run_id=run_id,
+        wave_id=wave_id,
+        ordinal=0,
+        shard_ids=(shard.shard_id,),
+        max_parallel=1,
+    )
+    ClosedWaveRegistry(tmp_path / "controller").register_closed_wave(job, wave, (shard,))
+
+
+def _age_payload(path: Path, when: datetime) -> None:
+    os.utime(path, (when.timestamp(), when.timestamp()))
+
+
 def _non_broker_manifest(
     run_id: str,
     *,
@@ -582,6 +630,135 @@ def test_nonterminal_manifest_still_blocks_gc(tmp_path):
     assert index.is_protected(ref.sha256)
     report = plan_gc(tmp_path, policy, mode="normal", now=datetime.now(UTC))
     assert ref.sha256 in {item.digest for item in report.protected}
+
+
+def test_legacy_gc_protects_closed_wave_input_for_nonterminal_broker(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=3600)
+    _register_request(service, "req-live-input")
+    store = BrokerRequestStore(service.state_root / "controller")
+    state = store.load("req-live-input")
+    assert state is not None
+    assert state.status not in BROKER_TERMINAL_REQUEST_STATUSES
+    payload = ClosedWaveRegistry(service.state_root / "controller").resolve_wave(
+        state.logical_run_id, state.wave_id
+    )
+    input_digest = payload["job"]["input_manifest_ref"]["sha256"]
+    path = artifact_payload_path(tmp_path, input_digest)
+    _age_payload(path, datetime.now(UTC) - timedelta(days=30))
+    index = build_reachability_index(tmp_path, policy)
+    assert f"closed_wave_input:{state.logical_run_id}" in index.protection_reasons(
+        input_digest
+    )
+    report = plan_gc(tmp_path, policy, mode="legacy", now=datetime.now(UTC))
+    assert input_digest in {item.digest for item in report.protected}
+
+
+def test_legacy_gc_shared_closed_wave_input_protected_while_one_run_live(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    _register_request(service, "req-live-shared")
+    store = BrokerRequestStore(service.state_root / "controller")
+    live_state = store.load("req-live-shared")
+    assert live_state is not None
+    payload = ClosedWaveRegistry(service.state_root / "controller").resolve_wave(
+        live_state.logical_run_id, live_state.wave_id
+    )
+    shared_digest = payload["job"]["input_manifest_ref"]["sha256"]
+    terminal_run = opaque_run_id("req-term-shared")
+    terminal_input_ref = ArtifactRef(
+        object_id=shared_digest.removeprefix("sha256:"),
+        uri=artifact_payload_path(tmp_path, shared_digest).as_uri(),
+        sha256=shared_digest,
+        media_type="application/octet-stream",
+        size_bytes=artifact_payload_path(tmp_path, shared_digest).stat().st_size,
+    )
+    _register_closed_wave_input(
+        tmp_path,
+        run_id=terminal_run,
+        input_ref=terminal_input_ref,
+        wave_id=opaque_wave_id("req-term-shared"),
+    )
+    terminal_output = b"terminal-run-output"
+    terminal_out_digest = f"sha256:{sha256(terminal_output).hexdigest()}"
+    store.save(
+        BrokerRequestState(
+            request_id="req-term-shared",
+            binding=live_state.binding,
+            logical_run_id=terminal_run,
+            wave_id=opaque_wave_id("req-term-shared"),
+            shard_id="shard-000000",
+            status="succeeded",
+            output_sha256=terminal_out_digest,
+            output_size_bytes=len(terminal_output),
+            output_media_type="application/json",
+        )
+    )
+    _age_payload(
+        artifact_payload_path(tmp_path, shared_digest),
+        datetime.now(UTC) - timedelta(days=30),
+    )
+    report = plan_gc(
+        tmp_path, policy, mode="legacy", now=datetime.now(UTC) + timedelta(days=30)
+    )
+    assert shared_digest in {item.digest for item in report.protected}
+
+
+def test_legacy_gc_protects_closed_wave_input_for_nonterminal_manifest(tmp_path):
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    plane = LocalFilesystemDataPlane(tmp_path)
+    input_ref = plane.write(b"manifest-closed-wave-input", "application/octet-stream")
+    run_id = "standalone-running"
+    _register_closed_wave_input(tmp_path, run_id=run_id, input_ref=input_ref)
+    plane.write_next_manifest(
+        _non_broker_manifest(run_id=run_id, status="running", final_output_refs=()),
+        -1,
+    )
+    _age_payload(
+        artifact_payload_path(tmp_path, input_ref.sha256),
+        datetime.now(UTC) - timedelta(days=30),
+    )
+    index = build_reachability_index(tmp_path, policy)
+    assert f"closed_wave_input:{run_id}" in index.protection_reasons(input_ref.sha256)
+    report = plan_gc(
+        tmp_path, policy, mode="legacy", now=datetime.now(UTC) + timedelta(days=30)
+    )
+    assert input_ref.sha256 in {item.digest for item in report.protected}
+
+
+def test_legacy_gc_terminal_broker_closed_wave_input_becomes_eligible(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    _register_request(service, "req-terminal-input")
+    store = BrokerRequestStore(service.state_root / "controller")
+    state = store.load("req-terminal-input")
+    assert state is not None
+    output = b"[{\"id\":1}]"
+    digest_out = f"sha256:{sha256(output).hexdigest()}"
+    _append_success_attempt(service.controller, "req-terminal-input", output)
+    state.status = "succeeded"
+    state.output_sha256 = digest_out
+    state.output_size_bytes = len(output)
+    state.output_media_type = "application/json"
+    store.save(state)
+    _delivery_commit(service, "req-terminal-input", digest_out, len(output))
+    payload = ClosedWaveRegistry(service.state_root / "controller").resolve_wave(
+        state.logical_run_id, state.wave_id
+    )
+    input_digest = payload["job"]["input_manifest_ref"]["sha256"]
+    input_path = artifact_payload_path(tmp_path, input_digest)
+    _age_payload(input_path, datetime.now(UTC) - timedelta(days=30))
+    index = build_reachability_index(tmp_path, policy)
+    assert f"closed_wave_input:{state.logical_run_id}" not in index.protection_reasons(
+        input_digest
+    )
+    report = plan_gc(
+        tmp_path, policy, mode="legacy", now=datetime.now(UTC) + timedelta(days=30)
+    )
+    assert input_digest in {item.digest for item in report.candidates}
 
 
 def test_gc_prevents_publishing_ref_to_deleted_payload(tmp_path):
