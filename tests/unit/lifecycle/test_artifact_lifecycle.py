@@ -575,6 +575,74 @@ def _register_closed_wave_input(
     ClosedWaveRegistry(tmp_path / "controller").register_closed_wave(job, wave, (shard,))
 
 
+def _historical_closed_wave_job_payload(
+    *,
+    run_id: str,
+    input_manifest_ref: ArtifactRef,
+    shard_input_refs: tuple[ArtifactRef, ...],
+    created_at: datetime,
+) -> dict[str, object]:
+    """Job/shard bundle that is reachability-valid but fails current JobSpec semantics."""
+    job: dict[str, object] = {
+        "schema_version": "1",
+        "job_id": "job-historical",
+        "logical_run_id": run_id,
+        "pack": "tabular-batch",
+        "operation": "tabular.text_event_features.v1",
+        "input_manifest_ref": input_manifest_ref.model_dump(mode="json"),
+        "sharding": {"mode": "independent"},
+        "execution": {"max_parallel": 1, "max_attempts_per_shard": 4},
+        "security_profile": "offline",
+        "provenance": {
+            "producer": "test",
+            "revision": "legacy",
+            "created_at": created_at.isoformat(),
+        },
+        "operation_params": {
+            "import_path": "legacy.module:build_features",
+            "feature_columns": ["text", "event_id"],
+        },
+    }
+    with pytest.raises(ValueError):
+        JobSpec.model_validate(job)
+    shard: dict[str, object] = {
+        "schema_version": "1",
+        "logical_run_id": run_id,
+        "shard_id": "shard-000000",
+        "ordinal": 0,
+        "correctness": {"mode": "independent"},
+        "input_refs": [ref.model_dump(mode="json") for ref in shard_input_refs],
+        "input_digest": "sha256:" + "1" * 64,
+        "execution_fingerprint": "fp",
+    }
+    return {
+        "job": job,
+        "wave": {
+            "schema_version": "1",
+            "logical_run_id": run_id,
+            "wave_id": "wave-historical",
+            "ordinal": 0,
+            "shard_ids": ["shard-000000"],
+            "max_parallel": 1,
+        },
+        "shards": [shard],
+    }
+
+
+def _write_closed_wave_bundle(
+    tmp_path: Path,
+    *,
+    run_id: str,
+    bundle: dict[str, object],
+    wave_id: str = "wave-historical",
+) -> Path:
+    run_dir = tmp_path / "controller" / "closed_waves" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    wave_path = run_dir / f"{wave_id}.wave.json"
+    wave_path.write_text(json.dumps(bundle) + "\n", encoding="utf-8")
+    return wave_path
+
+
 def _age_payload(path: Path, when: datetime) -> None:
     os.utime(path, (when.timestamp(), when.timestamp()))
 
@@ -630,6 +698,108 @@ def test_nonterminal_manifest_still_blocks_gc(tmp_path):
     assert index.is_protected(ref.sha256)
     report = plan_gc(tmp_path, policy, mode="normal", now=datetime.now(UTC))
     assert ref.sha256 in {item.digest for item in report.protected}
+
+
+def test_legacy_gc_closed_wave_reachability_tolerates_historical_job_semantics(tmp_path):
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    plane = LocalFilesystemDataPlane(tmp_path)
+    manifest_input = plane.write(b"historical-manifest-input", "application/octet-stream")
+    shard_input = plane.write(b"historical-shard-input", "application/octet-stream")
+    run_id = "historical-closed-wave-run"
+    created_at = datetime(2024, 6, 1, 12, 0, tzinfo=UTC)
+    bundle = _historical_closed_wave_job_payload(
+        run_id=run_id,
+        input_manifest_ref=manifest_input,
+        shard_input_refs=(shard_input,),
+        created_at=created_at,
+    )
+    wave_path = _write_closed_wave_bundle(tmp_path, run_id=run_id, bundle=bundle)
+    _age_payload(wave_path, created_at)
+    index = build_reachability_index(tmp_path, policy)
+    assert not any("closed wave" in message for message in index.unknown_messages)
+    assert run_id in index.run_ids_by_digest[manifest_input.sha256]
+    assert run_id in index.run_ids_by_digest[shard_input.sha256]
+    assert index.digest_last_reference_at[manifest_input.sha256] == created_at
+    assert index.digest_last_reference_at[shard_input.sha256] == created_at
+    assert not index.protection_reasons(manifest_input.sha256)
+    assert not index.protection_reasons(shard_input.sha256)
+
+
+def test_legacy_gc_closed_wave_file_mtime_advances_last_reference_time(tmp_path):
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    plane = LocalFilesystemDataPlane(tmp_path)
+    manifest_input = plane.write(b"mtime-manifest-input", "application/octet-stream")
+    run_id = "historical-closed-wave-mtime"
+    created_at = datetime(2024, 6, 1, 12, 0, tzinfo=UTC)
+    observed_at = datetime(2025, 3, 15, 8, 30, tzinfo=UTC)
+    bundle = _historical_closed_wave_job_payload(
+        run_id=run_id,
+        input_manifest_ref=manifest_input,
+        shard_input_refs=(),
+        created_at=created_at,
+    )
+    wave_path = _write_closed_wave_bundle(tmp_path, run_id=run_id, bundle=bundle)
+    _age_payload(wave_path, observed_at)
+    index = build_reachability_index(tmp_path, policy)
+    assert index.digest_last_reference_at[manifest_input.sha256] == observed_at
+
+
+def test_legacy_gc_closed_wave_historical_inputs_hard_protected_for_live_run(tmp_path):
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    plane = LocalFilesystemDataPlane(tmp_path)
+    manifest_input = plane.write(b"live-historical-manifest", "application/octet-stream")
+    shard_input = plane.write(b"live-historical-shard", "application/octet-stream")
+    run_id = "historical-live-run"
+    bundle = _historical_closed_wave_job_payload(
+        run_id=run_id,
+        input_manifest_ref=manifest_input,
+        shard_input_refs=(shard_input,),
+        created_at=datetime(2024, 6, 1, 12, 0, tzinfo=UTC),
+    )
+    _write_closed_wave_bundle(tmp_path, run_id=run_id, bundle=bundle)
+    plane.write_next_manifest(
+        _non_broker_manifest(run_id=run_id, status="running", final_output_refs=()),
+        -1,
+    )
+    index = build_reachability_index(tmp_path, policy)
+    assert f"closed_wave_input:{run_id}" in index.protection_reasons(manifest_input.sha256)
+    assert f"closed_wave_input:{run_id}" in index.protection_reasons(shard_input.sha256)
+
+
+def test_legacy_gc_closed_wave_historical_reachability_fail_closed(tmp_path):
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    plane = LocalFilesystemDataPlane(tmp_path)
+    good_ref = plane.write(b"good-ref", "application/octet-stream")
+    run_id = "historical-fail-closed"
+    created_at = datetime(2024, 6, 1, 12, 0, tzinfo=UTC)
+    mismatch_bundle = _historical_closed_wave_job_payload(
+        run_id="other-run-id",
+        input_manifest_ref=good_ref,
+        shard_input_refs=(good_ref,),
+        created_at=created_at,
+    )
+    _write_closed_wave_bundle(tmp_path, run_id=run_id, bundle=mismatch_bundle)
+    bad_ref_bundle = _historical_closed_wave_job_payload(
+        run_id=run_id,
+        input_manifest_ref=good_ref,
+        shard_input_refs=(good_ref,),
+        created_at=created_at,
+    )
+    bad_ref_bundle["shards"] = [
+        {
+            "logical_run_id": run_id,
+            "input_refs": [{"sha256": "not-a-digest"}],
+        }
+    ]
+    _write_closed_wave_bundle(
+        tmp_path,
+        run_id=run_id,
+        bundle=bad_ref_bundle,
+        wave_id="wave-bad-ref",
+    )
+    index = build_reachability_index(tmp_path, policy)
+    assert any("logical_run_id mismatch" in message for message in index.unknown_messages)
+    assert any("closed wave shard invalid" in message for message in index.unknown_messages)
 
 
 def test_legacy_gc_protects_closed_wave_input_for_nonterminal_broker(tmp_path):

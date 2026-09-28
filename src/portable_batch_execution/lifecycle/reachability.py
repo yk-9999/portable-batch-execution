@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from pydantic import TypeAdapter
+
 from portable_batch_execution.broker.state import (
     BROKER_TERMINAL_REQUEST_STATUSES,
     BROKER_TRANSPORT_OUTPUT_STATUSES,
@@ -108,6 +110,87 @@ def _load_deliveries(state_root: Path, index: ReachabilityIndex) -> tuple[Delive
     return tuple(records)
 
 
+_DATETIME_ADAPTER = TypeAdapter(datetime)
+
+
+def _parse_closed_wave_job_reachability(
+    job_payload: object,
+    *,
+    expected_run_id: str,
+) -> tuple[str, datetime, ArtifactRef]:
+    if not isinstance(job_payload, dict):
+        raise TypeError("job must be an object")
+    run_id = job_payload.get("logical_run_id")
+    if not isinstance(run_id, str):
+        raise TypeError("logical_run_id required")
+    safe_file_component(run_id, "run_id")
+    if run_id != expected_run_id:
+        raise ValueError("logical_run_id mismatch")
+    provenance = job_payload.get("provenance")
+    if not isinstance(provenance, dict):
+        raise TypeError("provenance required")
+    try:
+        when = _DATETIME_ADAPTER.validate_python(provenance["created_at"])
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ValueError("provenance.created_at required") from exc
+    try:
+        input_manifest_ref = ArtifactRef.model_validate(job_payload["input_manifest_ref"])
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ValueError("input_manifest_ref required") from exc
+    return run_id, when, input_manifest_ref
+
+
+def _closed_wave_observed_reference_time(
+    wave_path: Path,
+    job_created_at: datetime,
+) -> datetime:
+    wave_mtime = datetime.fromtimestamp(wave_path.stat().st_mtime, UTC)
+    return max(_coerce_utc(job_created_at), wave_mtime)
+
+
+def _extract_validated_closed_wave_reachability(
+    payload: dict[str, object],
+    *,
+    expected_run_id: str,
+) -> tuple[str, datetime, ArtifactRef, list[tuple[ArtifactRef, ...]]]:
+    job_payload = payload["job"]
+    shard_payloads = payload.get("shards", ())
+    if not isinstance(shard_payloads, list):
+        shard_payloads = ()
+    job = JobSpec.model_validate(job_payload)
+    if job.logical_run_id != expected_run_id:
+        raise ValueError("logical_run_id mismatch")
+    shard_refs: list[tuple[ArtifactRef, ...]] = []
+    for shard_payload in shard_payloads:
+        shard = ShardSpec.model_validate(shard_payload)
+        if shard.logical_run_id != job.logical_run_id:
+            raise ValueError("shard logical_run_id mismatch")
+        shard_refs.append(shard.input_refs)
+    return job.logical_run_id, job.provenance.created_at, job.input_manifest_ref, shard_refs
+
+
+def _parse_closed_wave_shard_reachability(
+    shard_payload: object,
+    *,
+    expected_run_id: str,
+) -> tuple[ArtifactRef, ...]:
+    if not isinstance(shard_payload, dict):
+        raise TypeError("shard must be an object")
+    run_id = shard_payload.get("logical_run_id")
+    if not isinstance(run_id, str):
+        raise TypeError("logical_run_id required")
+    safe_file_component(run_id, "run_id")
+    if run_id != expected_run_id:
+        raise ValueError("shard logical_run_id mismatch")
+    input_refs_payload = shard_payload.get("input_refs")
+    if not isinstance(input_refs_payload, list):
+        raise TypeError("input_refs required")
+    refs: list[ArtifactRef] = []
+    for item in input_refs_payload:
+        refs.append(ArtifactRef.model_validate(item))
+    return tuple(refs)
+
+
 def _load_holds(state_root: Path, index: ReachabilityIndex) -> tuple[HoldRecord, ...]:
     records: list[HoldRecord] = []
     root = holds_dir(state_root)
@@ -149,33 +232,65 @@ def _scan_closed_waves(
             if not isinstance(payload, dict):
                 index.unknown_messages.append(f"closed wave invalid: {wave_path.name}")
                 continue
+            shard_payloads = payload.get("shards", ())
+            if not isinstance(shard_payloads, list):
+                shard_payloads = ()
+            validated: tuple[str, datetime, ArtifactRef, list[tuple[ArtifactRef, ...]]] | None = None
             try:
-                job = JobSpec.model_validate(payload["job"])
-            except (KeyError, ValueError, TypeError) as exc:
-                index.unknown_messages.append(f"closed wave job invalid: {wave_path.name}: {exc}")
-                continue
-            run_id = job.logical_run_id
-            when = _coerce_utc(job.provenance.created_at)
-            digest = job.input_manifest_ref.sha256
+                validated = _extract_validated_closed_wave_reachability(
+                    payload,
+                    expected_run_id=run_dir.name,
+                )
+            except (KeyError, ValueError, TypeError):
+                validated = None
+            if validated is not None:
+                run_id, job_created_at, input_manifest_ref, shard_input_refs_list = validated
+            else:
+                try:
+                    run_id, job_created_at, input_manifest_ref = _parse_closed_wave_job_reachability(
+                        payload["job"],
+                        expected_run_id=run_dir.name,
+                    )
+                except (KeyError, ValueError, TypeError) as exc:
+                    index.unknown_messages.append(
+                        f"closed wave job invalid: {wave_path.name}: {exc}"
+                    )
+                    continue
+                shard_input_refs_list = None
+            when = _closed_wave_observed_reference_time(wave_path, job_created_at)
+            digest = input_manifest_ref.sha256
             index.run_ids_by_digest[digest].add(run_id)
             _touch(index, digest, when)
             if run_id in live_run_ids:
                 index.protected_by_digest[digest].add(f"closed_wave_input:{run_id}")
-            for shard_payload in payload.get("shards", ()):
-                try:
-                    shard = ShardSpec.model_validate(shard_payload)
-                except (ValueError, TypeError) as exc:
-                    index.unknown_messages.append(
-                        f"closed wave shard invalid: {wave_path.name}: {exc}"
-                    )
-                    continue
-                for ref in shard.input_refs:
-                    index.run_ids_by_digest[ref.sha256].add(run_id)
-                    _touch(index, ref.sha256, when)
-                    if run_id in live_run_ids:
-                        index.protected_by_digest[ref.sha256].add(
-                            f"closed_wave_input:{run_id}"
+            if shard_input_refs_list is not None:
+                for shard_input_refs in shard_input_refs_list:
+                    for ref in shard_input_refs:
+                        index.run_ids_by_digest[ref.sha256].add(run_id)
+                        _touch(index, ref.sha256, when)
+                        if run_id in live_run_ids:
+                            index.protected_by_digest[ref.sha256].add(
+                                f"closed_wave_input:{run_id}"
+                            )
+            else:
+                for shard_payload in shard_payloads:
+                    try:
+                        shard_input_refs = _parse_closed_wave_shard_reachability(
+                            shard_payload,
+                            expected_run_id=run_id,
                         )
+                    except (ValueError, TypeError) as exc:
+                        index.unknown_messages.append(
+                            f"closed wave shard invalid: {wave_path.name}: {exc}"
+                        )
+                        continue
+                    for ref in shard_input_refs:
+                        index.run_ids_by_digest[ref.sha256].add(run_id)
+                        _touch(index, ref.sha256, when)
+                        if run_id in live_run_ids:
+                            index.protected_by_digest[ref.sha256].add(
+                                f"closed_wave_input:{run_id}"
+                            )
 
 
 def build_reachability_index(
