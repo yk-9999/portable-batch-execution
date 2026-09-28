@@ -6,6 +6,7 @@ import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Self
 
 from portable_batch_execution.lifecycle.paths import lifecycle_root, writer_lock_path
 
@@ -63,7 +64,7 @@ class LifecycleStateLock:
         finally:
             os.close(handle)
 
-    def __enter__(self) -> LifecycleStateLock:
+    def __enter__(self) -> Self:
         self.acquire()
         return self
 

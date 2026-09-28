@@ -1,4 +1,3 @@
-import base64
 import json
 import os
 from datetime import UTC, datetime, timedelta
@@ -19,20 +18,41 @@ from portable_batch_execution.broker.planning import (
     register_broker_private_run,
 )
 from portable_batch_execution.broker.service import UnixBrokerService
-from portable_batch_execution.broker.state import BrokerRequestState, BrokerRequestStore, RequestBinding
+from portable_batch_execution.broker.state import (
+    BrokerRequestState,
+    BrokerRequestStore,
+    RequestBinding,
+)
+from portable_batch_execution.contracts import (
+    ArtifactRef,
+    Provenance,
+    RunManifest,
+    ShardAttemptRecord,
+)
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
-from portable_batch_execution.lifecycle.delivery import DeliveryRecord, DeliveryRecordStore
-from portable_batch_execution.contracts import ArtifactRef, Provenance, RunManifest, ShardAttemptRecord
-from portable_batch_execution.lifecycle.deletion import DeletionIntentStore, DeletionReceiptStore
-from portable_batch_execution.lifecycle.gc import apply_gc, plan_gc
-from portable_batch_execution.lifecycle.holds import HoldStore, HoldRecord
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
+from portable_batch_execution.lifecycle.cli import main as lifecycle_cli_main
+from portable_batch_execution.lifecycle.deletion import (
+    DeletionIntentStore,
+    DeletionReceiptStore,
+)
+from portable_batch_execution.lifecycle.delivery import (
+    DeliveryRecord,
+    DeliveryRecordStore,
+)
+from portable_batch_execution.lifecycle.gc import apply_gc, plan_gc
+from portable_batch_execution.lifecycle.holds import HoldRecord, HoldStore
+from portable_batch_execution.lifecycle.lock import (
+    LifecycleLockError,
+    LifecycleStateLock,
+)
 from portable_batch_execution.lifecycle.paths import lifecycle_policy_path
 from portable_batch_execution.lifecycle.policy import LifecyclePolicy
-from portable_batch_execution.lifecycle.lock import LifecycleLockError, LifecycleStateLock
-from portable_batch_execution.lifecycle.cli import main as lifecycle_cli_main
-from portable_batch_execution.lifecycle.reachability import artifact_payload_path, build_reachability_index
+from portable_batch_execution.lifecycle.reachability import (
+    artifact_payload_path,
+    build_reachability_index,
+)
 from tests.unit.broker.test_unix_broker import (
     _UID,
     _append_success_attempt,
@@ -164,11 +184,10 @@ def test_durable_write_failure_does_not_record_delivery(tmp_path):
     with patch(
         "portable_batch_execution.broker.client.persist_verified_bytes",
         side_effect=OSError("disk full"),
-    ):
-        with pytest.raises(OSError):
-            client.execute_and_durably_persist(
-                _request(request_id=request_id), destination
-            )
+    ), pytest.raises(OSError):
+        client.execute_and_durably_persist(
+            _request(request_id=request_id), destination
+        )
     assert not DeliveryRecordStore(tmp_path).load(request_id)
     retry = service.handle_payload(_UID, _request(request_id=request_id))
     assert retry.status == "succeeded"
@@ -303,7 +322,7 @@ def test_succeeded_undelivered_broker_output_stays_protected(tmp_path):
 
 
 def test_legacy_gc_dry_run_review_json_includes_candidates_and_protected(tmp_path, capsys):
-    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    _write_policy(tmp_path, grace=0, legacy=0)
     digest = "sha256:" + "e" * 64
     path = artifact_payload_path(tmp_path, digest)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -811,7 +830,10 @@ def test_delivery_commit_conflicting_replay_fails(tmp_path):
 
 
 def test_delivery_save_acquires_lifecycle_lock(tmp_path):
-    from portable_batch_execution.lifecycle.delivery import DeliveryRecord, DeliveryRecordStore
+    from portable_batch_execution.lifecycle.delivery import (
+        DeliveryRecord,
+        DeliveryRecordStore,
+    )
 
     with patch.object(LifecycleStateLock, "acquire", autospec=True) as acquire:
         DeliveryRecordStore(tmp_path).save_new(

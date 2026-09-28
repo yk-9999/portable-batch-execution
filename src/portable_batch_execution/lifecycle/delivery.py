@@ -107,18 +107,17 @@ class DeliveryRecordStore:
     def save_new(self, record: DeliveryRecord) -> None:
         """Persist only if no record exists; conflicting payloads fail closed."""
         path = self._path(record.request_id)
-        with self._lock:
-            with lifecycle_state_lock(self._state_root):
-                if path.is_file():
-                    existing = DeliveryRecord.from_json(
-                        json.loads(path.read_text(encoding="utf-8"))
-                    )
-                    if self._transport_identity(existing) != self._transport_identity(
-                        record
-                    ):
-                        raise ValueError("delivery_commit_conflict")
-                    return
-                write_json_atomically(path, record.to_json())
+        with self._lock, lifecycle_state_lock(self._state_root):
+            if path.is_file():
+                existing = DeliveryRecord.from_json(
+                    json.loads(path.read_text(encoding="utf-8"))
+                )
+                if self._transport_identity(existing) != self._transport_identity(
+                    record
+                ):
+                    raise ValueError("delivery_commit_conflict")
+                return
+            write_json_atomically(path, record.to_json())
 
     def list_all(self) -> tuple[DeliveryRecord, ...]:
         records: list[DeliveryRecord] = []

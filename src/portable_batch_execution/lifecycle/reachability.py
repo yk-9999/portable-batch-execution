@@ -7,7 +7,6 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 from portable_batch_execution.broker.state import (
     BROKER_TERMINAL_REQUEST_STATUSES,
@@ -23,8 +22,12 @@ from portable_batch_execution.contracts import (
 )
 from portable_batch_execution.controller.closed_wave_registry import safe_file_component
 from portable_batch_execution.lifecycle.deletion import digest_hex
-from portable_batch_execution.lifecycle.delivery import DeliveryRecord, DeliveryRecordStore
-from portable_batch_execution.lifecycle.external_references import apply_policy_external_references
+from portable_batch_execution.lifecycle.delivery import (
+    DeliveryRecord,
+)
+from portable_batch_execution.lifecycle.external_references import (
+    apply_policy_external_references,
+)
 from portable_batch_execution.lifecycle.holds import HoldRecord
 from portable_batch_execution.lifecycle.paths import deliveries_dir, holds_dir
 from portable_batch_execution.lifecycle.policy import LifecyclePolicy

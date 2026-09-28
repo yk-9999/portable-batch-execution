@@ -10,7 +10,10 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
 
-from portable_batch_execution.lifecycle.durable import fsync_directory, write_json_atomically
+from portable_batch_execution.lifecycle.durable import (
+    fsync_directory,
+    write_json_atomically,
+)
 from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from portable_batch_execution.lifecycle.paths import holds_dir
 
@@ -69,19 +72,17 @@ class HoldStore:
 
     def put(self, record: HoldRecord) -> None:
         path = self._path(record.hold_id)
-        with self._lock:
-            with lifecycle_state_lock(self._state_root):
-                write_json_atomically(path, record.to_json())
+        with self._lock, lifecycle_state_lock(self._state_root):
+            write_json_atomically(path, record.to_json())
 
     def remove(self, hold_id: str) -> bool:
         path = self._path(hold_id)
-        with self._lock:
-            with lifecycle_state_lock(self._state_root):
-                if path.is_file():
-                    path.unlink()
-                    fsync_directory(self._root)
-                    return True
-                return False
+        with self._lock, lifecycle_state_lock(self._state_root):
+            if path.is_file():
+                path.unlink()
+                fsync_directory(self._root)
+                return True
+            return False
 
     def list_all(self) -> tuple[HoldRecord, ...]:
         records: list[HoldRecord] = []

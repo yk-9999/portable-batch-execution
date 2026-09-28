@@ -9,8 +9,14 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
 
-from portable_batch_execution.lifecycle.durable import fsync_directory, write_json_atomically
-from portable_batch_execution.lifecycle.paths import deletion_intents_dir, deletion_receipts_dir
+from portable_batch_execution.lifecycle.durable import (
+    fsync_directory,
+    write_json_atomically,
+)
+from portable_batch_execution.lifecycle.paths import (
+    deletion_intents_dir,
+    deletion_receipts_dir,
+)
 
 _RECEIPT_SCHEMA = "pbe.lifecycle.deletion-receipt.v1"
 _INTENT_SCHEMA = "pbe.lifecycle.deletion-intent.v1"

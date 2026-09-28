@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from portable_batch_execution.broker.protocol import (
+    _REQUEST_SCHEMA,
     BrokerDeliveryCommitRequest,
     BrokerDeliveryCommitResponse,
     BrokerExecuteResponse,
-    _REQUEST_SCHEMA,
 )
 from portable_batch_execution.lifecycle.durable import persist_verified_bytes
 

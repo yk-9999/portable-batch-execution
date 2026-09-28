@@ -200,11 +200,10 @@ class LocalFilesystemDataPlane:
 
     def append_attempt(self, record: ShardAttemptRecord) -> None:
         """Persist an immutable attempt record; duplicate IDs are rejected."""
-        with self._lock:
-            with lifecycle_state_lock(self.root):
-                if record.output_refs:
-                    self._validate_local_refs(record.output_refs)
-                self._append_attempt_unlocked(record)
+        with self._lock, lifecycle_state_lock(self.root):
+            if record.output_refs:
+                self._validate_local_refs(record.output_refs)
+            self._append_attempt_unlocked(record)
 
     def read_attempts(self, run_id: str) -> tuple[ShardAttemptRecord, ...]:
         run = self._run_directory(run_id)
@@ -268,6 +267,5 @@ class LocalFilesystemDataPlane:
         self, manifest: RunManifest, expected_revision: int
     ) -> RunManifest:
         """Compare-and-swap latest manifest and retain every immutable revision."""
-        with self._lock:
-            with lifecycle_state_lock(self.root):
-                return self._write_next_manifest_unlocked(manifest, expected_revision)
+        with self._lock, lifecycle_state_lock(self.root):
+            return self._write_next_manifest_unlocked(manifest, expected_revision)
