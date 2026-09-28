@@ -9,7 +9,6 @@ from pathlib import Path
 
 from portable_batch_execution.lifecycle.gc import apply_gc, plan_gc
 from portable_batch_execution.lifecycle.holds import HoldRecord, HoldStore
-from portable_batch_execution.lifecycle.lock import LifecycleStateLock, lifecycle_state_lock
 from portable_batch_execution.lifecycle.policy import (
     load_lifecycle_policy,
     validate_lifecycle_policy_file,
@@ -63,31 +62,28 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.command == "hold-add":
-        with lifecycle_state_lock(state_root):
-            HoldStore(state_root).put(
-                HoldRecord(
-                    hold_id=args.hold_id,
-                    kind=args.kind,
-                    artifact_digests=tuple(args.digest),
-                    reason=args.reason,
-                    created_at=datetime.now(UTC),
-                )
+        HoldStore(state_root).put(
+            HoldRecord(
+                hold_id=args.hold_id,
+                kind=args.kind,
+                artifact_digests=tuple(args.digest),
+                reason=args.reason,
+                created_at=datetime.now(UTC),
             )
+        )
         return 0
 
     if args.command == "hold-remove":
-        with lifecycle_state_lock(state_root):
-            removed = HoldStore(state_root).remove(args.hold_id)
+        removed = HoldStore(state_root).remove(args.hold_id)
         print(json.dumps({"removed": removed}))
         return 0
 
     if args.command in {"gc-dry-run", "gc-apply", "legacy-gc-dry-run", "legacy-gc-apply"}:
         mode = args.gc_mode
-        with LifecycleStateLock(state_root):
-            if args.apply:
-                report = apply_gc(state_root, policy, mode=mode)
-            else:
-                report = plan_gc(state_root, policy, mode=mode)
+        if args.apply:
+            report = apply_gc(state_root, policy, mode=mode)
+        else:
+            report = plan_gc(state_root, policy, mode=mode)
         print(json.dumps(report.to_dict(), indent=2))
         return 1 if report.blocked else 0
 

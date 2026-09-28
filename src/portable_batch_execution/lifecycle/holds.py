@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
 
+from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from portable_batch_execution.lifecycle.paths import holds_dir
 
 _HOLD_SCHEMA = "pbe.lifecycle.hold.v1"
@@ -56,6 +57,7 @@ class HoldRecord:
 
 class HoldStore:
     def __init__(self, state_root: Path):
+        self._state_root = state_root.resolve()
         self._root = holds_dir(state_root)
         self._root.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
@@ -67,17 +69,19 @@ class HoldStore:
     def put(self, record: HoldRecord) -> None:
         path = self._path(record.hold_id)
         with self._lock:
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(record.to_json()) + "\n", encoding="utf-8")
-            temporary.replace(path)
+            with lifecycle_state_lock(self._state_root):
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(record.to_json()) + "\n", encoding="utf-8")
+                temporary.replace(path)
 
     def remove(self, hold_id: str) -> bool:
         path = self._path(hold_id)
         with self._lock:
-            if path.is_file():
-                path.unlink()
-                return True
-            return False
+            with lifecycle_state_lock(self._state_root):
+                if path.is_file():
+                    path.unlink()
+                    return True
+                return False
 
     def list_all(self) -> tuple[HoldRecord, ...]:
         records: list[HoldRecord] = []

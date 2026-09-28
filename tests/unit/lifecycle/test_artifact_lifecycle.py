@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -24,8 +25,10 @@ from portable_batch_execution.lifecycle.delivery import DeliveryRecordStore
 from portable_batch_execution.lifecycle.deletion import DeletionReceiptStore
 from portable_batch_execution.lifecycle.gc import apply_gc, plan_gc
 from portable_batch_execution.lifecycle.holds import HoldStore, HoldRecord
+from portable_batch_execution.data_plane import LocalFilesystemDataPlane
 from portable_batch_execution.lifecycle.paths import lifecycle_policy_path
 from portable_batch_execution.lifecycle.policy import LifecyclePolicy
+from portable_batch_execution.lifecycle.lock import LifecycleStateLock
 from portable_batch_execution.lifecycle.reachability import artifact_payload_path, build_reachability_index
 from tests.unit.broker.test_unix_broker import (
     _UID,
@@ -46,11 +49,20 @@ def _local_service(tmp_path, config: BrokerConfig) -> UnixBrokerService:
 _PUBLIC_SHA = "ac3a69d2c818526b87f38c848d324221e2dc2775"
 
 
-def _write_policy(tmp_path: Path, *, grace: int = 0, legacy: int = 0) -> LifecyclePolicy:
+def _write_policy(
+    tmp_path: Path,
+    *,
+    grace: int = 0,
+    legacy: int = 0,
+    authoritative_reference_files: tuple[str, ...] = (),
+    authoritative_reference_roots: tuple[str, ...] = (),
+) -> LifecyclePolicy:
     policy = LifecyclePolicy(
         schema_version="pbe.lifecycle-policy.v1",
         delivery_grace_seconds=grace,
         legacy_retention_seconds=legacy,
+        authoritative_reference_files=authoritative_reference_files,
+        authoritative_reference_roots=authoritative_reference_roots,
     )
     lifecycle_policy_path(tmp_path).write_text(
         json.dumps(policy.to_json()) + "\n", encoding="utf-8"
@@ -281,6 +293,146 @@ def test_legacy_gc_dry_run_and_unknown_state(tmp_path):
     (run_dir / "latest.json").write_text("{not json", encoding="utf-8")
     blocked = plan_gc(tmp_path, policy, mode="legacy")
     assert blocked.blocked is True
+
+
+def test_external_reference_file_protects_payload(tmp_path):
+    digest = "sha256:" + "b" * 64
+    path = artifact_payload_path(tmp_path, digest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"config-bound")
+    config_path = tmp_path / "runtime-config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "static_input_bindings": [
+                    {
+                        "object_id": "b" * 64,
+                        "uri": path.as_uri(),
+                        "sha256": digest,
+                    }
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    policy = _write_policy(
+        tmp_path,
+        grace=0,
+        legacy=0,
+        authoritative_reference_files=(str(config_path),),
+    )
+    report = plan_gc(tmp_path, policy, mode="legacy", now=datetime.now(UTC) + timedelta(days=30))
+    assert digest in {item.digest for item in report.protected}
+    assert report.blocked is False
+
+
+def test_malformed_external_reference_blocks_apply(tmp_path):
+    digest = "sha256:" + "c" * 64
+    path = artifact_payload_path(tmp_path, digest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"orphan")
+    config_path = tmp_path / "broken-config.json"
+    config_path.write_text("{not-json", encoding="utf-8")
+    policy = _write_policy(
+        tmp_path,
+        grace=0,
+        legacy=0,
+        authoritative_reference_files=(str(config_path),),
+    )
+    report = plan_gc(tmp_path, policy, mode="normal")
+    assert report.blocked is True
+    apply_report = apply_gc(tmp_path, policy, mode="normal")
+    assert apply_report.blocked is True
+    assert path.is_file()
+
+
+def test_legacy_gc_retains_old_payload_with_recent_broker_ref(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=3600)
+    output = b"legacy-retained"
+    _succeed_broker(service, "req-legacy", output)
+    digest = f"sha256:{sha256(output).hexdigest()}"
+    store = BrokerRequestStore(service.state_root / "controller")
+    state = store.load("req-legacy")
+    assert state is not None
+    state.status = "exhausted"
+    store.save(state)
+    payload_path = artifact_payload_path(tmp_path, digest)
+    old = datetime.now(UTC) - timedelta(days=30)
+    os.utime(payload_path, (old.timestamp(), old.timestamp()))
+    now = datetime.now(UTC)
+    report = plan_gc(tmp_path, policy, mode="legacy", now=now)
+    assert digest in {item.digest for item in report.protected}
+
+
+def test_normal_gc_waits_for_all_transport_refs_on_shared_digest(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    output = b"shared-output"
+    _succeed_broker(service, "req-shared-a", output)
+    _succeed_broker(service, "req-shared-b", output)
+    digest = f"sha256:{sha256(output).hexdigest()}"
+    _delivery_commit(service, "req-shared-a", digest, len(output))
+    store = BrokerRequestStore(service.state_root / "controller")
+    for request_id in ("req-shared-a", "req-shared-b"):
+        state = store.load(request_id)
+        assert state is not None
+        state.status = "exhausted"
+        store.save(state)
+    report = plan_gc(tmp_path, policy, mode="normal", now=datetime.now(UTC))
+    assert digest in {item.digest for item in report.protected}
+    apply_report = apply_gc(tmp_path, policy, mode="normal")
+    assert artifact_payload_path(tmp_path, digest).is_file()
+    assert apply_report.deleted == ()
+
+
+def test_apply_gc_refuses_deletion_when_authoritative_state_unreadable(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    output = b"blocked-delete"
+    _succeed_broker(service, "req-blocked", output)
+    digest = f"sha256:{sha256(output).hexdigest()}"
+    _delivery_commit(service, "req-blocked", digest, len(output))
+    store = BrokerRequestStore(service.state_root / "controller")
+    state = store.load("req-blocked")
+    assert state is not None
+    state.status = "exhausted"
+    store.save(state)
+    run_dir = tmp_path / "runs" / state.logical_run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "latest.json").write_text("{broken", encoding="utf-8")
+    apply_report = apply_gc(tmp_path, policy, mode="normal")
+    assert apply_report.blocked is True
+    assert artifact_payload_path(tmp_path, digest).is_file()
+
+
+def test_local_data_plane_write_acquires_lifecycle_lock(tmp_path):
+    with patch.object(LifecycleStateLock, "acquire", autospec=True) as acquire:
+        LocalFilesystemDataPlane(tmp_path).write(b"new-artifact", "application/octet-stream")
+    acquire.assert_called_once()
+
+
+def test_delivery_save_acquires_lifecycle_lock(tmp_path):
+    from portable_batch_execution.lifecycle.delivery import DeliveryRecord, DeliveryRecordStore
+
+    with patch.object(LifecycleStateLock, "acquire", autospec=True) as acquire:
+        DeliveryRecordStore(tmp_path).save_new(
+            DeliveryRecord(
+                request_id="req-lock",
+                logical_run_id="run-lock",
+                artifact_digest="sha256:" + "d" * 64,
+                artifact_size_bytes=1,
+                producer_uid=None,
+                consumer_uid=1,
+                created_at=None,
+                delivered_at=datetime.now(UTC),
+            )
+        )
+    acquire.assert_called_once()
 
 
 def test_broker_success_includes_output_size_bytes(tmp_path):

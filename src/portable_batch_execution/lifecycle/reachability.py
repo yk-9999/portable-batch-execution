@@ -5,15 +5,25 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from portable_batch_execution.broker.state import BrokerRequestState, BrokerRequestStore
-from portable_batch_execution.contracts import ArtifactRef, RunManifest, ShardAttemptRecord
+from portable_batch_execution.broker.state import BrokerRequestState
+from portable_batch_execution.contracts import (
+    ArtifactRef,
+    JobSpec,
+    RunManifest,
+    ShardAttemptRecord,
+    ShardSpec,
+)
 from portable_batch_execution.controller.closed_wave_registry import safe_file_component
 from portable_batch_execution.lifecycle.deletion import digest_hex
-from portable_batch_execution.lifecycle.delivery import DeliveryRecordStore
-from portable_batch_execution.lifecycle.holds import HoldStore
+from portable_batch_execution.lifecycle.delivery import DeliveryRecord, DeliveryRecordStore
+from portable_batch_execution.lifecycle.external_references import apply_policy_external_references
+from portable_batch_execution.lifecycle.holds import HoldRecord
+from portable_batch_execution.lifecycle.paths import deliveries_dir, holds_dir
+from portable_batch_execution.lifecycle.policy import LifecyclePolicy
 
 _TERMINAL_MANIFEST = frozenset({"succeeded", "failed", "cancelled"})
 _BROKER_LIVE = frozenset({"active", "succeeded"})
@@ -26,6 +36,7 @@ class ReachabilityIndex:
     unknown_messages: list[str] = field(default_factory=list)
     broker_outputs: dict[str, str] = field(default_factory=dict)
     run_ids_by_digest: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
+    digest_last_reference_at: dict[str, datetime] = field(default_factory=dict)
 
     def is_protected(self, digest: str) -> bool:
         if digest in self.unknown_digests:
@@ -34,6 +45,21 @@ class ReachabilityIndex:
 
     def protection_reasons(self, digest: str) -> set[str]:
         return set(self.protected_by_digest.get(digest, ()))
+
+
+def _coerce_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
+
+
+def _touch(index: ReachabilityIndex, digest: str, when: datetime | None) -> None:
+    if when is None:
+        return
+    when = _coerce_utc(when)
+    previous = index.digest_last_reference_at.get(digest)
+    if previous is None or when > previous:
+        index.digest_last_reference_at[digest] = when
 
 
 def _artifact_digests_from_refs(refs: tuple[ArtifactRef, ...]) -> set[str]:
@@ -60,18 +86,96 @@ def _load_manifest(path: Path) -> RunManifest | None:
         raise ValueError(f"unreadable manifest: {path}") from exc
 
 
-def build_reachability_index(state_root: Path) -> ReachabilityIndex:
+def _load_deliveries(state_root: Path, index: ReachabilityIndex) -> tuple[DeliveryRecord, ...]:
+    records: list[DeliveryRecord] = []
+    root = deliveries_dir(state_root)
+    if not root.is_dir():
+        return ()
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise TypeError("invalid delivery record")
+            records.append(DeliveryRecord.from_json(payload))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            index.unknown_messages.append(f"delivery record unreadable: {path.name}: {exc}")
+    return tuple(records)
+
+
+def _load_holds(state_root: Path, index: ReachabilityIndex) -> tuple[HoldRecord, ...]:
+    records: list[HoldRecord] = []
+    root = holds_dir(state_root)
+    if not root.is_dir():
+        return ()
+    for path in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise TypeError("invalid hold record")
+            records.append(HoldRecord.from_json(payload))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            index.unknown_messages.append(f"hold record unreadable: {path.name}: {exc}")
+    return tuple(records)
+
+
+def _scan_closed_waves(controller_root: Path, index: ReachabilityIndex) -> None:
+    waves_root = controller_root / "closed_waves"
+    if not waves_root.is_dir():
+        return
+    for run_dir in sorted(waves_root.iterdir()):
+        if not run_dir.is_dir():
+            continue
+        try:
+            safe_file_component(run_dir.name, "run_id")
+        except ValueError:
+            index.unknown_messages.append(f"invalid closed wave run directory: {run_dir.name}")
+            continue
+        for wave_path in sorted(run_dir.glob("*.wave.json")):
+            try:
+                payload = json.loads(wave_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                index.unknown_messages.append(f"closed wave unreadable: {wave_path.name}: {exc}")
+                continue
+            if not isinstance(payload, dict):
+                index.unknown_messages.append(f"closed wave invalid: {wave_path.name}")
+                continue
+            try:
+                job = JobSpec.model_validate(payload["job"])
+            except (KeyError, ValueError, TypeError) as exc:
+                index.unknown_messages.append(f"closed wave job invalid: {wave_path.name}: {exc}")
+                continue
+            run_id = job.logical_run_id
+            when = _coerce_utc(job.provenance.created_at)
+            digest = job.input_manifest_ref.sha256
+            index.run_ids_by_digest[digest].add(run_id)
+            _touch(index, digest, when)
+            for shard_payload in payload.get("shards", ()):
+                try:
+                    shard = ShardSpec.model_validate(shard_payload)
+                except (ValueError, TypeError) as exc:
+                    index.unknown_messages.append(
+                        f"closed wave shard invalid: {wave_path.name}: {exc}"
+                    )
+                    continue
+                for ref in shard.input_refs:
+                    index.run_ids_by_digest[ref.sha256].add(run_id)
+                    _touch(index, ref.sha256, when)
+
+
+def build_reachability_index(
+    state_root: Path,
+    policy: LifecyclePolicy | None = None,
+) -> ReachabilityIndex:
     state_root = state_root.resolve()
     index = ReachabilityIndex()
     controller_root = state_root / "controller"
-    delivery_store = DeliveryRecordStore(state_root)
-    hold_store = HoldStore(state_root)
 
     broker_terminal_by_run: dict[str, str] = {}
     for path in sorted((controller_root / "broker" / "requests").glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             state = BrokerRequestState.from_json(payload)
+            state_mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             index.unknown_messages.append(f"broker request state unreadable: {path.name}: {exc}")
             continue
@@ -84,12 +188,17 @@ def build_reachability_index(state_root: Path) -> ReachabilityIndex:
                 index.protected_by_digest[digest].add(f"broker_request:{state.request_id}")
                 index.broker_outputs[state.request_id] = digest
                 index.run_ids_by_digest[digest].add(state.logical_run_id)
+                _touch(index, digest, state_mtime)
         if state.status in {"succeeded", "exhausted", "failed"}:
             broker_terminal_by_run[state.logical_run_id] = state.status
+        if state.output_sha256 and state.status in {"succeeded", "exhausted"}:
+            _touch(index, state.output_sha256, state_mtime)
+            index.run_ids_by_digest[state.output_sha256].add(state.logical_run_id)
 
-    for record in hold_store.list_all():
+    for record in _load_holds(state_root, index):
         for digest in record.artifact_digests:
             index.protected_by_digest[digest].add(f"hold:{record.hold_id}")
+            _touch(index, digest, record.created_at)
 
     runs_root = state_root / "runs"
     if runs_root.is_dir():
@@ -118,9 +227,14 @@ def build_reachability_index(state_root: Path) -> ReachabilityIndex:
                     index.protected_by_digest.setdefault("__run__", set()).add(
                         f"manifest:{run_id}:{manifest.status}"
                     )
+                manifest_when = max(
+                    _coerce_utc(manifest.updated_at),
+                    _coerce_utc(manifest.created_at),
+                )
                 for ref in manifest.final_output_refs:
                     index.protected_by_digest[ref.sha256].add(f"manifest_final:{run_id}")
                     index.run_ids_by_digest[ref.sha256].add(run_id)
+                    _touch(index, ref.sha256, manifest_when)
             attempts_dir = run_dir / "attempts"
             if attempts_dir.is_dir():
                 for attempt_path in sorted(attempts_dir.glob("*.json")):
@@ -131,8 +245,13 @@ def build_reachability_index(state_root: Path) -> ReachabilityIndex:
                         continue
                     if attempt is None:
                         continue
+                    attempt_when = max(
+                        _coerce_utc(attempt.finished_at),
+                        _coerce_utc(attempt.started_at),
+                    )
                     for digest in _attempt_refs(attempt):
                         index.run_ids_by_digest[digest].add(run_id)
+                        _touch(index, digest, attempt_when)
                         if (
                             manifest is not None
                             and manifest.status not in _TERMINAL_MANIFEST
@@ -142,8 +261,14 @@ def build_reachability_index(state_root: Path) -> ReachabilityIndex:
                                 f"attempt:{attempt.attempt_id}"
                             )
 
-    for record in delivery_store.list_all():
+    for record in _load_deliveries(state_root, index):
         index.run_ids_by_digest[record.artifact_digest].add(record.logical_run_id)
+        _touch(index, record.artifact_digest, record.delivered_at)
+
+    _scan_closed_waves(controller_root, index)
+
+    if policy is not None:
+        apply_policy_external_references(index, policy)
 
     return index
 

@@ -16,6 +16,7 @@ from portable_batch_execution.lifecycle.delivery import DeliveryRecordStore
 from portable_batch_execution.lifecycle.paths import artifacts_dir
 from portable_batch_execution.lifecycle.policy import LifecyclePolicy
 from portable_batch_execution.broker.state import BrokerRequestState
+from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from portable_batch_execution.lifecycle.reachability import (
     ReachabilityIndex,
     artifact_payload_path,
@@ -81,9 +82,11 @@ class _SweepState:
 
 
 def _policy_identity(policy: LifecyclePolicy) -> str:
+    files = ",".join(policy.authoritative_reference_files)
+    roots = ",".join(policy.authoritative_reference_roots)
     return (
         f"{policy.schema_version}:grace={policy.delivery_grace_seconds}:"
-        f"legacy={policy.legacy_retention_seconds}"
+        f"legacy={policy.legacy_retention_seconds}:refs={files}:roots={roots}"
     )
 
 
@@ -96,7 +99,7 @@ def plan_gc(
 ) -> GcReport:
     state_root = state_root.resolve()
     now = now or datetime.now(UTC)
-    index = build_reachability_index(state_root)
+    index = build_reachability_index(state_root, policy)
     delivery_store = DeliveryRecordStore(state_root)
     deliveries = delivery_store.list_all()
     delivery_by_request = {item.request_id: item for item in deliveries}
@@ -197,12 +200,53 @@ def apply_gc(
     receipt_store = DeletionReceiptStore(state_root)
     delivery_store = DeliveryRecordStore(state_root)
     deleted: list[GcCandidate] = []
-    for candidate in report.candidates:
+    with lifecycle_state_lock(state_root):
+        deleted.extend(
+            _apply_gc_candidates(
+                state_root,
+                policy,
+                mode=mode,
+                now=now,
+                candidates=report.candidates,
+                receipt_store=receipt_store,
+                delivery_store=delivery_store,
+                crash_after_unlink=crash_after_unlink,
+            )
+        )
+        deleted.extend(
+            _converge_receipts_for_missing_payloads(
+                state_root,
+                policy,
+                mode=mode,
+                now=now,
+                receipt_store=receipt_store,
+                delivery_store=delivery_store,
+            )
+        )
+    report.deleted = tuple(deleted)
+    return report
+
+
+def _apply_gc_candidates(
+    state_root: Path,
+    policy: LifecyclePolicy,
+    *,
+    mode: GcMode,
+    now: datetime,
+    candidates: tuple[GcCandidate, ...],
+    receipt_store: DeletionReceiptStore,
+    delivery_store: DeliveryRecordStore,
+    crash_after_unlink: set[str] | None,
+) -> list[GcCandidate]:
+    deleted: list[GcCandidate] = []
+    for candidate in candidates:
         digest = candidate.digest
         if receipt_store.load(digest) is not None:
             continue
-        fresh = build_reachability_index(state_root)
+        fresh = build_reachability_index(state_root, policy)
         if fresh.is_protected(digest) or digest in fresh.unknown_digests:
+            continue
+        if fresh.unknown_messages:
             continue
         path = artifact_payload_path(state_root, digest)
         if not path.is_file():
@@ -233,18 +277,7 @@ def apply_gc(
         )
         receipt_store.save(receipt)
         deleted.append(candidate)
-    deleted.extend(
-        _converge_receipts_for_missing_payloads(
-            state_root,
-            policy,
-            mode=mode,
-            now=now,
-            receipt_store=receipt_store,
-            delivery_store=delivery_store,
-        )
-    )
-    report.deleted = tuple(deleted)
-    return report
+    return deleted
 
 
 def _converge_receipts_for_missing_payloads(
@@ -259,7 +292,7 @@ def _converge_receipts_for_missing_payloads(
     converged: list[GcCandidate] = []
     sweep = _SweepState(
         state_root=state_root,
-        index=build_reachability_index(state_root),
+        index=build_reachability_index(state_root, policy),
         delivery_by_request={item.request_id: item for item in delivery_store.list_all()},
         policy=policy,
         now=now,
@@ -306,7 +339,7 @@ def _receipt_for_digest(
     now: datetime,
     delivery_store: DeliveryRecordStore,
 ) -> DeletionReceipt:
-    index = build_reachability_index(state_root)
+    index = build_reachability_index(state_root, policy)
     run_ids = tuple(sorted(index.run_ids_by_digest.get(digest, ())))
     delivery = next(
         (item for item in delivery_store.list_all() if item.artifact_digest == digest),
@@ -384,6 +417,16 @@ def _normal_protection_reasons(
     return tuple(reasons) or ("not_eligible",)
 
 
+def _legacy_effective_last_use(sweep: _SweepState, digest: str, path: Path) -> datetime:
+    mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+    referenced = sweep.index.digest_last_reference_at.get(digest)
+    if referenced is None:
+        return mtime
+    if referenced.tzinfo is None:
+        referenced = referenced.replace(tzinfo=UTC)
+    return max(mtime, referenced)
+
+
 def _legacy_eligible(
     state_root: Path, sweep: _SweepState, digest: str, path: Path
 ) -> bool:
@@ -392,8 +435,8 @@ def _legacy_eligible(
         if request_id in sweep.delivery_by_request:
             return False
     retention = timedelta(seconds=sweep.policy.legacy_retention_seconds)
-    mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-    return sweep.now >= mtime + retention
+    last_use = _legacy_effective_last_use(sweep, digest, path)
+    return sweep.now >= last_use + retention
 
 
 def _legacy_protection_reasons(
@@ -405,7 +448,7 @@ def _legacy_protection_reasons(
         if request_id in sweep.delivery_by_request:
             reasons.append(f"has_delivery_record:{request_id}")
     retention = timedelta(seconds=sweep.policy.legacy_retention_seconds)
-    mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-    if sweep.now < mtime + retention:
+    last_use = _legacy_effective_last_use(sweep, digest, path)
+    if sweep.now < last_use + retention:
         reasons.append("legacy_retention_pending")
     return tuple(reasons) or ("not_eligible",)

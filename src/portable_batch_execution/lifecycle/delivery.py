@@ -10,6 +10,7 @@ from threading import RLock
 from typing import Any
 
 from portable_batch_execution.broker.config import opaque_request_id
+from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from portable_batch_execution.lifecycle.paths import deliveries_dir
 
 _DELIVERY_SCHEMA = "pbe.lifecycle.delivery-record.v1"
@@ -69,6 +70,7 @@ class DeliveryRecord:
 
 class DeliveryRecordStore:
     def __init__(self, state_root: Path):
+        self._state_root = state_root.resolve()
         self._root = deliveries_dir(state_root)
         self._root.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
@@ -89,16 +91,17 @@ class DeliveryRecordStore:
         """Persist only if no record exists; conflicting payloads fail closed."""
         path = self._path(record.request_id)
         with self._lock:
-            if path.is_file():
-                existing = DeliveryRecord.from_json(
-                    json.loads(path.read_text(encoding="utf-8"))
-                )
-                if existing.to_json() != record.to_json():
-                    raise ValueError("delivery_commit_conflict")
-                return
-            temporary = path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(record.to_json()) + "\n", encoding="utf-8")
-            temporary.replace(path)
+            with lifecycle_state_lock(self._state_root):
+                if path.is_file():
+                    existing = DeliveryRecord.from_json(
+                        json.loads(path.read_text(encoding="utf-8"))
+                    )
+                    if existing.to_json() != record.to_json():
+                        raise ValueError("delivery_commit_conflict")
+                    return
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(record.to_json()) + "\n", encoding="utf-8")
+                temporary.replace(path)
 
     def list_all(self) -> tuple[DeliveryRecord, ...]:
         records: list[DeliveryRecord] = []

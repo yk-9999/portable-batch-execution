@@ -13,6 +13,7 @@ from portable_batch_execution.contracts import (
     ShardAttemptRecord,
 )
 from portable_batch_execution.controller.closed_wave_registry import safe_file_component
+from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 
 from .base import ArtifactContentStream, RevisionConflictError
 
@@ -42,9 +43,11 @@ class LocalFilesystemDataPlane:
         p = self._artifacts / digest
         with self._lock:
             if not p.exists():
-                temp = p.with_suffix(".tmp")
-                temp.write_bytes(data)
-                temp.replace(p)
+                with lifecycle_state_lock(self.root):
+                    if not p.exists():
+                        temp = p.with_suffix(".tmp")
+                        temp.write_bytes(data)
+                        temp.replace(p)
         return ArtifactRef(
             object_id=digest,
             uri=p.as_uri(),
