@@ -43,6 +43,9 @@ class ReachabilityIndex:
     unknown_digests: set[str] = field(default_factory=set)
     unknown_messages: list[str] = field(default_factory=list)
     broker_outputs: dict[str, str] = field(default_factory=dict)
+    broker_transport_request_ids_by_digest: dict[str, set[str]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
     run_ids_by_digest: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     digest_last_reference_at: dict[str, datetime] = field(default_factory=dict)
 
@@ -293,6 +296,13 @@ def _scan_closed_waves(
                             )
 
 
+def _load_broker_request_state(path: Path) -> BrokerRequestState:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError("invalid broker request state")
+    return BrokerRequestState.from_json(payload)
+
+
 def build_reachability_index(
     state_root: Path,
     policy: LifecyclePolicy | None = None,
@@ -312,8 +322,7 @@ def build_reachability_index(
     broker_runs: set[str] = set()
     for path in sorted((controller_root / "broker" / "requests").glob("*.json")):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            state = BrokerRequestState.from_json(payload)
+            state = _load_broker_request_state(path)
             state_mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             index.unknown_messages.append(f"broker request state unreadable: {path.name}: {exc}")
@@ -331,6 +340,7 @@ def build_reachability_index(
         if state.output_sha256 and state.status in BROKER_TRANSPORT_OUTPUT_STATUSES:
             digest = state.output_sha256
             index.broker_outputs[state.request_id] = digest
+            index.broker_transport_request_ids_by_digest[digest].add(state.request_id)
             index.run_ids_by_digest[digest].add(state.logical_run_id)
             _touch(index, digest, state_mtime)
             if (

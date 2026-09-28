@@ -1,5 +1,8 @@
 import json
 import os
+import subprocess
+import sys
+import threading
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -38,6 +41,7 @@ from portable_batch_execution.contracts import (
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
+from portable_batch_execution.lifecycle import gc as lifecycle_gc_module
 from portable_batch_execution.lifecycle.cli import main as lifecycle_cli_main
 from portable_batch_execution.lifecycle.deletion import (
     DeletionIntentStore,
@@ -56,6 +60,7 @@ from portable_batch_execution.lifecycle.lock import (
 from portable_batch_execution.lifecycle.paths import lifecycle_policy_path
 from portable_batch_execution.lifecycle.policy import LifecyclePolicy
 from portable_batch_execution.lifecycle.reachability import (
+    _load_broker_request_state,
     artifact_payload_path,
     build_reachability_index,
 )
@@ -1208,3 +1213,176 @@ def test_broker_success_includes_output_size_bytes(tmp_path):
     assert response.output_size_bytes == len(output)
     payload = json.loads(response.model_dump_json())
     assert "output_size_bytes" in payload
+
+
+def test_plan_gc_loads_each_broker_request_once_not_per_artifact(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    broker_request_count = 3
+    for index in range(broker_request_count):
+        output = f"bounded-plan-out-{index}".encode()
+        request_id = f"req-plan-bounded-{index}"
+        _succeed_broker(service, request_id, output)
+        digest = f"sha256:{sha256(output).hexdigest()}"
+        _delivery_commit(service, request_id, digest, len(output))
+    artifacts_root = artifact_payload_path(tmp_path, "sha256:" + "0" * 64).parent
+    for index in range(15):
+        filler = artifacts_root / f"{index:064x}"
+        filler.write_bytes(b"filler")
+    loads = 0
+    original_load = _load_broker_request_state
+
+    def counting_load(path: Path):
+        nonlocal loads
+        loads += 1
+        return original_load(path)
+
+    with patch(
+        "portable_batch_execution.lifecycle.reachability._load_broker_request_state",
+        side_effect=counting_load,
+    ):
+        plan_gc(tmp_path, policy, mode="normal", now=datetime.now(UTC))
+    assert loads == broker_request_count
+
+
+def test_apply_gc_reachability_index_builds_bounded_with_many_candidates(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    candidate_count = 6
+    for index in range(candidate_count):
+        output = f"bounded-apply-out-{index}".encode()
+        request_id = f"req-apply-bounded-{index}"
+        _succeed_broker(service, request_id, output)
+        digest = f"sha256:{sha256(output).hexdigest()}"
+        _delivery_commit(service, request_id, digest, len(output))
+    builds = 0
+    original_build = build_reachability_index
+
+    def counting_build(*args, **kwargs):
+        nonlocal builds
+        builds += 1
+        return original_build(*args, **kwargs)
+
+    with patch(
+        "portable_batch_execution.lifecycle.gc.build_reachability_index",
+        side_effect=counting_build,
+    ):
+        report = apply_gc(tmp_path, policy, mode="normal", now=datetime.now(UTC))
+    assert len(report.deleted) == candidate_count
+    assert builds == 2
+
+
+def test_apply_gc_finalizes_stale_intent_when_digest_becomes_protected(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    output = b"stale-intent-output"
+    _succeed_broker(service, "req-stale-intent", output)
+    digest = f"sha256:{sha256(output).hexdigest()}"
+    _delivery_commit(service, "req-stale-intent", digest, len(output))
+    path = artifact_payload_path(tmp_path, digest)
+    intent = lifecycle_gc_module._deletion_intent_for_digest(
+        lifecycle_gc_module._build_sweep_state(
+            tmp_path, policy, mode="normal", now=datetime.now(UTC)
+        )[1],
+        digest,
+        path.stat().st_size,
+        now=datetime.now(UTC),
+        delivery_store=DeliveryRecordStore(tmp_path),
+        path=path,
+    )
+    DeletionIntentStore(tmp_path).save(intent)
+    HoldStore(tmp_path).put(
+        HoldRecord(
+            hold_id="hold-stale-intent",
+            kind="hold",
+            artifact_digests=(digest,),
+            reason="reactivated",
+            created_at=datetime.now(UTC),
+        )
+    )
+    apply_gc(tmp_path, policy, mode="normal", now=datetime.now(UTC))
+    assert path.is_file()
+    assert DeletionIntentStore(tmp_path).load(digest) is None
+    assert DeletionReceiptStore(tmp_path).load(digest) is None
+
+
+def test_broker_request_save_blocks_while_gc_apply_holds_lifecycle_lock(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    output = b"lock-during-apply"
+    _succeed_broker(service, "req-lock-during-apply", output)
+    digest = f"sha256:{sha256(output).hexdigest()}"
+    _delivery_commit(service, "req-lock-during-apply", digest, len(output))
+    store = BrokerRequestStore(service.state_root / "controller")
+    state = store.load("req-lock-during-apply")
+    assert state is not None
+    started_apply = threading.Event()
+    outcomes: list[str] = []
+    original_apply_candidates = lifecycle_gc_module._apply_gc_candidates
+
+    def apply_candidates_with_gate(*args, **kwargs):
+        started_apply.set()
+        return original_apply_candidates(*args, **kwargs)
+
+    def try_save():
+        assert started_apply.wait(timeout=10)
+        try:
+            store.save(state)
+            outcomes.append("saved")
+        except LifecycleLockError:
+            outcomes.append("blocked")
+
+    with patch.object(
+        lifecycle_gc_module, "_apply_gc_candidates", apply_candidates_with_gate
+    ):
+        thread = threading.Thread(target=try_save)
+        thread.start()
+        apply_gc(tmp_path, policy, mode="normal", now=datetime.now(UTC))
+        thread.join(timeout=10)
+    assert outcomes == ["blocked"]
+
+
+def test_broker_request_save_acquires_lifecycle_lock(tmp_path):
+    store = BrokerRequestStore(tmp_path / "controller")
+    state = BrokerRequestState(
+        request_id="req-broker-lock",
+        binding=RequestBinding(
+            input_digest="sha256:" + "1" * 64,
+            pack="tabular-batch",
+            operation="tabular.sort",
+            operation_params={"by": [{"column": "id"}]},
+            execution_fingerprint="fp",
+            public_sha=_PUBLIC_SHA,
+        ),
+        logical_run_id="run-broker-lock",
+        wave_id="wave-broker-lock",
+        shard_id="shard-000000",
+        status="active",
+    )
+    with patch.object(LifecycleStateLock, "acquire", autospec=True) as acquire:
+        store.save(state)
+    acquire.assert_called_once()
+
+
+def test_lifecycle_cli_module_entrypoint_invokes_main(tmp_path):
+    policy_path = lifecycle_policy_path(tmp_path)
+    _write_policy(tmp_path)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "portable_batch_execution.lifecycle.cli",
+            "validate-policy",
+            "--policy-file",
+            str(policy_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert json.loads(result.stdout)["schema_version"] == "pbe.lifecycle-policy.v1"

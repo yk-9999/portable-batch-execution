@@ -9,6 +9,7 @@ from threading import RLock
 from typing import Any
 
 from portable_batch_execution.broker.config import opaque_request_id
+from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 
 _STATE_SCHEMA = "pbe.a1-unix-broker.request-state.v1"
 
@@ -116,7 +117,9 @@ class BrokerRequestState:
 
 class BrokerRequestStore:
     def __init__(self, controller_root: Path):
-        self._root = controller_root.resolve() / "broker" / "requests"
+        controller_root = controller_root.resolve()
+        self._state_root = controller_root.parent
+        self._root = controller_root / "broker" / "requests"
         self._root.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
 
@@ -133,9 +136,19 @@ class BrokerRequestStore:
             raise TypeError("invalid broker request state")
         return BrokerRequestState.from_json(payload)
 
-    def save(self, state: BrokerRequestState) -> None:
+    def save(
+        self, state: BrokerRequestState, *, lifecycle_lock_held: bool = False
+    ) -> None:
         path = self._path(state.request_id)
         temporary = path.with_suffix(".tmp")
-        with self._lock:
-            temporary.write_text(json.dumps(state.to_json()) + "\n", encoding="utf-8")
-            temporary.replace(path)
+
+        def _write() -> None:
+            with self._lock:
+                temporary.write_text(json.dumps(state.to_json()) + "\n", encoding="utf-8")
+                temporary.replace(path)
+
+        if lifecycle_lock_held:
+            _write()
+            return
+        with lifecycle_state_lock(self._state_root):
+            _write()

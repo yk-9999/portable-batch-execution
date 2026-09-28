@@ -7,7 +7,6 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from portable_batch_execution.lifecycle.gc import apply_gc, plan_gc
 from portable_batch_execution.lifecycle.holds import HoldRecord, HoldStore
 from portable_batch_execution.lifecycle.policy import (
     load_lifecycle_policy,
@@ -79,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command in {"gc-dry-run", "gc-apply", "legacy-gc-dry-run", "legacy-gc-apply"}:
+        from portable_batch_execution.lifecycle.gc import apply_gc, plan_gc
+
         mode = args.gc_mode
         if args.apply:
             report = apply_gc(state_root, policy, mode=mode)
@@ -88,3 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if report.blocked else 0
 
     raise AssertionError(f"unknown command {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
