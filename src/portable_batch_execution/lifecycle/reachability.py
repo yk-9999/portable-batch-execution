@@ -180,6 +180,7 @@ def build_reachability_index(
         _touch(index, record.artifact_digest, record.delivered_at)
 
     broker_terminal_by_run: dict[str, str] = {}
+    broker_runs: set[str] = set()
     for path in sorted((controller_root / "broker" / "requests").glob("*.json")):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
@@ -188,10 +189,15 @@ def build_reachability_index(
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             index.unknown_messages.append(f"broker request state unreadable: {path.name}: {exc}")
             continue
-        if state.status == "active":
+        broker_runs.add(state.logical_run_id)
+        if state.status not in BROKER_TERMINAL_REQUEST_STATUSES:
             index.protected_by_digest.setdefault("__broker_request__", set()).add(
                 f"broker:{state.request_id}:{state.status}"
             )
+            if state.output_sha256:
+                index.protected_by_digest[state.output_sha256].add(
+                    f"broker_request:{state.request_id}"
+                )
         if state.output_sha256 and state.status in BROKER_TRANSPORT_OUTPUT_STATUSES:
             digest = state.output_sha256
             index.broker_outputs[state.request_id] = digest
@@ -247,10 +253,24 @@ def build_reachability_index(
                     _coerce_utc(manifest.updated_at),
                     _coerce_utc(manifest.created_at),
                 )
+                terminal_manifest = manifest.status in _TERMINAL_MANIFEST
+                broker_terminal = (
+                    broker_status in BROKER_TERMINAL_REQUEST_STATUSES
+                    if broker_status is not None
+                    else False
+                )
+                broker_owned = run_id in broker_runs
                 for ref in manifest.final_output_refs:
-                    index.protected_by_digest[ref.sha256].add(f"manifest_final:{run_id}")
                     index.run_ids_by_digest[ref.sha256].add(run_id)
                     _touch(index, ref.sha256, manifest_when)
+                    if not (
+                        broker_owned
+                        and terminal_manifest
+                        and broker_terminal
+                    ):
+                        index.protected_by_digest[ref.sha256].add(
+                            f"manifest_final:{run_id}"
+                        )
             attempts_dir = run_dir / "attempts"
             if attempts_dir.is_dir():
                 for attempt_path in sorted(attempts_dir.glob("*.json")):

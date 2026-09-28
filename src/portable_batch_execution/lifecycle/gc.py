@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Literal
 
 from portable_batch_execution.lifecycle.deletion import (
+    DeletionIntent,
+    DeletionIntentStore,
     DeletionReceipt,
     DeletionReceiptStore,
 )
@@ -71,6 +73,23 @@ class GcReport:
                 value = value.replace(tzinfo=UTC)
             return value.isoformat()
 
+        sorted_candidates = sorted(self.candidates, key=lambda item: item.digest)
+        sorted_protected = sorted(self.protected, key=lambda item: item.digest)
+        reason_counts: dict[str, int] = {}
+        reason_bytes: dict[str, int] = {}
+        for item in sorted_protected:
+            for reason in item.reasons:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                reason_bytes[reason] = reason_bytes.get(reason, 0) + item.size_bytes
+        protection_reason_aggregates = [
+            {
+                "reason": reason,
+                "count": reason_counts[reason],
+                "bytes": reason_bytes[reason],
+            }
+            for reason in sorted(reason_counts)
+        ]
+
         return {
             "mode": self.mode,
             "planned_at": _iso(self.planned_at),
@@ -78,11 +97,12 @@ class GcReport:
             "artifact_bytes": self.artifact_bytes,
             "candidate_count": self.candidate_count,
             "candidate_bytes": self.candidate_bytes,
-            "protected_count": len(self.protected),
-            "protected_bytes": sum(item.size_bytes for item in self.protected),
+            "protected_count": len(sorted_protected),
+            "protected_bytes": sum(item.size_bytes for item in sorted_protected),
             "deleted_count": len(self.deleted),
             "blocked": self.blocked,
-            "unknown_references": list(self.unknown_references),
+            "unknown_references": sorted(self.unknown_references),
+            "protection_reason_aggregates": protection_reason_aggregates,
             "candidates": [
                 {
                     "digest": item.digest,
@@ -91,23 +111,23 @@ class GcReport:
                     "effective_last_use": _iso(item.effective_last_use),
                     "effective_age_seconds": item.effective_age_seconds,
                 }
-                for item in self.candidates
+                for item in sorted_candidates
             ],
             "protected": [
                 {
                     "digest": item.digest,
                     "size_bytes": item.size_bytes,
-                    "reasons": list(item.reasons),
+                    "reasons": sorted(item.reasons),
                 }
-                for item in self.protected
+                for item in sorted_protected
             ],
             "run_reference_pairs": [
                 {"logical_run_id": run_id, "artifact_digest": digest}
-                for run_id, digest in self.run_reference_pairs
+                for run_id, digest in sorted(self.run_reference_pairs)
             ],
             "deleted": [
                 {"digest": item.digest, "size_bytes": item.size_bytes}
-                for item in self.deleted
+                for item in sorted(self.deleted, key=lambda item: item.digest)
             ],
         }
 
@@ -268,9 +288,21 @@ def apply_gc(
         return report
     now = now or datetime.now(UTC)
     receipt_store = DeletionReceiptStore(state_root)
+    intent_store = DeletionIntentStore(state_root)
     delivery_store = DeliveryRecordStore(state_root)
     deleted: list[GcCandidate] = []
     with lifecycle_state_lock(state_root):
+        deleted.extend(
+            _converge_pending_deletion_intents(
+                state_root,
+                policy,
+                mode=mode,
+                now=now,
+                receipt_store=receipt_store,
+                intent_store=intent_store,
+                delivery_store=delivery_store,
+            )
+        )
         deleted.extend(
             _apply_gc_candidates(
                 state_root,
@@ -279,6 +311,7 @@ def apply_gc(
                 now=now,
                 candidates=report.candidates,
                 receipt_store=receipt_store,
+                intent_store=intent_store,
                 delivery_store=delivery_store,
                 crash_after_unlink=crash_after_unlink,
             )
@@ -305,6 +338,7 @@ def _apply_gc_candidates(
     now: datetime,
     candidates: tuple[GcCandidate, ...],
     receipt_store: DeletionReceiptStore,
+    intent_store: DeletionIntentStore,
     delivery_store: DeliveryRecordStore,
     crash_after_unlink: set[str] | None,
 ) -> list[GcCandidate]:
@@ -312,6 +346,8 @@ def _apply_gc_candidates(
     for candidate in candidates:
         digest = candidate.digest
         if receipt_store.load(digest) is not None:
+            continue
+        if intent_store.load(digest) is not None:
             continue
         fresh = build_reachability_index(state_root, policy)
         if fresh.is_protected(digest) or digest in fresh.unknown_digests:
@@ -328,15 +364,14 @@ def _apply_gc_candidates(
                 policy=policy,
                 now=now,
                 delivery_store=delivery_store,
+                path=path,
             )
             receipt_store.save(receipt)
             deleted.append(candidate)
             continue
-        if crash_after_unlink and digest in crash_after_unlink:
-            path.unlink()
-            raise RuntimeError("simulated crash during gc sweep")
-        path.unlink(missing_ok=True)
-        receipt = _receipt_for_digest(
+        if not _still_eligible(state_root, policy, mode=mode, digest=digest, now=now):
+            continue
+        intent = _deletion_intent_for_digest(
             state_root,
             digest,
             candidate.size_bytes,
@@ -344,10 +379,85 @@ def _apply_gc_candidates(
             policy=policy,
             now=now,
             delivery_store=delivery_store,
+            path=path,
         )
+        intent_store.save(intent)
+        path.unlink(missing_ok=True)
+        if crash_after_unlink and digest in crash_after_unlink:
+            raise RuntimeError("simulated crash during gc sweep")
+        receipt = intent.to_receipt(now)
         receipt_store.save(receipt)
+        intent_store.finalize(digest)
         deleted.append(candidate)
     return deleted
+
+
+def _converge_pending_deletion_intents(
+    state_root: Path,
+    policy: LifecyclePolicy,
+    *,
+    mode: GcMode,
+    now: datetime,
+    receipt_store: DeletionReceiptStore,
+    intent_store: DeletionIntentStore,
+    delivery_store: DeliveryRecordStore,
+) -> list[GcCandidate]:
+    converged: list[GcCandidate] = []
+    for intent in intent_store.list_all():
+        digest = intent.artifact_digest
+        if receipt_store.load(digest) is not None:
+            intent_store.finalize(digest)
+            continue
+        path = artifact_payload_path(state_root, digest)
+        if not path.is_file():
+            receipt = intent.to_receipt(now)
+            receipt_store.save(receipt)
+            intent_store.finalize(digest)
+            converged.append(
+                GcCandidate(digest=digest, size_bytes=intent.artifact_size_bytes)
+            )
+            continue
+        fresh = build_reachability_index(state_root, policy)
+        if fresh.is_protected(digest) or digest in fresh.unknown_digests:
+            intent_store.finalize(digest)
+            continue
+        if fresh.unknown_messages:
+            continue
+        if not _still_eligible(
+            state_root, policy, mode=intent.mode, digest=digest, now=now
+        ):
+            intent_store.finalize(digest)
+            continue
+        path.unlink(missing_ok=True)
+        receipt = intent.to_receipt(now)
+        receipt_store.save(receipt)
+        intent_store.finalize(digest)
+        converged.append(GcCandidate(digest=digest, size_bytes=intent.artifact_size_bytes))
+    return converged
+
+
+def _still_eligible(
+    state_root: Path,
+    policy: LifecyclePolicy,
+    *,
+    mode: GcMode,
+    digest: str,
+    now: datetime,
+) -> bool:
+    delivery_store = DeliveryRecordStore(state_root)
+    sweep = _SweepState(
+        state_root=state_root,
+        index=build_reachability_index(state_root, policy),
+        delivery_by_request={item.request_id: item for item in delivery_store.list_all()},
+        policy=policy,
+        now=now,
+        mode=mode,
+        receipt_store=DeletionReceiptStore(state_root),
+    )
+    path = artifact_payload_path(state_root, digest)
+    if mode == "normal":
+        return _normal_eligible(state_root, sweep, digest, path)
+    return _legacy_eligible(state_root, sweep, digest, path)
 
 
 def _converge_receipts_for_missing_payloads(
@@ -393,10 +503,76 @@ def _converge_receipts_for_missing_payloads(
             policy=policy,
             now=now,
             delivery_store=delivery_store,
+            path=path,
         )
         receipt_store.save(receipt)
         converged.append(GcCandidate(digest=digest, size_bytes=size))
     return converged
+
+
+def _deletion_intent_for_digest(
+    state_root: Path,
+    digest: str,
+    size_bytes: int,
+    *,
+    mode: GcMode,
+    policy: LifecyclePolicy,
+    now: datetime,
+    delivery_store: DeliveryRecordStore,
+    path: Path,
+) -> DeletionIntent:
+    metadata = _deletion_metadata_for_digest(
+        state_root,
+        digest,
+        size_bytes,
+        mode=mode,
+        policy=policy,
+        delivery_store=delivery_store,
+        path=path,
+    )
+    return DeletionIntent(
+        artifact_digest=digest,
+        artifact_size_bytes=size_bytes,
+        logical_run_ids=metadata["logical_run_ids"],
+        producer_uid=metadata["producer_uid"],
+        consumer_uid=metadata["consumer_uid"],
+        provenance=metadata["provenance"],
+        created_at=metadata["created_at"],
+        delivered_at=metadata["delivered_at"],
+        intended_at=now,
+        mode=mode,
+        policy_identity=_policy_identity(policy),
+    )
+
+
+def _deletion_metadata_for_digest(
+    state_root: Path,
+    digest: str,
+    size_bytes: int,
+    *,
+    mode: GcMode,
+    policy: LifecyclePolicy,
+    delivery_store: DeliveryRecordStore,
+    path: Path,
+) -> dict:
+    index = build_reachability_index(state_root, policy)
+    run_ids = tuple(sorted(index.run_ids_by_digest.get(digest, ())))
+    delivery = next(
+        (item for item in delivery_store.list_all() if item.artifact_digest == digest),
+        None,
+    )
+    created_at = delivery.created_at if delivery else None
+    delivered_at = delivery.delivered_at if delivery else None
+    if created_at is None and path.is_file():
+        created_at = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+    return {
+        "logical_run_ids": run_ids,
+        "producer_uid": delivery.producer_uid if delivery else None,
+        "consumer_uid": delivery.consumer_uid if delivery else None,
+        "provenance": delivery.provenance if delivery else None,
+        "created_at": created_at,
+        "delivered_at": delivered_at,
+    }
 
 
 def _receipt_for_digest(
@@ -408,20 +584,28 @@ def _receipt_for_digest(
     policy: LifecyclePolicy,
     now: datetime,
     delivery_store: DeliveryRecordStore,
+    path: Path | None = None,
 ) -> DeletionReceipt:
-    index = build_reachability_index(state_root, policy)
-    run_ids = tuple(sorted(index.run_ids_by_digest.get(digest, ())))
-    delivery = next(
-        (item for item in delivery_store.list_all() if item.artifact_digest == digest),
-        None,
+    if path is None:
+        path = artifact_payload_path(state_root, digest)
+    metadata = _deletion_metadata_for_digest(
+        state_root,
+        digest,
+        size_bytes,
+        mode=mode,
+        policy=policy,
+        delivery_store=delivery_store,
+        path=path,
     )
     return DeletionReceipt(
         artifact_digest=digest,
         artifact_size_bytes=size_bytes,
-        logical_run_ids=run_ids,
-        producer_uid=delivery.producer_uid if delivery else None,
-        consumer_uid=delivery.consumer_uid if delivery else None,
-        provenance=delivery.provenance if delivery else None,
+        logical_run_ids=metadata["logical_run_ids"],
+        producer_uid=metadata["producer_uid"],
+        consumer_uid=metadata["consumer_uid"],
+        provenance=metadata["provenance"],
+        created_at=metadata["created_at"],
+        delivered_at=metadata["delivered_at"],
         deleted_at=now,
         mode=mode,
         policy_identity=_policy_identity(policy),

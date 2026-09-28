@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
 
+from portable_batch_execution.lifecycle.durable import write_json_atomically
 from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from portable_batch_execution.lifecycle.paths import holds_dir
 
@@ -70,9 +71,7 @@ class HoldStore:
         path = self._path(record.hold_id)
         with self._lock:
             with lifecycle_state_lock(self._state_root):
-                temporary = path.with_suffix(".tmp")
-                temporary.write_text(json.dumps(record.to_json()) + "\n", encoding="utf-8")
-                temporary.replace(path)
+                write_json_atomically(path, record.to_json())
 
     def remove(self, hold_id: str) -> bool:
         path = self._path(hold_id)

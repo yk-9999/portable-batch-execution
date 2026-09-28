@@ -28,6 +28,10 @@ def deletion_receipts_dir(state_root: Path) -> Path:
     return lifecycle_root(state_root) / "deletion-receipts"
 
 
+def deletion_intents_dir(state_root: Path) -> Path:
+    return lifecycle_root(state_root) / "deletion-intents"
+
+
 def writer_lock_path(state_root: Path) -> Path:
     return lifecycle_root(state_root) / ".writer-lock"
 

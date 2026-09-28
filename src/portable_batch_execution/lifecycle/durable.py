@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 from hashlib import sha256
 from pathlib import Path
+from typing import Any
 
 
 def persist_verified_bytes(
@@ -41,6 +43,20 @@ def verify_file(destination: Path, *, expected_sha256: str, expected_size_bytes:
         raise ValueError("size verification failed")
     if f"sha256:{sha256(data).hexdigest()}" != expected_sha256:
         raise ValueError("digest verification failed")
+
+
+def write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON atomically with flush, fsync, replace, and parent fsync."""
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    encoded = json.dumps(payload, sort_keys=True) + "\n"
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+    _fsync_parent(path)
 
 
 def _fsync_parent(path: Path) -> None:

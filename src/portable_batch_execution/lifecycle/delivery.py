@@ -10,6 +10,7 @@ from threading import RLock
 from typing import Any
 
 from portable_batch_execution.broker.config import opaque_request_id
+from portable_batch_execution.lifecycle.durable import write_json_atomically
 from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from portable_batch_execution.lifecycle.paths import deliveries_dir
 
@@ -113,9 +114,7 @@ class DeliveryRecordStore:
                     ):
                         raise ValueError("delivery_commit_conflict")
                     return
-                temporary = path.with_suffix(".tmp")
-                temporary.write_text(json.dumps(record.to_json()) + "\n", encoding="utf-8")
-                temporary.replace(path)
+                write_json_atomically(path, record.to_json())
 
     def list_all(self) -> tuple[DeliveryRecord, ...]:
         records: list[DeliveryRecord] = []
