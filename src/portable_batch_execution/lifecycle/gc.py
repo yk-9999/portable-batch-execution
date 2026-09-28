@@ -303,6 +303,9 @@ def apply_gc(
     intent_store = DeletionIntentStore(state_root)
     delivery_store = DeliveryRecordStore(state_root)
     deleted: list[GcCandidate] = []
+    external_refs_configured = bool(
+        policy.authoritative_reference_files or policy.authoritative_reference_roots
+    )
     with lifecycle_state_lock(state_root):
         sweeps: dict[GcMode, _SweepState] = {}
         requested_index = build_reachability_index(state_root, policy)
@@ -341,6 +344,8 @@ def apply_gc(
                 intent_store=intent_store,
                 delivery_store=delivery_store,
                 sweeps=sweeps,
+                external_refs_configured=external_refs_configured,
+                report=report,
             )
         )
         deleted.extend(
@@ -355,6 +360,8 @@ def apply_gc(
                 delivery_store=delivery_store,
                 crash_after_unlink=crash_after_unlink,
                 sweep=sweeps[mode],
+                external_refs_configured=external_refs_configured,
+                report=report,
             )
         )
         deleted.extend(
@@ -384,6 +391,8 @@ def _apply_gc_candidates(
     delivery_store: DeliveryRecordStore,
     crash_after_unlink: set[str] | None,
     sweep: _SweepState,
+    external_refs_configured: bool,
+    report: GcReport,
 ) -> list[GcCandidate]:
     deleted: list[GcCandidate] = []
     for candidate in candidates:
@@ -412,6 +421,21 @@ def _apply_gc_candidates(
             continue
         if not _sweep_eligible(state_root, sweep, mode=mode, digest=digest):
             continue
+        deletion_sweep = sweep
+        if external_refs_configured:
+            deletion_sweep = _fresh_deletion_sweep(
+                state_root, policy, mode=mode, now=now, delivery_store=delivery_store
+            )
+            if (
+                deletion_sweep.index.unknown_messages
+                or digest in deletion_sweep.index.unknown_digests
+            ):
+                _record_fresh_block(report, deletion_sweep.index)
+                continue
+            if deletion_sweep.index.is_protected(digest) or not _sweep_eligible(
+                state_root, deletion_sweep, mode=mode, digest=digest
+            ):
+                continue
         intent = _deletion_intent_for_digest(
             state_root,
             digest,
@@ -421,7 +445,7 @@ def _apply_gc_candidates(
             now=now,
             delivery_store=delivery_store,
             path=path,
-            index=sweep.index,
+            index=deletion_sweep.index,
         )
         intent_store.save(intent)
         path.unlink(missing_ok=True)
@@ -445,6 +469,8 @@ def _converge_pending_deletion_intents(
     intent_store: DeletionIntentStore,
     delivery_store: DeliveryRecordStore,
     sweeps: dict[GcMode, _SweepState],
+    external_refs_configured: bool,
+    report: GcReport,
 ) -> list[GcCandidate]:
     converged: list[GcCandidate] = []
     for intent in intent_store.list_all():
@@ -470,6 +496,25 @@ def _converge_pending_deletion_intents(
         if not _sweep_eligible(state_root, sweep, mode=intent.mode, digest=digest):
             intent_store.finalize(digest)
             continue
+        if external_refs_configured:
+            sweep = _fresh_deletion_sweep(
+                state_root,
+                policy,
+                mode=intent.mode,
+                now=now,
+                delivery_store=delivery_store,
+            )
+            if sweep.index.unknown_messages:
+                _record_fresh_block(report, sweep.index)
+                continue
+            if digest in sweep.index.unknown_digests or sweep.index.is_protected(
+                digest
+            ):
+                intent_store.finalize(digest)
+                continue
+            if not _sweep_eligible(state_root, sweep, mode=intent.mode, digest=digest):
+                intent_store.finalize(digest)
+                continue
         path.unlink(missing_ok=True)
         fsync_directory(path.parent)
         receipt = intent.to_receipt(now)
@@ -479,6 +524,25 @@ def _converge_pending_deletion_intents(
             GcCandidate(digest=digest, size_bytes=intent.artifact_size_bytes)
         )
     return converged
+
+
+def _fresh_deletion_sweep(state_root, policy, *, mode, now, delivery_store):
+    index = build_reachability_index(state_root, policy)
+    return _make_sweep(
+        state_root,
+        policy,
+        mode=mode,
+        now=now,
+        index=index,
+        delivery_store=delivery_store,
+    )
+
+
+def _record_fresh_block(report: GcReport, index: ReachabilityIndex) -> None:
+    report.blocked = True
+    report.unknown_references = tuple(
+        sorted(set(report.unknown_references).union(index.unknown_messages))
+    )
 
 
 def _still_eligible(

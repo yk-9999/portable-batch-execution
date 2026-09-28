@@ -521,6 +521,87 @@ def test_apply_gc_refuses_deletion_when_authoritative_state_unreadable(tmp_path)
     assert artifact_payload_path(tmp_path, digest).is_file()
 
 
+def _external_reference_candidate(
+    tmp_path, request_id, external_path, initial_text="[]"
+):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    output = f"external-ref-{request_id}".encode()
+    _succeed_broker(service, request_id, output)
+    digest = f"sha256:{sha256(output).hexdigest()}"
+    _delivery_commit(service, request_id, digest, len(output))
+    external_path.write_text(initial_text, encoding="utf-8")
+    policy = _write_policy(
+        tmp_path,
+        grace=0,
+        authoritative_reference_files=(str(external_path),),
+    )
+    return policy, digest
+
+
+def test_apply_gc_rechecks_external_refs_immediately_before_unlink(tmp_path):
+    external_path = tmp_path / "external-references.json"
+    policy, digest = _external_reference_candidate(
+        tmp_path, "req-external-late-ref", external_path
+    )
+    original = gc_module.build_reachability_index
+    calls = 0
+
+    def build_then_publish_ref(state_root, current_policy=None):
+        nonlocal calls
+        calls += 1
+        index = original(state_root, current_policy)
+        if calls == 1:
+            external_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": {
+                            "object_id": digest.removeprefix("sha256:"),
+                            "sha256": digest,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return index
+
+    with patch.object(
+        gc_module, "build_reachability_index", side_effect=build_then_publish_ref
+    ):
+        report = apply_gc(tmp_path, policy, mode="normal")
+
+    assert calls == 2
+    assert report.deleted == ()
+    assert artifact_payload_path(tmp_path, digest).is_file()
+
+
+def test_apply_gc_blocks_candidate_if_external_refs_turn_unreadable(tmp_path):
+    external_path = tmp_path / "external-references.json"
+    policy, digest = _external_reference_candidate(
+        tmp_path, "req-external-invalid", external_path
+    )
+    original = gc_module.build_reachability_index
+    calls = 0
+
+    def build_then_invalidate_refs(state_root, current_policy=None):
+        nonlocal calls
+        calls += 1
+        index = original(state_root, current_policy)
+        if calls == 1:
+            external_path.write_text("{invalid", encoding="utf-8")
+        return index
+
+    with patch.object(
+        gc_module, "build_reachability_index", side_effect=build_then_invalidate_refs
+    ):
+        report = apply_gc(tmp_path, policy, mode="normal")
+
+    assert calls == 2
+    assert report.blocked is True
+    assert report.deleted == ()
+    assert artifact_payload_path(tmp_path, digest).is_file()
+
+
 def test_local_data_plane_write_acquires_lifecycle_lock(tmp_path):
     with patch.object(LifecycleStateLock, "acquire", autospec=True) as acquire:
         LocalFilesystemDataPlane(tmp_path).write(
