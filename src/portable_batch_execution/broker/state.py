@@ -12,6 +12,10 @@ from portable_batch_execution.broker.config import opaque_request_id
 
 _STATE_SCHEMA = "pbe.a1-unix-broker.request-state.v1"
 
+# Persisted broker request statuses (see BrokerExecuteResponse.status in protocol).
+BROKER_TERMINAL_REQUEST_STATUSES = frozenset({"succeeded", "exhausted", "failed"})
+BROKER_TRANSPORT_OUTPUT_STATUSES = frozenset({"succeeded", "exhausted"})
+
 
 @dataclass(frozen=True)
 class RequestBinding:

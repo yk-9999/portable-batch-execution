@@ -15,7 +15,10 @@ from portable_batch_execution.lifecycle.deletion import (
 from portable_batch_execution.lifecycle.delivery import DeliveryRecordStore
 from portable_batch_execution.lifecycle.paths import artifacts_dir
 from portable_batch_execution.lifecycle.policy import LifecyclePolicy
-from portable_batch_execution.broker.state import BrokerRequestState
+from portable_batch_execution.broker.state import (
+    BROKER_TRANSPORT_OUTPUT_STATUSES,
+    BrokerRequestState,
+)
 from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from portable_batch_execution.lifecycle.reachability import (
     ReachabilityIndex,
@@ -37,6 +40,9 @@ class GcProtection:
 class GcCandidate:
     digest: str
     size_bytes: int
+    payload_mtime: datetime | None = None
+    effective_last_use: datetime | None = None
+    effective_age_seconds: float | None = None
 
 
 @dataclass
@@ -52,10 +58,22 @@ class GcReport:
     unknown_references: tuple[str, ...] = ()
     run_reference_pairs: tuple[tuple[str, str], ...] = ()
     blocked: bool = False
+    planned_at: datetime | None = None
 
     def to_dict(self) -> dict:
+        return self.to_review_dict()
+
+    def to_review_dict(self) -> dict:
+        def _iso(value: datetime | None) -> str | None:
+            if value is None:
+                return None
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=UTC)
+            return value.isoformat()
+
         return {
             "mode": self.mode,
+            "planned_at": _iso(self.planned_at),
             "artifact_count": self.artifact_count,
             "artifact_bytes": self.artifact_bytes,
             "candidate_count": self.candidate_count,
@@ -63,8 +81,34 @@ class GcReport:
             "protected_count": len(self.protected),
             "protected_bytes": sum(item.size_bytes for item in self.protected),
             "deleted_count": len(self.deleted),
-            "unknown_references": list(self.unknown_references),
             "blocked": self.blocked,
+            "unknown_references": list(self.unknown_references),
+            "candidates": [
+                {
+                    "digest": item.digest,
+                    "size_bytes": item.size_bytes,
+                    "payload_mtime": _iso(item.payload_mtime),
+                    "effective_last_use": _iso(item.effective_last_use),
+                    "effective_age_seconds": item.effective_age_seconds,
+                }
+                for item in self.candidates
+            ],
+            "protected": [
+                {
+                    "digest": item.digest,
+                    "size_bytes": item.size_bytes,
+                    "reasons": list(item.reasons),
+                }
+                for item in self.protected
+            ],
+            "run_reference_pairs": [
+                {"logical_run_id": run_id, "artifact_digest": digest}
+                for run_id, digest in self.run_reference_pairs
+            ],
+            "deleted": [
+                {"digest": item.digest, "size_bytes": item.size_bytes}
+                for item in self.deleted
+            ],
         }
 
 
@@ -150,7 +194,9 @@ def plan_gc(
             continue
         if mode == "normal":
             if _normal_eligible(state_root, sweep, digest, path):
-                sweep.candidates.append(GcCandidate(digest=digest, size_bytes=size))
+                sweep.candidates.append(
+                    _candidate_detail(sweep, digest=digest, size_bytes=size, path=path)
+                )
             else:
                 sweep.protected.append(
                     GcProtection(
@@ -160,7 +206,9 @@ def plan_gc(
                     )
                 )
         elif _legacy_eligible(state_root, sweep, digest, path):
-            sweep.candidates.append(GcCandidate(digest=digest, size_bytes=size))
+            sweep.candidates.append(
+                _candidate_detail(sweep, digest=digest, size_bytes=size, path=path)
+            )
         else:
             sweep.protected.append(
                 GcProtection(
@@ -181,6 +229,28 @@ def plan_gc(
         unknown_references=tuple(index.unknown_messages),
         run_reference_pairs=tuple(sorted(run_pairs)),
         blocked=blocked,
+        planned_at=now,
+    )
+
+
+def _candidate_detail(
+    sweep: _SweepState, *, digest: str, size_bytes: int, path: Path
+) -> GcCandidate:
+    payload_mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+    effective_last_use = (
+        _legacy_effective_last_use(sweep, digest, path)
+        if sweep.mode == "legacy"
+        else payload_mtime
+    )
+    age_seconds = (sweep.now - effective_last_use).total_seconds()
+    if effective_last_use.tzinfo is None:
+        effective_last_use = effective_last_use.replace(tzinfo=UTC)
+    return GcCandidate(
+        digest=digest,
+        size_bytes=size_bytes,
+        payload_mtime=payload_mtime,
+        effective_last_use=effective_last_use,
+        effective_age_seconds=age_seconds,
     )
 
 
@@ -372,7 +442,7 @@ def _broker_requests_for_digest(
             state = BrokerRequestState.from_json(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             continue
-        if state.output_sha256 == digest and state.status in {"succeeded", "exhausted"}:
+        if state.output_sha256 == digest and state.status in BROKER_TRANSPORT_OUTPUT_STATUSES:
             request_ids.add(state.request_id)
     return sorted(request_ids)
 

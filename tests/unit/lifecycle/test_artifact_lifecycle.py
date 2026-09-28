@@ -29,6 +29,7 @@ from portable_batch_execution.data_plane import LocalFilesystemDataPlane
 from portable_batch_execution.lifecycle.paths import lifecycle_policy_path
 from portable_batch_execution.lifecycle.policy import LifecyclePolicy
 from portable_batch_execution.lifecycle.lock import LifecycleStateLock
+from portable_batch_execution.lifecycle.cli import main as lifecycle_cli_main
 from portable_batch_execution.lifecycle.reachability import artifact_payload_path, build_reachability_index
 from tests.unit.broker.test_unix_broker import (
     _UID,
@@ -228,9 +229,8 @@ def test_gc_deletes_after_grace_when_unreachable(tmp_path):
     store = BrokerRequestStore(service.state_root / "controller")
     state = store.load("req-gc")
     assert state is not None
-    state.status = "exhausted"
-    store.save(state)
-    index = build_reachability_index(tmp_path)
+    assert state.status == "succeeded"
+    index = build_reachability_index(tmp_path, policy)
     assert not index.is_protected(digest)
     report = apply_gc(tmp_path, policy, mode="normal")
     assert report.candidate_count == 1
@@ -248,10 +248,6 @@ def test_gc_grace_protects_payload(tmp_path):
     _succeed_broker(service, "req-grace", output)
     digest = f"sha256:{sha256(output).hexdigest()}"
     _delivery_commit(service, "req-grace", digest, len(output))
-    store = BrokerRequestStore(service.state_root / "controller")
-    state = store.load("req-grace")
-    state.status = "exhausted"
-    store.save(state)
     report = plan_gc(tmp_path, policy, mode="normal", now=datetime.now(UTC))
     assert digest in {item.digest for item in report.protected}
 
@@ -264,9 +260,6 @@ def test_gc_crash_rerun_converges(tmp_path):
     _succeed_broker(service, "req-crash", output)
     digest = f"sha256:{sha256(output).hexdigest()}"
     _delivery_commit(service, "req-crash", digest, len(output))
-    state = BrokerRequestStore(service.state_root / "controller").load("req-crash")
-    state.status = "exhausted"
-    BrokerRequestStore(service.state_root / "controller").save(state)
     with pytest.raises(RuntimeError):
         apply_gc(
             tmp_path,
@@ -278,6 +271,50 @@ def test_gc_crash_rerun_converges(tmp_path):
     assert DeletionReceiptStore(tmp_path).load(digest) is None
     apply_gc(tmp_path, policy, mode="normal")
     assert DeletionReceiptStore(tmp_path).load(digest) is not None
+
+
+def test_succeeded_undelivered_broker_output_stays_protected(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    output = b"awaiting-delivery"
+    _succeed_broker(service, "req-await", output)
+    digest = f"sha256:{sha256(output).hexdigest()}"
+    state = BrokerRequestStore(service.state_root / "controller").load("req-await")
+    assert state is not None
+    assert state.status == "succeeded"
+    index = build_reachability_index(tmp_path, policy)
+    assert index.is_protected(digest)
+    report = plan_gc(tmp_path, policy, mode="normal")
+    assert digest in {item.digest for item in report.protected}
+
+
+def test_legacy_gc_dry_run_review_json_includes_candidates_and_protected(tmp_path, capsys):
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    digest = "sha256:" + "e" * 64
+    path = artifact_payload_path(tmp_path, digest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"legacy-candidate")
+    old = datetime.now(UTC) - timedelta(days=30)
+    os.utime(path, (old.timestamp(), old.timestamp()))
+    rc = lifecycle_cli_main(
+        [
+            "legacy-gc-dry-run",
+            "--state-root",
+            str(tmp_path),
+            "--policy-file",
+            str(lifecycle_policy_path(tmp_path)),
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["candidate_count"] >= 1
+    assert any(item["digest"] == digest for item in payload["candidates"])
+    assert payload["candidates"][0]["effective_last_use"] is not None
+    assert payload["candidates"][0]["effective_age_seconds"] is not None
+    assert "protected" in payload
+    assert "unknown_references" in payload
+    assert "run_reference_pairs" in payload
 
 
 def test_legacy_gc_dry_run_and_unknown_state(tmp_path):
@@ -376,12 +413,6 @@ def test_normal_gc_waits_for_all_transport_refs_on_shared_digest(tmp_path):
     _succeed_broker(service, "req-shared-b", output)
     digest = f"sha256:{sha256(output).hexdigest()}"
     _delivery_commit(service, "req-shared-a", digest, len(output))
-    store = BrokerRequestStore(service.state_root / "controller")
-    for request_id in ("req-shared-a", "req-shared-b"):
-        state = store.load(request_id)
-        assert state is not None
-        state.status = "exhausted"
-        store.save(state)
     report = plan_gc(tmp_path, policy, mode="normal", now=datetime.now(UTC))
     assert digest in {item.digest for item in report.protected}
     apply_report = apply_gc(tmp_path, policy, mode="normal")
@@ -400,8 +431,6 @@ def test_apply_gc_refuses_deletion_when_authoritative_state_unreadable(tmp_path)
     store = BrokerRequestStore(service.state_root / "controller")
     state = store.load("req-blocked")
     assert state is not None
-    state.status = "exhausted"
-    store.save(state)
     run_dir = tmp_path / "runs" / state.logical_run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "latest.json").write_text("{broken", encoding="utf-8")
@@ -414,6 +443,63 @@ def test_local_data_plane_write_acquires_lifecycle_lock(tmp_path):
     with patch.object(LifecycleStateLock, "acquire", autospec=True) as acquire:
         LocalFilesystemDataPlane(tmp_path).write(b"new-artifact", "application/octet-stream")
     acquire.assert_called_once()
+
+
+def test_delivery_commit_idempotent_identical_replay(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    output = b"[{\"id\":1}]"
+    _succeed_broker(service, "req-replay", output)
+    digest = f"sha256:{sha256(output).hexdigest()}"
+    first = service.handle_delivery_commit(
+        _UID,
+        {
+            "schema_version": "pbe.a1-unix-broker.delivery-commit.v1",
+            "request_id": "req-replay",
+            "output_sha256": digest,
+            "output_size_bytes": len(output),
+        },
+    )
+    second = service.handle_delivery_commit(
+        _UID,
+        {
+            "schema_version": "pbe.a1-unix-broker.delivery-commit.v1",
+            "request_id": "req-replay",
+            "output_sha256": digest,
+            "output_size_bytes": len(output),
+        },
+    )
+    assert first.status == "accepted"
+    assert second.status == "accepted"
+
+
+def test_delivery_commit_conflicting_replay_fails(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    output = b"[{\"id\":1}]"
+    _succeed_broker(service, "req-conflict", output)
+    digest = f"sha256:{sha256(output).hexdigest()}"
+    accepted = service.handle_delivery_commit(
+        _UID,
+        {
+            "schema_version": "pbe.a1-unix-broker.delivery-commit.v1",
+            "request_id": "req-conflict",
+            "output_sha256": digest,
+            "output_size_bytes": len(output),
+        },
+    )
+    assert accepted.status == "accepted"
+    conflict = service.handle_delivery_commit(
+        _UID,
+        {
+            "schema_version": "pbe.a1-unix-broker.delivery-commit.v1",
+            "request_id": "req-conflict",
+            "output_sha256": digest,
+            "output_size_bytes": len(output) + 1,
+        },
+    )
+    assert conflict.status == "failed"
+    assert conflict.error_code == "delivery_commit_mismatch"
 
 
 def test_delivery_save_acquires_lifecycle_lock(tmp_path):

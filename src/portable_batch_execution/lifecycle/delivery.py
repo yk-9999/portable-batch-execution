@@ -87,6 +87,18 @@ class DeliveryRecordStore:
             raise TypeError("invalid delivery record")
         return DeliveryRecord.from_json(payload)
 
+    @staticmethod
+    def _transport_identity(record: DeliveryRecord) -> tuple:
+        return (
+            record.request_id,
+            record.logical_run_id,
+            record.artifact_digest,
+            record.artifact_size_bytes,
+            record.producer_uid,
+            record.consumer_uid,
+            json.dumps(record.provenance, sort_keys=True) if record.provenance else None,
+        )
+
     def save_new(self, record: DeliveryRecord) -> None:
         """Persist only if no record exists; conflicting payloads fail closed."""
         path = self._path(record.request_id)
@@ -96,7 +108,9 @@ class DeliveryRecordStore:
                     existing = DeliveryRecord.from_json(
                         json.loads(path.read_text(encoding="utf-8"))
                     )
-                    if existing.to_json() != record.to_json():
+                    if self._transport_identity(existing) != self._transport_identity(
+                        record
+                    ):
                         raise ValueError("delivery_commit_conflict")
                     return
                 temporary = path.with_suffix(".tmp")

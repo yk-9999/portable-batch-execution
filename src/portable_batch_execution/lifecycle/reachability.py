@@ -9,7 +9,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from portable_batch_execution.broker.state import BrokerRequestState
+from portable_batch_execution.broker.state import (
+    BROKER_TERMINAL_REQUEST_STATUSES,
+    BROKER_TRANSPORT_OUTPUT_STATUSES,
+    BrokerRequestState,
+)
 from portable_batch_execution.contracts import (
     ArtifactRef,
     JobSpec,
@@ -26,7 +30,6 @@ from portable_batch_execution.lifecycle.paths import deliveries_dir, holds_dir
 from portable_batch_execution.lifecycle.policy import LifecyclePolicy
 
 _TERMINAL_MANIFEST = frozenset({"succeeded", "failed", "cancelled"})
-_BROKER_LIVE = frozenset({"active", "succeeded"})
 
 
 @dataclass
@@ -170,6 +173,12 @@ def build_reachability_index(
     index = ReachabilityIndex()
     controller_root = state_root / "controller"
 
+    deliveries = _load_deliveries(state_root, index)
+    delivery_by_request = {record.request_id: record for record in deliveries}
+    for record in deliveries:
+        index.run_ids_by_digest[record.artifact_digest].add(record.logical_run_id)
+        _touch(index, record.artifact_digest, record.delivered_at)
+
     broker_terminal_by_run: dict[str, str] = {}
     for path in sorted((controller_root / "broker" / "requests").glob("*.json")):
         try:
@@ -179,21 +188,25 @@ def build_reachability_index(
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             index.unknown_messages.append(f"broker request state unreadable: {path.name}: {exc}")
             continue
-        if state.status in _BROKER_LIVE:
+        if state.status == "active":
             index.protected_by_digest.setdefault("__broker_request__", set()).add(
                 f"broker:{state.request_id}:{state.status}"
             )
-            if state.status == "succeeded" and state.output_sha256:
-                digest = state.output_sha256
+        if state.output_sha256 and state.status in BROKER_TRANSPORT_OUTPUT_STATUSES:
+            digest = state.output_sha256
+            index.broker_outputs[state.request_id] = digest
+            index.run_ids_by_digest[digest].add(state.logical_run_id)
+            _touch(index, digest, state_mtime)
+            if (
+                state.status == "succeeded"
+                and state.request_id not in delivery_by_request
+            ):
+                index.protected_by_digest.setdefault("__broker_request__", set()).add(
+                    f"broker:{state.request_id}:{state.status}"
+                )
                 index.protected_by_digest[digest].add(f"broker_request:{state.request_id}")
-                index.broker_outputs[state.request_id] = digest
-                index.run_ids_by_digest[digest].add(state.logical_run_id)
-                _touch(index, digest, state_mtime)
-        if state.status in {"succeeded", "exhausted", "failed"}:
+        if state.status in BROKER_TERMINAL_REQUEST_STATUSES:
             broker_terminal_by_run[state.logical_run_id] = state.status
-        if state.output_sha256 and state.status in {"succeeded", "exhausted"}:
-            _touch(index, state.output_sha256, state_mtime)
-            index.run_ids_by_digest[state.output_sha256].add(state.logical_run_id)
 
     for record in _load_holds(state_root, index):
         for digest in record.artifact_digests:
@@ -223,7 +236,10 @@ def build_reachability_index(
             broker_status = broker_terminal_by_run.get(run_id)
             if manifest is not None:
                 live_manifest = manifest.status not in _TERMINAL_MANIFEST
-                if live_manifest and broker_status not in {"succeeded", "exhausted", "failed"}:
+                if (
+                    live_manifest
+                    and broker_status not in BROKER_TERMINAL_REQUEST_STATUSES
+                ):
                     index.protected_by_digest.setdefault("__run__", set()).add(
                         f"manifest:{run_id}:{manifest.status}"
                     )
@@ -255,15 +271,11 @@ def build_reachability_index(
                         if (
                             manifest is not None
                             and manifest.status not in _TERMINAL_MANIFEST
-                            and broker_status not in {"succeeded", "exhausted", "failed"}
+                            and broker_status not in BROKER_TERMINAL_REQUEST_STATUSES
                         ):
                             index.protected_by_digest[digest].add(
                                 f"attempt:{attempt.attempt_id}"
                             )
-
-    for record in _load_deliveries(state_root, index):
-        index.run_ids_by_digest[record.artifact_digest].add(record.logical_run_id)
-        _touch(index, record.artifact_digest, record.delivered_at)
 
     _scan_closed_waves(controller_root, index)
 
