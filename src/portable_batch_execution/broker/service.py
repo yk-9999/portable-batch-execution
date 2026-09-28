@@ -28,7 +28,19 @@ from .planning import (
     register_broker_private_run,
     validate_registered_wave_binding,
 )
-from .protocol import BrokerExecuteRequest, BrokerExecuteResponse, parse_request
+from portable_batch_execution.lifecycle.delivery import DeliveryRecord, DeliveryRecordStore, utc_now
+
+from .protocol import (
+    BrokerDeliveryCommitResponse,
+    BrokerExecuteRequest,
+    BrokerExecuteResponse,
+    _DELIVERY_COMMIT_SCHEMA,
+    delivery_commit_response_to_json,
+    message_schema_version,
+    parse_delivery_commit,
+    parse_request,
+    response_to_json,
+)
 from .state import BrokerRequestState, BrokerRequestStore, RequestBinding
 
 _TERMINAL_FAILURE_STATUSES = frozenset({"failed", "cancelled"})
@@ -56,6 +68,77 @@ class UnixBrokerService:
         self.poll_interval_seconds = poll_interval_seconds
         self._sleep = sleeper or time.sleep
         self._store = BrokerRequestStore(self.state_root / "controller")
+        self._deliveries = DeliveryRecordStore(self.state_root)
+
+    def handle_message(self, peer_uid: int, payload: object) -> bytes:
+        version = message_schema_version(payload)
+        if version == _DELIVERY_COMMIT_SCHEMA:
+            response = self.handle_delivery_commit(peer_uid, payload)
+            return delivery_commit_response_to_json(response)
+        return response_to_json(self.handle_payload(peer_uid, payload))
+
+    def handle_delivery_commit(
+        self, peer_uid: int, payload: object
+    ) -> BrokerDeliveryCommitResponse:
+        try:
+            commit = parse_delivery_commit(payload)
+        except (TypeError, ValueError):
+            return BrokerDeliveryCommitResponse(
+                request_id=_request_id_or_unknown(payload),
+                status="failed",
+                error_code="delivery_commit_invalid",
+            )
+        state = self._store.load(commit.request_id)
+        if state is None or state.status != "succeeded":
+            return BrokerDeliveryCommitResponse(
+                request_id=commit.request_id,
+                status="failed",
+                error_code="delivery_commit_not_ready",
+            )
+        if (
+            state.output_sha256 != commit.output_sha256
+            or state.output_size_bytes != commit.output_size_bytes
+        ):
+            return BrokerDeliveryCommitResponse(
+                request_id=commit.request_id,
+                status="failed",
+                error_code="delivery_commit_mismatch",
+            )
+        if not self.config.authorize(
+            peer_uid, state.binding.pack, state.binding.operation
+        ):
+            return BrokerDeliveryCommitResponse(
+                request_id=commit.request_id,
+                status="failed",
+                error_code="peer_not_authorized",
+            )
+        created_at = None
+        manifest = self.controller.data_plane.read_manifest(state.logical_run_id)
+        if manifest is not None:
+            created_at = manifest.provenance.created_at
+        record = DeliveryRecord(
+            request_id=commit.request_id,
+            logical_run_id=state.logical_run_id,
+            artifact_digest=commit.output_sha256,
+            artifact_size_bytes=commit.output_size_bytes,
+            producer_uid=None,
+            consumer_uid=peer_uid,
+            created_at=created_at,
+            delivered_at=utc_now(),
+            provenance={"pack": state.binding.pack, "operation": state.binding.operation},
+        )
+        try:
+            self._deliveries.save_new(record)
+        except ValueError:
+            return BrokerDeliveryCommitResponse(
+                request_id=commit.request_id,
+                status="failed",
+                error_code="delivery_commit_conflict",
+            )
+        return BrokerDeliveryCommitResponse(
+            request_id=commit.request_id,
+            status="accepted",
+        )
 
     def handle_payload(self, peer_uid: int, payload: object) -> BrokerExecuteResponse:
         try:
@@ -237,9 +320,12 @@ class UnixBrokerService:
             )
             if canonical and not missing and not duplicate:
                 attempt = canonical[0]
-                output_bytes, media_type, digest = self._read_attempt_output(attempt)
+                output_bytes, media_type, digest, size_bytes = self._read_attempt_output(
+                    attempt
+                )
                 state.status = "succeeded"
                 state.output_sha256 = digest
+                state.output_size_bytes = size_bytes
                 state.output_media_type = media_type
                 self._store.save(state)
                 self._reconcile_if_attempts_changed(state, shard, attempts)
@@ -253,6 +339,7 @@ class UnixBrokerService:
                     execution_fingerprint=state.binding.execution_fingerprint,
                     output_media_type=media_type,
                     output_sha256=digest,
+                    output_size_bytes=size_bytes,
                     output_b64=base64.b64encode(output_bytes).decode("ascii"),
                 )
             try:
@@ -311,14 +398,15 @@ class UnixBrokerService:
 
     def _read_attempt_output(
         self, attempt: ShardAttemptRecord
-    ) -> tuple[bytes, str, str]:
+    ) -> tuple[bytes, str, str, int]:
         if not attempt.output_refs:
             raise ValueError("successful attempt missing output")
         ref = attempt.output_refs[0]
         payload = self.controller.data_plane.read(ref)
         digest = sha256(payload).hexdigest()
         media_type = ref.media_type or "application/octet-stream"
-        return payload, media_type, f"sha256:{digest}"
+        size_bytes = ref.size_bytes if ref.size_bytes is not None else len(payload)
+        return payload, media_type, f"sha256:{digest}", size_bytes
 
     def _success_from_state(self, state: BrokerRequestState) -> BrokerExecuteResponse:
         shards = self.controller.registry.load_shards_for_run(state.logical_run_id)
@@ -330,7 +418,13 @@ class UnixBrokerService:
         )
         if not canonical or missing or duplicate:
             return self._failed(state.request_id, "broker_internal_error")
-        output_bytes, media_type, digest = self._read_attempt_output(canonical[0])
+        output_bytes, media_type, digest, size_bytes = self._read_attempt_output(
+            canonical[0]
+        )
+        if state.output_size_bytes is None:
+            state.output_size_bytes = size_bytes
+            state.output_sha256 = digest
+            self._store.save(state)
         return BrokerExecuteResponse(
             request_id=state.request_id,
             status="succeeded",
@@ -341,6 +435,7 @@ class UnixBrokerService:
             execution_fingerprint=state.binding.execution_fingerprint,
             output_media_type=media_type,
             output_sha256=digest,
+            output_size_bytes=size_bytes,
             output_b64=base64.b64encode(output_bytes).decode("ascii"),
         )
 

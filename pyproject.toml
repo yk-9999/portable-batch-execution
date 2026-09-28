@@ -31,6 +31,7 @@ dev = [
 
 [project.scripts]
 pbe-a1-controller = "portable_batch_execution.controller.cli:main"
+pbe-lifecycle = "portable_batch_execution.lifecycle.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

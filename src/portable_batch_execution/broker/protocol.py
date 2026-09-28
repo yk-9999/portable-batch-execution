@@ -13,6 +13,8 @@ from portable_batch_execution.broker.config import opaque_request_id
 
 _REQUEST_SCHEMA = "pbe.a1-unix-broker.request.v1"
 _RESPONSE_SCHEMA = "pbe.a1-unix-broker.response.v1"
+_DELIVERY_COMMIT_SCHEMA = "pbe.a1-unix-broker.delivery-commit.v1"
+_DELIVERY_COMMIT_RESPONSE_SCHEMA = "pbe.a1-unix-broker.delivery-commit-response.v1"
 
 _RESERVED_PARAM_KEYS = frozenset(
     {
@@ -111,6 +113,7 @@ class BrokerExecuteResponse(_StrictModel):
     execution_fingerprint: str | None = None
     output_media_type: str | None = None
     output_sha256: str | None = None
+    output_size_bytes: int | None = Field(None, ge=0)
     output_b64: str | None = None
 
 
@@ -130,11 +133,59 @@ def _walk_forbidden(value: Any) -> None:
         raise ValueError("JSON compatible values only")
 
 
+class BrokerDeliveryCommitRequest(_StrictModel):
+    schema_version: Literal["pbe.a1-unix-broker.delivery-commit.v1"] = (
+        _DELIVERY_COMMIT_SCHEMA
+    )
+    request_id: str
+    output_sha256: str
+    output_size_bytes: int = Field(ge=0)
+
+    @field_validator("request_id")
+    @classmethod
+    def validate_request_id(cls, value: str) -> str:
+        return opaque_request_id(value)
+
+    @field_validator("output_sha256")
+    @classmethod
+    def validate_digest(cls, value: str) -> str:
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+            raise ValueError("output_sha256 required")
+        return value
+
+
+class BrokerDeliveryCommitResponse(_StrictModel):
+    schema_version: Literal["pbe.a1-unix-broker.delivery-commit-response.v1"] = (
+        _DELIVERY_COMMIT_RESPONSE_SCHEMA
+    )
+    request_id: str
+    status: Literal["accepted", "failed"]
+    error_code: str | None = None
+
+
 def parse_request(payload: object) -> BrokerExecuteRequest:
     if not isinstance(payload, dict):
         raise TypeError("request must be a JSON object")
     return BrokerExecuteRequest.model_validate(payload)
 
 
+def parse_delivery_commit(payload: object) -> BrokerDeliveryCommitRequest:
+    if not isinstance(payload, dict):
+        raise TypeError("delivery commit must be a JSON object")
+    return BrokerDeliveryCommitRequest.model_validate(payload)
+
+
+def message_schema_version(payload: object) -> str | None:
+    if isinstance(payload, dict):
+        version = payload.get("schema_version")
+        if isinstance(version, str):
+            return version
+    return None
+
+
 def response_to_json(response: BrokerExecuteResponse) -> bytes:
+    return (response.model_dump_json(exclude_none=True) + "\n").encode("utf-8")
+
+
+def delivery_commit_response_to_json(response: BrokerDeliveryCommitResponse) -> bytes:
     return (response.model_dump_json(exclude_none=True) + "\n").encode("utf-8")

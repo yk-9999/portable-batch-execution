@@ -37,14 +37,16 @@ def _handle_connection(connection: socket.socket, service: UnixBrokerService) ->
         _, uid, _gid = read_peer_credentials(connection)
         frame = _read_frame(connection, service.config.max_request_frame_bytes)
         payload = json.loads(frame.decode("utf-8"))
-        response = service.handle_payload(uid, payload)
+        response_bytes = service.handle_message(uid, payload)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        response = BrokerExecuteResponse(
-            request_id="unknown",
-            status="failed",
-            error_code="broker_internal_error",
+        response_bytes = response_to_json(
+            BrokerExecuteResponse(
+                request_id="unknown",
+                status="failed",
+                error_code="broker_internal_error",
+            )
         )
-    connection.sendall(response_to_json(response))
+    connection.sendall(response_bytes)
 
 
 def _read_frame(connection: socket.socket, max_frame_bytes: int) -> bytes:

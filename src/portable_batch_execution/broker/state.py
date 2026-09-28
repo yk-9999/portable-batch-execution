@@ -43,6 +43,7 @@ class BrokerRequestState:
     status: str
     execution_id: str | None = None
     output_sha256: str | None = None
+    output_size_bytes: int | None = None
     output_media_type: str | None = None
     dispatch_count: int = 0
     last_dispatched_failure_count: int = 0
@@ -66,6 +67,7 @@ class BrokerRequestState:
             "status": self.status,
             "execution_id": self.execution_id,
             "output_sha256": self.output_sha256,
+            "output_size_bytes": self.output_size_bytes,
             "output_media_type": self.output_media_type,
             "dispatch_count": self.dispatch_count,
             "last_dispatched_failure_count": self.last_dispatched_failure_count,
@@ -96,6 +98,7 @@ class BrokerRequestState:
             status=str(payload["status"]),
             execution_id=payload.get("execution_id"),
             output_sha256=payload.get("output_sha256"),
+            output_size_bytes=payload.get("output_size_bytes"),
             output_media_type=payload.get("output_media_type"),
             dispatch_count=int(payload.get("dispatch_count", 0)),
             last_dispatched_failure_count=int(
