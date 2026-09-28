@@ -24,6 +24,7 @@ from portable_batch_execution.controller.closed_wave_registry import (
 )
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
 from portable_batch_execution.kernel import RunController
+from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,9 @@ def _repository_root() -> Path:
 
 
 def _load_public_synthetic_plan() -> dict:
-    plan_path = _repository_root() / "fixtures" / "public" / "synthetic" / "wave-0000.json"
+    plan_path = (
+        _repository_root() / "fixtures" / "public" / "synthetic" / "wave-0000.json"
+    )
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     if not isinstance(plan, dict):
         raise TypeError("public synthetic wave plan must be an object")
@@ -119,7 +122,9 @@ def _inspect_dispatch_waves(waves: dict) -> dict:
         dispatches = _normalize_wave_dispatch_history(entry)
         inspected[wave_id] = {
             "dispatches": dispatches,
-            "latest_execution_id": dispatches[-1]["execution_id"] if dispatches else None,
+            "latest_execution_id": dispatches[-1]["execution_id"]
+            if dispatches
+            else None,
         }
     return inspected
 
@@ -171,7 +176,11 @@ class A1Controller:
         if not isinstance(waves, dict):
             raise TypeError("invalid dispatch waves")
         entry = waves.get(wave_id, {})
-        history = _normalize_wave_dispatch_history(entry) if isinstance(entry, dict) and entry else []
+        history = (
+            _normalize_wave_dispatch_history(entry)
+            if isinstance(entry, dict) and entry
+            else []
+        )
         record = _dispatch_record(execution)
         for existing in history:
             if existing["execution_id"] == record["execution_id"]:
@@ -200,54 +209,61 @@ class A1Controller:
 
         run_id = logical_run_id or f"run-{secrets.token_hex(8)}"
         wave = wave_id or f"wave-{secrets.token_hex(4)}"
-        input_ref = self.data_plane.write(data_path.read_bytes(), "application/json")
-        job = JobSpec.model_validate(
-            {
-                **plan["job"],
-                "logical_run_id": run_id,
-                "input_manifest_ref": input_ref.model_dump(mode="json"),
-                "execution": {
-                    "max_parallel": 1,
-                    "max_attempts_per_shard": 4,
-                    "resume_enabled": True,
-                },
-            }
-        )
-        shard_template = plan["shards"][0]
-        shard = ShardSpec.model_validate(
-            {
-                **shard_template,
-                "logical_run_id": run_id,
-                "correctness": job.sharding.model_dump(mode="json"),
-                "input_refs": [input_ref.model_dump(mode="json")],
-            }
-        )
-        wave_spec = WaveSpec(
-            logical_run_id=run_id,
-            wave_id=wave,
-            ordinal=0,
-            shard_ids=(shard.shard_id,),
-            max_parallel=1,
-        )
-        shards = (shard,)
-        self.registry.register_closed_wave(job, wave_spec, shards)
-        now = datetime.now(UTC)
-        manifest = RunManifest(
-            logical_run_id=run_id,
-            revision=0,
-            job_spec_digest=job_spec_digest(job),
-            status="planned",
-            expected_shard_ids=(shard.shard_id,),
-            created_at=now,
-            updated_at=now,
-            provenance=Provenance(
-                producer="a1-controller",
-                revision="private-synthetic-v1",
+        with lifecycle_state_lock(self.data_plane.root):
+            input_ref = self.data_plane.write(
+                data_path.read_bytes(),
+                "application/json",
+                _caller_holds_lifecycle_lock=True,
+            )
+            job = JobSpec.model_validate(
+                {
+                    **plan["job"],
+                    "logical_run_id": run_id,
+                    "input_manifest_ref": input_ref.model_dump(mode="json"),
+                    "execution": {
+                        "max_parallel": 1,
+                        "max_attempts_per_shard": 4,
+                        "resume_enabled": True,
+                    },
+                }
+            )
+            shard_template = plan["shards"][0]
+            shard = ShardSpec.model_validate(
+                {
+                    **shard_template,
+                    "logical_run_id": run_id,
+                    "correctness": job.sharding.model_dump(mode="json"),
+                    "input_refs": [input_ref.model_dump(mode="json")],
+                }
+            )
+            wave_spec = WaveSpec(
+                logical_run_id=run_id,
+                wave_id=wave,
+                ordinal=0,
+                shard_ids=(shard.shard_id,),
+                max_parallel=1,
+            )
+            shards = (shard,)
+            self.registry.register_closed_wave(
+                job, wave_spec, shards, _caller_holds_lifecycle_lock=True
+            )
+            now = datetime.now(UTC)
+            manifest = RunManifest(
+                logical_run_id=run_id,
+                revision=0,
+                job_spec_digest=job_spec_digest(job),
+                status="planned",
+                expected_shard_ids=(shard.shard_id,),
                 created_at=now,
-            ),
-            waves=(wave_spec,),
-        )
-        self.data_plane.write_next_manifest(manifest, -1)
+                updated_at=now,
+                provenance=Provenance(
+                    producer="a1-controller",
+                    revision="private-synthetic-v1",
+                    created_at=now,
+                ),
+                waves=(wave_spec,),
+            )
+            self.data_plane.write_next_manifest_with_caller_lifecycle_lock(manifest, -1)
         return PreparedPrivateRun(
             logical_run_id=run_id,
             wave_id=wave,
@@ -308,7 +324,9 @@ class A1Controller:
             "logical_run_id": run_id,
             "manifest_revision": manifest.revision if manifest else None,
             "manifest_status": manifest.status if manifest else None,
-            "dispatch": _inspect_dispatch_waves(waves if isinstance(waves, dict) else {}),
+            "dispatch": _inspect_dispatch_waves(
+                waves if isinstance(waves, dict) else {}
+            ),
             "backend_status": None
             if backend_status is None
             else {

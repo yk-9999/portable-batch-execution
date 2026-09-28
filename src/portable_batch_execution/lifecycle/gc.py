@@ -165,12 +165,25 @@ def plan_gc(
     state_root = state_root.resolve()
     now = now or datetime.now(UTC)
     index = build_reachability_index(state_root, policy)
+    return _plan_gc_from_index(state_root, policy, mode=mode, now=now, index=index)
+
+
+def _plan_gc_from_index(
+    state_root: Path,
+    policy: LifecyclePolicy,
+    *,
+    mode: GcMode,
+    now: datetime,
+    index: ReachabilityIndex,
+) -> GcReport:
     delivery_store = DeliveryRecordStore(state_root)
     deliveries = delivery_store.list_all()
     delivery_by_request = {item.request_id: item for item in deliveries}
 
     artifact_paths = sorted(artifacts_dir(state_root).glob("*"))
-    artifact_paths = [p for p in artifact_paths if p.is_file() and not p.name.endswith(".tmp")]
+    artifact_paths = [
+        p for p in artifact_paths if p.is_file() and not p.name.endswith(".tmp")
+    ]
 
     total_bytes = sum(p.stat().st_size for p in artifact_paths)
     sweep = _SweepState(
@@ -284,15 +297,40 @@ def apply_gc(
     crash_after_unlink: set[str] | None = None,
 ) -> GcReport:
     """Apply planned deletions; optional crash simulation for tests."""
-    report = plan_gc(state_root, policy, mode=mode, now=now)
-    if report.blocked:
-        return report
+    state_root = state_root.resolve()
     now = now or datetime.now(UTC)
     receipt_store = DeletionReceiptStore(state_root)
     intent_store = DeletionIntentStore(state_root)
     delivery_store = DeliveryRecordStore(state_root)
     deleted: list[GcCandidate] = []
     with lifecycle_state_lock(state_root):
+        sweeps: dict[GcMode, _SweepState] = {}
+        requested_index = build_reachability_index(state_root, policy)
+        report = _plan_gc_from_index(
+            state_root, policy, mode=mode, now=now, index=requested_index
+        )
+        if report.blocked:
+            return report
+        sweeps[mode] = _make_sweep(
+            state_root,
+            policy,
+            mode=mode,
+            now=now,
+            index=requested_index,
+            delivery_store=delivery_store,
+        )
+        pending = intent_store.list_all()
+        for pending_mode in {item.mode for item in pending}:
+            if pending_mode not in sweeps:
+                pending_index = build_reachability_index(state_root, policy)
+                sweeps[pending_mode] = _make_sweep(
+                    state_root,
+                    policy,
+                    mode=pending_mode,
+                    now=now,
+                    index=pending_index,
+                    delivery_store=delivery_store,
+                )
         deleted.extend(
             _converge_pending_deletion_intents(
                 state_root,
@@ -302,6 +340,7 @@ def apply_gc(
                 receipt_store=receipt_store,
                 intent_store=intent_store,
                 delivery_store=delivery_store,
+                sweeps=sweeps,
             )
         )
         deleted.extend(
@@ -315,6 +354,7 @@ def apply_gc(
                 intent_store=intent_store,
                 delivery_store=delivery_store,
                 crash_after_unlink=crash_after_unlink,
+                sweep=sweeps[mode],
             )
         )
         deleted.extend(
@@ -325,6 +365,7 @@ def apply_gc(
                 now=now,
                 receipt_store=receipt_store,
                 delivery_store=delivery_store,
+                sweep=sweeps[mode],
             )
         )
     report.deleted = tuple(deleted)
@@ -342,6 +383,7 @@ def _apply_gc_candidates(
     intent_store: DeletionIntentStore,
     delivery_store: DeliveryRecordStore,
     crash_after_unlink: set[str] | None,
+    sweep: _SweepState,
 ) -> list[GcCandidate]:
     deleted: list[GcCandidate] = []
     for candidate in candidates:
@@ -350,10 +392,7 @@ def _apply_gc_candidates(
             continue
         if intent_store.load(digest) is not None:
             continue
-        fresh = build_reachability_index(state_root, policy)
-        if fresh.is_protected(digest) or digest in fresh.unknown_digests:
-            continue
-        if fresh.unknown_messages:
+        if sweep.index.is_protected(digest) or digest in sweep.index.unknown_digests:
             continue
         path = artifact_payload_path(state_root, digest)
         if not path.is_file():
@@ -366,11 +405,12 @@ def _apply_gc_candidates(
                 now=now,
                 delivery_store=delivery_store,
                 path=path,
+                index=sweep.index,
             )
             receipt_store.save(receipt)
             deleted.append(candidate)
             continue
-        if not _still_eligible(state_root, policy, mode=mode, digest=digest, now=now):
+        if not _sweep_eligible(state_root, sweep, mode=mode, digest=digest):
             continue
         intent = _deletion_intent_for_digest(
             state_root,
@@ -381,6 +421,7 @@ def _apply_gc_candidates(
             now=now,
             delivery_store=delivery_store,
             path=path,
+            index=sweep.index,
         )
         intent_store.save(intent)
         path.unlink(missing_ok=True)
@@ -403,6 +444,7 @@ def _converge_pending_deletion_intents(
     receipt_store: DeletionReceiptStore,
     intent_store: DeletionIntentStore,
     delivery_store: DeliveryRecordStore,
+    sweeps: dict[GcMode, _SweepState],
 ) -> list[GcCandidate]:
     converged: list[GcCandidate] = []
     for intent in intent_store.list_all():
@@ -419,15 +461,13 @@ def _converge_pending_deletion_intents(
                 GcCandidate(digest=digest, size_bytes=intent.artifact_size_bytes)
             )
             continue
-        fresh = build_reachability_index(state_root, policy)
-        if fresh.is_protected(digest) or digest in fresh.unknown_digests:
+        sweep = sweeps[intent.mode]
+        if sweep.index.is_protected(digest) or digest in sweep.index.unknown_digests:
             intent_store.finalize(digest)
             continue
-        if fresh.unknown_messages:
+        if sweep.index.unknown_messages:
             continue
-        if not _still_eligible(
-            state_root, policy, mode=intent.mode, digest=digest, now=now
-        ):
+        if not _sweep_eligible(state_root, sweep, mode=intent.mode, digest=digest):
             intent_store.finalize(digest)
             continue
         path.unlink(missing_ok=True)
@@ -435,7 +475,9 @@ def _converge_pending_deletion_intents(
         receipt = intent.to_receipt(now)
         receipt_store.save(receipt)
         intent_store.finalize(digest)
-        converged.append(GcCandidate(digest=digest, size_bytes=intent.artifact_size_bytes))
+        converged.append(
+            GcCandidate(digest=digest, size_bytes=intent.artifact_size_bytes)
+        )
     return converged
 
 
@@ -448,15 +490,32 @@ def _still_eligible(
     now: datetime,
 ) -> bool:
     delivery_store = DeliveryRecordStore(state_root)
-    sweep = _SweepState(
+    sweep = _make_sweep(
         state_root=state_root,
         index=build_reachability_index(state_root, policy),
-        delivery_by_request={item.request_id: item for item in delivery_store.list_all()},
+        policy=policy,
+        now=now,
+        mode=mode,
+        delivery_store=delivery_store,
+    )
+    return _sweep_eligible(state_root, sweep, mode=mode, digest=digest)
+
+
+def _make_sweep(state_root, policy, *, mode, now, index, delivery_store):
+    return _SweepState(
+        state_root=state_root,
+        index=index,
+        delivery_by_request={
+            item.request_id: item for item in delivery_store.list_all()
+        },
         policy=policy,
         now=now,
         mode=mode,
         receipt_store=DeletionReceiptStore(state_root),
     )
+
+
+def _sweep_eligible(state_root, sweep, *, mode, digest):
     path = artifact_payload_path(state_root, digest)
     if mode == "normal":
         return _normal_eligible(state_root, sweep, digest, path)
@@ -471,17 +530,9 @@ def _converge_receipts_for_missing_payloads(
     now: datetime,
     receipt_store: DeletionReceiptStore,
     delivery_store: DeliveryRecordStore,
+    sweep: _SweepState,
 ) -> list[GcCandidate]:
     converged: list[GcCandidate] = []
-    sweep = _SweepState(
-        state_root=state_root,
-        index=build_reachability_index(state_root, policy),
-        delivery_by_request={item.request_id: item for item in delivery_store.list_all()},
-        policy=policy,
-        now=now,
-        mode=mode,
-        receipt_store=receipt_store,
-    )
     seen: set[str] = set()
     for record in delivery_store.list_all():
         digest = record.artifact_digest
@@ -507,6 +558,7 @@ def _converge_receipts_for_missing_payloads(
             now=now,
             delivery_store=delivery_store,
             path=path,
+            index=sweep.index,
         )
         receipt_store.save(receipt)
         converged.append(GcCandidate(digest=digest, size_bytes=size))
@@ -523,6 +575,7 @@ def _deletion_intent_for_digest(
     now: datetime,
     delivery_store: DeliveryRecordStore,
     path: Path,
+    index: ReachabilityIndex,
 ) -> DeletionIntent:
     metadata = _deletion_metadata_for_digest(
         state_root,
@@ -532,6 +585,7 @@ def _deletion_intent_for_digest(
         policy=policy,
         delivery_store=delivery_store,
         path=path,
+        index=index,
     )
     return DeletionIntent(
         artifact_digest=digest,
@@ -557,8 +611,8 @@ def _deletion_metadata_for_digest(
     policy: LifecyclePolicy,
     delivery_store: DeliveryRecordStore,
     path: Path,
+    index: ReachabilityIndex,
 ) -> dict:
-    index = build_reachability_index(state_root, policy)
     run_ids = tuple(sorted(index.run_ids_by_digest.get(digest, ())))
     delivery = next(
         (item for item in delivery_store.list_all() if item.artifact_digest == digest),
@@ -588,6 +642,7 @@ def _receipt_for_digest(
     now: datetime,
     delivery_store: DeliveryRecordStore,
     path: Path | None = None,
+    index: ReachabilityIndex,
 ) -> DeletionReceipt:
     if path is None:
         path = artifact_payload_path(state_root, digest)
@@ -599,6 +654,7 @@ def _receipt_for_digest(
         policy=policy,
         delivery_store=delivery_store,
         path=path,
+        index=index,
     )
     return DeletionReceipt(
         artifact_digest=digest,
@@ -626,10 +682,15 @@ def _broker_requests_for_digest(
     controller_root = state_root / "controller"
     for path in (controller_root / "broker" / "requests").glob("*.json"):
         try:
-            state = BrokerRequestState.from_json(json.loads(path.read_text(encoding="utf-8")))
+            state = BrokerRequestState.from_json(
+                json.loads(path.read_text(encoding="utf-8"))
+            )
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             continue
-        if state.output_sha256 == digest and state.status in BROKER_TRANSPORT_OUTPUT_STATUSES:
+        if (
+            state.output_sha256 == digest
+            and state.status in BROKER_TRANSPORT_OUTPUT_STATUSES
+        ):
             request_ids.add(state.request_id)
     return sorted(request_ids)
 

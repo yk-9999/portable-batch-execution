@@ -7,6 +7,7 @@ from pathlib import Path
 from threading import RLock
 
 from portable_batch_execution.contracts import JobSpec, ShardSpec, WaveSpec
+from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 
 _FORBIDDEN = "/\\?#"
 _MAX_COMPONENT_LEN = 128
@@ -33,6 +34,7 @@ class ClosedWaveRegistry:
 
     def __init__(self, controller_root: Path):
         self._root = controller_root.resolve()
+        self._state_root = self._root.parent
         self._root.mkdir(parents=True, exist_ok=True)
         self._waves = self._root / "closed_waves"
         self._waves.mkdir(exist_ok=True)
@@ -49,6 +51,8 @@ class ClosedWaveRegistry:
         job: JobSpec,
         wave: WaveSpec,
         shards: tuple[ShardSpec, ...],
+        *,
+        _caller_holds_lifecycle_lock: bool = False,
     ) -> None:
         run_id = opaque_identifier(job.logical_run_id, "run_id")
         wave_id = opaque_identifier(wave.wave_id, "wave_id")
@@ -63,21 +67,28 @@ class ClosedWaveRegistry:
             "wave": wave.model_dump(mode="json"),
             "shards": [shard.model_dump(mode="json") for shard in shards],
         }
-        with self._lock:
-            run_dir = self._run_dir(run_id)
-            job_path = run_dir / "job.json"
-            if job_path.exists():
-                existing = JobSpec.model_validate_json(job_path.read_text(encoding="utf-8"))
-                if existing != job:
-                    raise ValueError("run already registered with a different job")
-            else:
-                job_path.write_text(job.model_dump_json() + "\n", encoding="utf-8")
-            wave_path = run_dir / f"{wave_id}.wave.json"
-            if wave_path.exists():
-                raise ValueError("wave_id already registered for run")
-            temporary = wave_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(bundle) + "\n", encoding="utf-8")
-            temporary.replace(wave_path)
+        if _caller_holds_lifecycle_lock:
+            with self._lock:
+                self._register_closed_wave_unlocked(run_id, wave_id, job, bundle)
+        else:
+            with self._lock, lifecycle_state_lock(self._state_root):
+                self._register_closed_wave_unlocked(run_id, wave_id, job, bundle)
+
+    def _register_closed_wave_unlocked(self, run_id, wave_id, job, bundle) -> None:
+        run_dir = self._run_dir(run_id)
+        job_path = run_dir / "job.json"
+        if job_path.exists():
+            existing = JobSpec.model_validate_json(job_path.read_text(encoding="utf-8"))
+            if existing != job:
+                raise ValueError("run already registered with a different job")
+        else:
+            job_path.write_text(job.model_dump_json() + "\n", encoding="utf-8")
+        wave_path = run_dir / f"{wave_id}.wave.json"
+        if wave_path.exists():
+            raise ValueError("wave_id already registered for run")
+        temporary = wave_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(bundle) + "\n", encoding="utf-8")
+        temporary.replace(wave_path)
 
     def resolve_wave(self, run_id: str, wave_id: str) -> dict[str, object]:
         run_id = opaque_identifier(run_id, "run_id")

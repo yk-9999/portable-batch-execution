@@ -41,7 +41,9 @@ _CLOSED_ML_BATCH_OPERATIONS = frozenset(
 )
 
 
-def canonical_operation_params(pack: str, operation: str, params: dict[str, Any]) -> dict[str, Any]:
+def canonical_operation_params(
+    pack: str, operation: str, params: dict[str, Any]
+) -> dict[str, Any]:
     if pack == "tabular-batch":
         return TabularPack().validate_params(operation, params)
     if pack == "ml-batch":
@@ -81,7 +83,9 @@ def broker_composite_input_digest(
     material = json.dumps(
         {
             "client_input_digest": raw_client_digest,
-            "static_input_refs": [_static_ref_projection(ref) for ref in static_input_refs],
+            "static_input_refs": [
+                _static_ref_projection(ref) for ref in static_input_refs
+            ],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -299,7 +303,9 @@ def register_broker_private_run(
             max_parallel=1,
         )
         plane._validate_local_refs(tuple(shard.input_refs))
-        registry.register_closed_wave(job, wave, (shard,))
+        registry.register_closed_wave(
+            job, wave, (shard,), _caller_holds_lifecycle_lock=True
+        )
         manifest = _initial_manifest(job, wave, shard)
         plane.write_next_manifest_with_caller_lifecycle_lock(manifest, -1)
     return job, wave, shard, manifest

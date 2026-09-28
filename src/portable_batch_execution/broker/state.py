@@ -9,6 +9,7 @@ from threading import RLock
 from typing import Any
 
 from portable_batch_execution.broker.config import opaque_request_id
+from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 
 _STATE_SCHEMA = "pbe.a1-unix-broker.request-state.v1"
 
@@ -110,13 +111,17 @@ class BrokerRequestState:
             last_dispatched_failure_count=int(
                 payload.get("last_dispatched_failure_count", 0)
             ),
-            last_reconciled_attempt_marker=payload.get("last_reconciled_attempt_marker"),
+            last_reconciled_attempt_marker=payload.get(
+                "last_reconciled_attempt_marker"
+            ),
         )
 
 
 class BrokerRequestStore:
     def __init__(self, controller_root: Path):
-        self._root = controller_root.resolve() / "broker" / "requests"
+        controller_root = controller_root.resolve()
+        self._state_root = controller_root.parent
+        self._root = controller_root / "broker" / "requests"
         self._root.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
 
@@ -136,6 +141,6 @@ class BrokerRequestStore:
     def save(self, state: BrokerRequestState) -> None:
         path = self._path(state.request_id)
         temporary = path.with_suffix(".tmp")
-        with self._lock:
+        with self._lock, lifecycle_state_lock(self._state_root):
             temporary.write_text(json.dumps(state.to_json()) + "\n", encoding="utf-8")
             temporary.replace(path)

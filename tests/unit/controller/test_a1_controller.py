@@ -48,6 +48,42 @@ def test_prepare_registers_closed_wave_and_manifest(tmp_path):
     assert manifest is not None and manifest.revision == 0
 
 
+def test_prepare_publishes_input_refs_and_manifest_in_one_lifecycle_transaction(
+    tmp_path,
+):
+    from contextlib import contextmanager
+
+    from portable_batch_execution.controller import a1_controller as controller_module
+    from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
+
+    entries = []
+
+    @contextmanager
+    def counted_lock(state_root):
+        entries.append(state_root)
+        with lifecycle_state_lock(state_root):
+            yield
+
+    controller = A1Controller(tmp_path)
+    with patch.object(controller_module, "lifecycle_state_lock", counted_lock):
+        prepared = controller.prepare_private_synthetic_run(
+            logical_run_id="one-transaction", wave_id="one-transaction-wave"
+        )
+
+    assert entries == [tmp_path.resolve()]
+    assert controller.data_plane.exists(prepared.job.input_manifest_ref)
+    assert (
+        controller.registry.resolve_wave(prepared.logical_run_id, prepared.wave_id)[
+            "job"
+        ]["input_manifest_ref"]["sha256"]
+        == prepared.job.input_manifest_ref.sha256
+    )
+    assert (
+        controller.data_plane.read_manifest(prepared.logical_run_id)
+        == prepared.manifest
+    )
+
+
 def test_dispatch_state_rejects_path_like_run_id(tmp_path):
     controller = A1Controller(tmp_path)
     with pytest.raises(ValueError, match="opaque identifier"):
@@ -60,7 +96,9 @@ def test_dispatch_state_rejects_path_like_run_id(tmp_path):
 
 def test_dispatch_persists_exact_backend_execution_id(tmp_path):
     def handler(request):
-        return httpx.Response(201, json={"workflow_run_id": 424242, "html_url": "https://run"})
+        return httpx.Response(
+            201, json={"workflow_run_id": 424242, "html_url": "https://run"}
+        )
 
     controller = A1Controller(tmp_path, backend=_mock_backend(handler))
     prepared = controller.prepare_private_synthetic_run(
@@ -129,8 +167,11 @@ def test_private_client_round_trips_through_service_dispatch(tmp_path):
     )
     payload = plane.resolve_wave("opaque-run", "opaque-wave")
     assert payload["wave"]["wave_id"] == prepared.wave_id
-    with patch(
-        "portable_batch_execution.worker.execute_wave.TabularPack.execute",
-        side_effect=RuntimeError("fail"),
-    ), pytest.raises(PrivateWaveExecutionError):
+    with (
+        patch(
+            "portable_batch_execution.worker.execute_wave.TabularPack.execute",
+            side_effect=RuntimeError("fail"),
+        ),
+        pytest.raises(PrivateWaveExecutionError),
+    ):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)

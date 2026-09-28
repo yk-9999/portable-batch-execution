@@ -38,8 +38,10 @@ from portable_batch_execution.contracts import (
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
+from portable_batch_execution.lifecycle import gc as gc_module
 from portable_batch_execution.lifecycle.cli import main as lifecycle_cli_main
 from portable_batch_execution.lifecycle.deletion import (
+    DeletionIntent,
     DeletionIntentStore,
     DeletionReceiptStore,
 )
@@ -75,6 +77,7 @@ def _local_service(tmp_path, config: BrokerConfig) -> UnixBrokerService:
         poll_interval_seconds=0.0,
     )
 
+
 _PUBLIC_SHA = "ac3a69d2c818526b87f38c848d324221e2dc2775"
 
 
@@ -104,7 +107,9 @@ def _register_request(service: UnixBrokerService, request_id: str):
     body = json.dumps([{"id": 2}, {"id": 1}]).encode()
     static = service.config.static_input_refs_for(req["pack"], req["operation"])
     input_digest = broker_shard_input_digest(body, static)
-    validated = canonical_operation_params(req["pack"], req["operation"], req["operation_params"])
+    validated = canonical_operation_params(
+        req["pack"], req["operation"], req["operation_params"]
+    )
     register_broker_private_run(
         state_root=service.state_root,
         request_id=request_id,
@@ -156,7 +161,9 @@ def _succeed_broker(service: UnixBrokerService, request_id: str, output: bytes):
     BrokerRequestStore(service.state_root / "controller").save(state)
 
 
-def _delivery_commit(service: UnixBrokerService, request_id: str, digest: str, size: int):
+def _delivery_commit(
+    service: UnixBrokerService, request_id: str, digest: str, size: int
+):
     response = service.handle_delivery_commit(
         _UID,
         {
@@ -173,7 +180,7 @@ def test_durable_write_failure_does_not_record_delivery(tmp_path):
     config = _config(tmp_path)
     service = _local_service(tmp_path, config)
     request_id = "req-durable-fail"
-    output = b"[{\"id\":1}]"
+    output = b'[{"id":1}]'
     _succeed_broker(service, request_id, output)
     response = service.handle_payload(_UID, _request(request_id=request_id))
     assert response.status == "succeeded"
@@ -187,13 +194,14 @@ def test_durable_write_failure_does_not_record_delivery(tmp_path):
 
     client = UnixBrokerClient(sender=sender)
     destination = tmp_path / "out" / "result.json"
-    with patch(
-        "portable_batch_execution.broker.client.persist_verified_bytes",
-        side_effect=OSError("disk full"),
-    ), pytest.raises(OSError):
-        client.execute_and_durably_persist(
-            _request(request_id=request_id), destination
-        )
+    with (
+        patch(
+            "portable_batch_execution.broker.client.persist_verified_bytes",
+            side_effect=OSError("disk full"),
+        ),
+        pytest.raises(OSError),
+    ):
+        client.execute_and_durably_persist(_request(request_id=request_id), destination)
     assert not DeliveryRecordStore(tmp_path).load(request_id)
     retry = service.handle_payload(_UID, _request(request_id=request_id))
     assert retry.status == "succeeded"
@@ -203,11 +211,13 @@ def test_durable_success_auto_records_delivery(tmp_path):
     config = _config(tmp_path)
     service = _local_service(tmp_path, config)
     request_id = "req-durable-ok"
-    output = b"[{\"id\":1}]"
+    output = b'[{"id":1}]'
     _succeed_broker(service, request_id, output)
 
     client = UnixBrokerClient(
-        sender=lambda frame: service.handle_message(_UID, json.loads(frame.decode("utf-8")))
+        sender=lambda frame: service.handle_message(
+            _UID, json.loads(frame.decode("utf-8"))
+        )
     )
     destination = tmp_path / "out" / "result.json"
     result = client.execute_and_durably_persist(
@@ -327,7 +337,9 @@ def test_succeeded_undelivered_broker_output_stays_protected(tmp_path):
     assert review["protection_reason_aggregates"]
 
 
-def test_legacy_gc_dry_run_review_json_includes_candidates_and_protected(tmp_path, capsys):
+def test_legacy_gc_dry_run_review_json_includes_candidates_and_protected(
+    tmp_path, capsys
+):
     _write_policy(tmp_path, grace=0, legacy=0)
     digest = "sha256:" + "e" * 64
     path = artifact_payload_path(tmp_path, digest)
@@ -378,7 +390,9 @@ def test_legacy_gc_crash_after_unlink_converges_receipt(tmp_path):
     receipt = apply_gc(tmp_path, policy, mode="legacy", now=datetime.now(UTC))
     assert DeletionReceiptStore(tmp_path).load(digest) is not None
     assert receipt.deleted
-    assert apply_gc(tmp_path, policy, mode="legacy", now=datetime.now(UTC)).deleted == ()
+    assert (
+        apply_gc(tmp_path, policy, mode="legacy", now=datetime.now(UTC)).deleted == ()
+    )
 
 
 def test_legacy_gc_dry_run_and_unknown_state(tmp_path):
@@ -387,7 +401,9 @@ def test_legacy_gc_dry_run_and_unknown_state(tmp_path):
     path = artifact_payload_path(tmp_path, digest)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"x")
-    report = plan_gc(tmp_path, policy, mode="legacy", now=datetime.now(UTC) + timedelta(days=1))
+    report = plan_gc(
+        tmp_path, policy, mode="legacy", now=datetime.now(UTC) + timedelta(days=1)
+    )
     assert report.artifact_count >= 1
     run_dir = tmp_path / "runs" / "run-bad"
     run_dir.mkdir(parents=True)
@@ -423,7 +439,9 @@ def test_external_reference_file_protects_payload(tmp_path):
         legacy=0,
         authoritative_reference_files=(str(config_path),),
     )
-    report = plan_gc(tmp_path, policy, mode="legacy", now=datetime.now(UTC) + timedelta(days=30))
+    report = plan_gc(
+        tmp_path, policy, mode="legacy", now=datetime.now(UTC) + timedelta(days=30)
+    )
     assert digest in {item.digest for item in report.protected}
     assert report.blocked is False
 
@@ -505,7 +523,9 @@ def test_apply_gc_refuses_deletion_when_authoritative_state_unreadable(tmp_path)
 
 def test_local_data_plane_write_acquires_lifecycle_lock(tmp_path):
     with patch.object(LifecycleStateLock, "acquire", autospec=True) as acquire:
-        LocalFilesystemDataPlane(tmp_path).write(b"new-artifact", "application/octet-stream")
+        LocalFilesystemDataPlane(tmp_path).write(
+            b"new-artifact", "application/octet-stream"
+        )
     acquire.assert_called_once()
 
 
@@ -572,7 +592,9 @@ def _register_closed_wave_input(
         shard_ids=(shard.shard_id,),
         max_parallel=1,
     )
-    ClosedWaveRegistry(tmp_path / "controller").register_closed_wave(job, wave, (shard,))
+    ClosedWaveRegistry(tmp_path / "controller").register_closed_wave(
+        job, wave, (shard,)
+    )
 
 
 def _historical_closed_wave_job_payload(
@@ -691,7 +713,9 @@ def test_nonterminal_manifest_still_blocks_gc(tmp_path):
     plane = LocalFilesystemDataPlane(tmp_path)
     ref = plane.write(data, "application/octet-stream")
     plane.write_next_manifest(
-        _non_broker_manifest(run_id="running-run", status="running", final_output_refs=(ref,)),
+        _non_broker_manifest(
+            run_id="running-run", status="running", final_output_refs=(ref,)
+        ),
         -1,
     )
     index = build_reachability_index(tmp_path, policy)
@@ -700,10 +724,14 @@ def test_nonterminal_manifest_still_blocks_gc(tmp_path):
     assert ref.sha256 in {item.digest for item in report.protected}
 
 
-def test_legacy_gc_closed_wave_reachability_tolerates_historical_job_semantics(tmp_path):
+def test_legacy_gc_closed_wave_reachability_tolerates_historical_job_semantics(
+    tmp_path,
+):
     policy = _write_policy(tmp_path, grace=0, legacy=0)
     plane = LocalFilesystemDataPlane(tmp_path)
-    manifest_input = plane.write(b"historical-manifest-input", "application/octet-stream")
+    manifest_input = plane.write(
+        b"historical-manifest-input", "application/octet-stream"
+    )
     shard_input = plane.write(b"historical-shard-input", "application/octet-stream")
     run_id = "historical-closed-wave-run"
     created_at = datetime(2024, 6, 1, 12, 0, tzinfo=UTC)
@@ -747,7 +775,9 @@ def test_legacy_gc_closed_wave_file_mtime_advances_last_reference_time(tmp_path)
 def test_legacy_gc_closed_wave_historical_inputs_hard_protected_for_live_run(tmp_path):
     policy = _write_policy(tmp_path, grace=0, legacy=0)
     plane = LocalFilesystemDataPlane(tmp_path)
-    manifest_input = plane.write(b"live-historical-manifest", "application/octet-stream")
+    manifest_input = plane.write(
+        b"live-historical-manifest", "application/octet-stream"
+    )
     shard_input = plane.write(b"live-historical-shard", "application/octet-stream")
     run_id = "historical-live-run"
     bundle = _historical_closed_wave_job_payload(
@@ -762,7 +792,9 @@ def test_legacy_gc_closed_wave_historical_inputs_hard_protected_for_live_run(tmp
         -1,
     )
     index = build_reachability_index(tmp_path, policy)
-    assert f"closed_wave_input:{run_id}" in index.protection_reasons(manifest_input.sha256)
+    assert f"closed_wave_input:{run_id}" in index.protection_reasons(
+        manifest_input.sha256
+    )
     assert f"closed_wave_input:{run_id}" in index.protection_reasons(shard_input.sha256)
 
 
@@ -798,8 +830,12 @@ def test_legacy_gc_closed_wave_historical_reachability_fail_closed(tmp_path):
         wave_id="wave-bad-ref",
     )
     index = build_reachability_index(tmp_path, policy)
-    assert any("logical_run_id mismatch" in message for message in index.unknown_messages)
-    assert any("closed wave shard invalid" in message for message in index.unknown_messages)
+    assert any(
+        "logical_run_id mismatch" in message for message in index.unknown_messages
+    )
+    assert any(
+        "closed wave shard invalid" in message for message in index.unknown_messages
+    )
 
 
 def test_legacy_gc_protects_closed_wave_input_for_nonterminal_broker(tmp_path):
@@ -906,7 +942,7 @@ def test_legacy_gc_terminal_broker_closed_wave_input_becomes_eligible(tmp_path):
     store = BrokerRequestStore(service.state_root / "controller")
     state = store.load("req-terminal-input")
     assert state is not None
-    output = b"[{\"id\":1}]"
+    output = b'[{"id":1}]'
     digest_out = f"sha256:{sha256(output).hexdigest()}"
     _append_success_attempt(service.controller, "req-terminal-input", output)
     state.status = "succeeded"
@@ -1056,7 +1092,7 @@ def test_register_broker_reuses_gc_eligible_digest_atomically(tmp_path):
     gc_outcome: list[str] = []
     original_register = ClosedWaveRegistry.register_closed_wave
 
-    def register_with_concurrent_gc(self, job, wave, shards):
+    def register_with_concurrent_gc(self, job, wave, shards, **kwargs):
         def run_gc():
             try:
                 apply_gc(tmp_path, policy, mode="normal")
@@ -1068,7 +1104,7 @@ def test_register_broker_reuses_gc_eligible_digest_atomically(tmp_path):
         thread.start()
         thread.join(timeout=10)
         assert gc_outcome == ["blocked"]
-        return original_register(self, job, wave, shards)
+        return original_register(self, job, wave, shards, **kwargs)
 
     with patch.object(
         ClosedWaveRegistry, "register_closed_wave", register_with_concurrent_gc
@@ -1103,10 +1139,90 @@ def test_gc_deletion_sequence_fsyncs_directories(tmp_path):
     assert fsync_directory.call_count >= 1
 
 
+def test_broker_and_closed_wave_writers_obey_lifecycle_lock(tmp_path):
+    service = _local_service(tmp_path, _config(tmp_path))
+    _register_request(service, "req-lock-writer")
+    store = BrokerRequestStore(tmp_path / "controller")
+    state = store.load("req-lock-writer")
+    assert state is not None
+    registry = ClosedWaveRegistry(tmp_path / "controller")
+    payload = registry.resolve_wave(state.logical_run_id, state.wave_id)
+    job = JobSpec.model_validate(payload["job"])
+    wave = WaveSpec.model_validate(payload["wave"])
+    shards = tuple(ShardSpec.model_validate(item) for item in payload["shards"])
+
+    with LifecycleStateLock(tmp_path):
+        with pytest.raises(LifecycleLockError):
+            store.save(state)
+        with pytest.raises(LifecycleLockError):
+            registry.register_closed_wave(job, wave, shards)
+
+    # The explicit caller-owned-lock path performs the publication without
+    # trying to acquire the non-recursive interprocess lock again.
+    second_wave = wave.model_copy(update={"wave_id": "second-wave"})
+    with LifecycleStateLock(tmp_path):
+        registry.register_closed_wave(
+            job, second_wave, shards, _caller_holds_lifecycle_lock=True
+        )
+
+
+def test_apply_gc_reuses_one_reachability_build_for_many_candidates(tmp_path):
+    policy = _write_policy(tmp_path, legacy=0)
+    plane = LocalFilesystemDataPlane(tmp_path)
+    old = datetime.now(UTC) - timedelta(days=3)
+    for number in range(8):
+        ref = plane.write(f"orphan-{number}".encode())
+        os.utime(
+            artifact_payload_path(tmp_path, ref.sha256),
+            (old.timestamp(), old.timestamp()),
+        )
+
+    original = gc_module.build_reachability_index
+    with patch.object(gc_module, "build_reachability_index", wraps=original) as build:
+        report = apply_gc(tmp_path, policy, mode="legacy")
+
+    assert report.candidate_count == 8
+    assert len(report.deleted) == 8
+    assert build.call_count == 1
+
+
+def test_apply_gc_builds_one_index_per_cross_mode_pending_intent(tmp_path):
+    policy = _write_policy(tmp_path, legacy=0)
+    plane = LocalFilesystemDataPlane(tmp_path)
+    payload = b"pending-legacy-intent"
+    ref = plane.write(payload)
+    path = artifact_payload_path(tmp_path, ref.sha256)
+    old = datetime.now(UTC) - timedelta(days=3)
+    os.utime(path, (old.timestamp(), old.timestamp()))
+    intent_store = DeletionIntentStore(tmp_path)
+    intent_store.save(
+        DeletionIntent(
+            artifact_digest=ref.sha256,
+            artifact_size_bytes=len(payload),
+            logical_run_ids=(),
+            producer_uid=None,
+            consumer_uid=None,
+            provenance=None,
+            created_at=None,
+            delivered_at=None,
+            intended_at=old,
+            mode="legacy",
+            policy_identity="test",
+        )
+    )
+
+    original = gc_module.build_reachability_index
+    with patch.object(gc_module, "build_reachability_index", wraps=original) as build:
+        apply_gc(tmp_path, policy, mode="normal")
+
+    assert build.call_count == 2
+    assert not path.exists()
+
+
 def test_delivery_commit_idempotent_identical_replay(tmp_path):
     config = _config(tmp_path)
     service = _local_service(tmp_path, config)
-    output = b"[{\"id\":1}]"
+    output = b'[{"id":1}]'
     _succeed_broker(service, "req-replay", output)
     digest = f"sha256:{sha256(output).hexdigest()}"
     first = service.handle_delivery_commit(
@@ -1144,13 +1260,15 @@ def test_delivery_commit_idempotent_identical_replay(tmp_path):
             },
         )
     assert third.status == "accepted"
-    assert DeliveryRecordStore(tmp_path).load("req-replay").delivered_at == first_delivered
+    assert (
+        DeliveryRecordStore(tmp_path).load("req-replay").delivered_at == first_delivered
+    )
 
 
 def test_delivery_commit_conflicting_replay_fails(tmp_path):
     config = _config(tmp_path)
     service = _local_service(tmp_path, config)
-    output = b"[{\"id\":1}]"
+    output = b'[{"id":1}]'
     _succeed_broker(service, "req-conflict", output)
     digest = f"sha256:{sha256(output).hexdigest()}"
     accepted = service.handle_delivery_commit(
