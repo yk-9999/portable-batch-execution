@@ -90,6 +90,9 @@ class DeliveryRecordStore:
 
     @staticmethod
     def _transport_identity(record: DeliveryRecord) -> tuple:
+        created = (
+            record.created_at.isoformat() if record.created_at is not None else None
+        )
         return (
             record.request_id,
             record.logical_run_id,
@@ -97,6 +100,7 @@ class DeliveryRecordStore:
             record.artifact_size_bytes,
             record.producer_uid,
             record.consumer_uid,
+            created,
             json.dumps(record.provenance, sort_keys=True) if record.provenance else None,
         )
 

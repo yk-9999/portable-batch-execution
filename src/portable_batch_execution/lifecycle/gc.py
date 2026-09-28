@@ -21,6 +21,7 @@ from portable_batch_execution.broker.state import (
     BROKER_TRANSPORT_OUTPUT_STATUSES,
     BrokerRequestState,
 )
+from portable_batch_execution.lifecycle.durable import fsync_directory
 from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from portable_batch_execution.lifecycle.reachability import (
     ReachabilityIndex,
@@ -383,6 +384,7 @@ def _apply_gc_candidates(
         )
         intent_store.save(intent)
         path.unlink(missing_ok=True)
+        fsync_directory(path.parent)
         if crash_after_unlink and digest in crash_after_unlink:
             raise RuntimeError("simulated crash during gc sweep")
         receipt = intent.to_receipt(now)
@@ -429,6 +431,7 @@ def _converge_pending_deletion_intents(
             intent_store.finalize(digest)
             continue
         path.unlink(missing_ok=True)
+        fsync_directory(path.parent)
         receipt = intent.to_receipt(now)
         receipt_store.save(receipt)
         intent_store.finalize(digest)

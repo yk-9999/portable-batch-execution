@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Literal
 
-from portable_batch_execution.lifecycle.durable import write_json_atomically
+from portable_batch_execution.lifecycle.durable import fsync_directory, write_json_atomically
 from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from portable_batch_execution.lifecycle.paths import holds_dir
 
@@ -79,6 +79,7 @@ class HoldStore:
             with lifecycle_state_lock(self._state_root):
                 if path.is_file():
                     path.unlink()
+                    fsync_directory(self._root)
                     return True
                 return False
 

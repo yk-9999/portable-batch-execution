@@ -21,7 +21,8 @@ from portable_batch_execution.broker.planning import (
 from portable_batch_execution.broker.service import UnixBrokerService
 from portable_batch_execution.broker.state import BrokerRequestState, BrokerRequestStore, RequestBinding
 from portable_batch_execution.controller.a1_controller import A1Controller
-from portable_batch_execution.lifecycle.delivery import DeliveryRecordStore
+from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
+from portable_batch_execution.lifecycle.delivery import DeliveryRecord, DeliveryRecordStore
 from portable_batch_execution.contracts import ArtifactRef, Provenance, RunManifest, ShardAttemptRecord
 from portable_batch_execution.lifecycle.deletion import DeletionIntentStore, DeletionReceiptStore
 from portable_batch_execution.lifecycle.gc import apply_gc, plan_gc
@@ -29,7 +30,7 @@ from portable_batch_execution.lifecycle.holds import HoldStore, HoldRecord
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
 from portable_batch_execution.lifecycle.paths import lifecycle_policy_path
 from portable_batch_execution.lifecycle.policy import LifecyclePolicy
-from portable_batch_execution.lifecycle.lock import LifecycleStateLock
+from portable_batch_execution.lifecycle.lock import LifecycleLockError, LifecycleStateLock
 from portable_batch_execution.lifecycle.cli import main as lifecycle_cli_main
 from portable_batch_execution.lifecycle.reachability import artifact_payload_path, build_reachability_index
 from tests.unit.broker.test_unix_broker import (
@@ -597,6 +598,143 @@ def test_gc_prevents_publishing_ref_to_deleted_payload(tmp_path):
     )
     with pytest.raises(FileNotFoundError):
         plane.append_attempt(attempt)
+
+
+def test_delivery_transport_identity_conflicts_on_created_at(tmp_path):
+    now = datetime.now(UTC)
+    base = DeliveryRecord(
+        request_id="req-created-at",
+        logical_run_id="run-1",
+        artifact_digest="sha256:" + "a" * 64,
+        artifact_size_bytes=4,
+        producer_uid=None,
+        consumer_uid=1,
+        created_at=now,
+        delivered_at=now,
+        provenance={"pack": "tabular-batch", "operation": "tabular.sort"},
+    )
+    store = DeliveryRecordStore(tmp_path)
+    store.save_new(base)
+    conflict = DeliveryRecord(
+        request_id=base.request_id,
+        logical_run_id=base.logical_run_id,
+        artifact_digest=base.artifact_digest,
+        artifact_size_bytes=base.artifact_size_bytes,
+        producer_uid=base.producer_uid,
+        consumer_uid=base.consumer_uid,
+        created_at=now + timedelta(seconds=1),
+        delivered_at=now + timedelta(days=1),
+        provenance=base.provenance,
+    )
+    with pytest.raises(ValueError, match="delivery_commit_conflict"):
+        store.save_new(conflict)
+
+
+def test_delivery_transport_identity_ignores_delivered_at_retry(tmp_path):
+    now = datetime.now(UTC)
+    base = DeliveryRecord(
+        request_id="req-delivered-at",
+        logical_run_id="run-1",
+        artifact_digest="sha256:" + "b" * 64,
+        artifact_size_bytes=8,
+        producer_uid=None,
+        consumer_uid=1,
+        created_at=now,
+        delivered_at=now,
+    )
+    store = DeliveryRecordStore(tmp_path)
+    store.save_new(base)
+    retry = DeliveryRecord(
+        request_id=base.request_id,
+        logical_run_id=base.logical_run_id,
+        artifact_digest=base.artifact_digest,
+        artifact_size_bytes=base.artifact_size_bytes,
+        producer_uid=base.producer_uid,
+        consumer_uid=base.consumer_uid,
+        created_at=base.created_at,
+        delivered_at=now + timedelta(days=2),
+    )
+    store.save_new(retry)
+    assert store.load(base.request_id).delivered_at == now
+
+
+def test_register_broker_holds_lifecycle_lock_for_input_and_manifest(tmp_path):
+    with patch.object(LifecycleStateLock, "acquire", autospec=True) as acquire:
+        register_broker_private_run(
+            state_root=tmp_path,
+            request_id="req-lock-once",
+            pack="tabular-batch",
+            operation="tabular.sort",
+            operation_params={"by": [{"column": "id"}]},
+            input_bytes=b"[1,2]",
+            input_media_type="application/json",
+            public_sha=_PUBLIC_SHA,
+        )
+    assert acquire.call_count == 1
+
+
+def test_register_broker_reuses_gc_eligible_digest_atomically(tmp_path):
+    import threading
+
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    shared = b"shared-broker-input"
+    digest = f"sha256:{sha256(shared).hexdigest()}"
+    _succeed_broker(service, "req-old-shared", shared)
+    _delivery_commit(service, "req-old-shared", digest, len(shared))
+    assert digest in {
+        item.digest for item in plan_gc(tmp_path, policy, mode="normal").candidates
+    }
+
+    gc_outcome: list[str] = []
+    original_register = ClosedWaveRegistry.register_closed_wave
+
+    def register_with_concurrent_gc(self, job, wave, shards):
+        def run_gc():
+            try:
+                apply_gc(tmp_path, policy, mode="normal")
+                gc_outcome.append("ran")
+            except LifecycleLockError:
+                gc_outcome.append("blocked")
+
+        thread = threading.Thread(target=run_gc)
+        thread.start()
+        thread.join(timeout=10)
+        assert gc_outcome == ["blocked"]
+        return original_register(self, job, wave, shards)
+
+    with patch.object(
+        ClosedWaveRegistry, "register_closed_wave", register_with_concurrent_gc
+    ):
+        _, _, shard, manifest = register_broker_private_run(
+            state_root=tmp_path,
+            request_id="req-new-shared",
+            pack="tabular-batch",
+            operation="tabular.sort",
+            operation_params={"by": [{"column": "id"}]},
+            input_bytes=shared,
+            input_media_type="application/json",
+            public_sha=_PUBLIC_SHA,
+        )
+    assert artifact_payload_path(tmp_path, digest).is_file()
+    assert shard.input_refs[0].sha256 == digest
+    assert manifest is not None
+
+
+def test_gc_deletion_sequence_fsyncs_directories(tmp_path):
+    config = _config(tmp_path)
+    service = _local_service(tmp_path, config)
+    policy = _write_policy(tmp_path, grace=0, legacy=0)
+    output = b"fsync-me"
+    _succeed_broker(service, "req-fsync", output)
+    digest = f"sha256:{sha256(output).hexdigest()}"
+    _delivery_commit(service, "req-fsync", digest, len(output))
+    with patch(
+        "portable_batch_execution.lifecycle.gc.fsync_directory"
+    ) as fsync_directory:
+        apply_gc(tmp_path, policy, mode="normal")
+    assert fsync_directory.call_count >= 1
 
 
 def test_delivery_commit_idempotent_identical_replay(tmp_path):

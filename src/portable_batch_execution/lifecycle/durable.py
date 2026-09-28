@@ -59,15 +59,20 @@ def write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
     _fsync_parent(path)
 
 
-def _fsync_parent(path: Path) -> None:
-    parent = path.parent
-    if not parent.exists():
+def fsync_directory(directory: Path) -> None:
+    """Durably sync a directory inode after entry create/remove."""
+    directory = directory.resolve()
+    if not directory.is_dir():
         return
     try:
-        fd = os.open(parent, os.O_RDONLY)
+        fd = os.open(directory, os.O_RDONLY)
     except OSError:
         return
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _fsync_parent(path: Path) -> None:
+    fsync_directory(path.parent)
