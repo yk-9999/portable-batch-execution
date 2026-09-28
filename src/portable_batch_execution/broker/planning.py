@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from hashlib import sha256
+from pathlib import Path
 from typing import Any
 
 from portable_batch_execution.contracts import (
@@ -22,6 +23,7 @@ from portable_batch_execution.controller.a1_controller import job_spec_digest
 from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
 from portable_batch_execution.data_plane.base import RevisionConflictError
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
+from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from portable_batch_execution.packs import MLPack, TabularPack
 from portable_batch_execution.packs.replay_reduction.models import (
     PairedFillReduceJobParams,
@@ -148,7 +150,7 @@ def _validate_static_input_refs(
         if identity in seen_sha256:
             raise ValueError("duplicate static input reference identity")
         seen_sha256.add(identity)
-        if not plane.verify(ref):
+        if not plane.validate_static_ref(ref):
             raise ValueError("static input reference is missing or invalid")
 
 
@@ -244,9 +246,9 @@ def register_broker_private_run(
     public_sha: str,
     static_input_refs: tuple[ArtifactRef, ...] = (),
 ) -> tuple[JobSpec, WaveSpec, ShardSpec, RunManifest]:
+    state_root = Path(state_root).resolve()
     plane = LocalFilesystemDataPlane(state_root)
     registry = ClosedWaveRegistry(state_root / "controller")
-    _validate_static_input_refs(plane, static_input_refs)
     input_digest = broker_shard_input_digest(input_bytes, static_input_refs)
     validated_params = canonical_operation_params(pack, operation, operation_params)
     execution_fingerprint = broker_execution_fingerprint(
@@ -282,54 +284,62 @@ def register_broker_private_run(
         manifest = plane.read_manifest(run_id)
         if manifest is None:
             manifest = _initial_manifest(job, wave, shard)
-            try:
-                plane.write_next_manifest(manifest, -1)
-            except RevisionConflictError:
-                manifest = plane.read_manifest(run_id)
+            with lifecycle_state_lock(state_root):
+                _validate_static_input_refs(plane, static_input_refs)
+                plane._validate_local_refs(tuple(shard.input_refs))
+                try:
+                    plane.write_next_manifest_with_caller_lifecycle_lock(manifest, -1)
+                except RevisionConflictError:
+                    manifest = plane.read_manifest(run_id)
             if manifest is None:
                 raise ValueError("registered run missing manifest")
         return job, wave, shard, manifest
-    input_ref = plane.write(input_bytes, input_media_type)
     now = datetime.now(UTC)
-    job = JobSpec(
-        job_id=job_id,
-        logical_run_id=run_id,
-        pack=pack,
-        operation=operation,
-        input_manifest_ref=input_ref,
-        sharding=ShardCorrectnessSpec(mode="independent"),
-        execution=ExecutionPolicy(
+    with lifecycle_state_lock(state_root):
+        _validate_static_input_refs(plane, static_input_refs)
+        input_ref = plane.write(
+            input_bytes, input_media_type, _caller_holds_lifecycle_lock=True
+        )
+        job = JobSpec(
+            job_id=job_id,
+            logical_run_id=run_id,
+            pack=pack,
+            operation=operation,
+            input_manifest_ref=input_ref,
+            sharding=ShardCorrectnessSpec(mode="independent"),
+            execution=ExecutionPolicy(
+                max_parallel=1,
+                max_attempts_per_shard=4,
+                resume_enabled=True,
+            ),
+            security_profile="offline",
+            provenance=Provenance(
+                producer="a1-unix-broker",
+                revision="v1",
+                created_at=now,
+            ),
+            operation_params=validated_params,
+        )
+        shard = ShardSpec(
+            logical_run_id=run_id,
+            shard_id="shard-000000",
+            ordinal=0,
+            correctness=job.sharding,
+            input_refs=(input_ref, *static_input_refs),
+            input_digest=input_digest,
+            execution_fingerprint=execution_fingerprint,
+        )
+        wave = WaveSpec(
+            logical_run_id=run_id,
+            wave_id=wave_id,
+            ordinal=0,
+            shard_ids=(shard.shard_id,),
             max_parallel=1,
-            max_attempts_per_shard=4,
-            resume_enabled=True,
-        ),
-        security_profile="offline",
-        provenance=Provenance(
-            producer="a1-unix-broker",
-            revision="v1",
-            created_at=now,
-        ),
-        operation_params=validated_params,
-    )
-    shard = ShardSpec(
-        logical_run_id=run_id,
-        shard_id="shard-000000",
-        ordinal=0,
-        correctness=job.sharding,
-        input_refs=(input_ref, *static_input_refs),
-        input_digest=input_digest,
-        execution_fingerprint=execution_fingerprint,
-    )
-    wave = WaveSpec(
-        logical_run_id=run_id,
-        wave_id=wave_id,
-        ordinal=0,
-        shard_ids=(shard.shard_id,),
-        max_parallel=1,
-    )
-    registry.register_closed_wave(job, wave, (shard,))
-    manifest = _initial_manifest(job, wave, shard)
-    plane.write_next_manifest(manifest, -1)
+        )
+        plane._validate_local_refs(tuple(shard.input_refs))
+        registry.register_closed_wave(job, wave, (shard,))
+        manifest = _initial_manifest(job, wave, shard)
+        plane.write_next_manifest_with_caller_lifecycle_lock(manifest, -1)
     return job, wave, shard, manifest
 
 
@@ -346,6 +356,7 @@ def register_broker_hf_direct_run(
 ) -> tuple[JobSpec, WaveSpec, ShardSpec, RunManifest]:
     if operation != FIXED_SET_OPERATION:
         raise ValueError("HF-direct broker registration supports fixed-set replay only")
+    state_root = Path(state_root).resolve()
     plane = LocalFilesystemDataPlane(state_root)
     registry = ClosedWaveRegistry(state_root / "controller")
     validated_ref = validate_hf_bucket_ref(input_hf_ref)
@@ -391,51 +402,53 @@ def register_broker_hf_direct_run(
         manifest = plane.read_manifest(run_id)
         if manifest is None:
             manifest = _initial_manifest(job, wave, shard)
-            try:
-                plane.write_next_manifest(manifest, -1)
-            except RevisionConflictError:
-                manifest = plane.read_manifest(run_id)
+            with lifecycle_state_lock(state_root):
+                try:
+                    plane.write_next_manifest_with_caller_lifecycle_lock(manifest, -1)
+                except RevisionConflictError:
+                    manifest = plane.read_manifest(run_id)
             if manifest is None:
                 raise ValueError("registered run missing manifest")
         return job, wave, shard, manifest
     now = datetime.now(UTC)
-    job = JobSpec(
-        job_id=job_id,
-        logical_run_id=run_id,
-        pack=pack,
-        operation=operation,
-        input_manifest_ref=input_ref,
-        sharding=ShardCorrectnessSpec(mode="independent"),
-        execution=ExecutionPolicy(
+    with lifecycle_state_lock(state_root):
+        job = JobSpec(
+            job_id=job_id,
+            logical_run_id=run_id,
+            pack=pack,
+            operation=operation,
+            input_manifest_ref=input_ref,
+            sharding=ShardCorrectnessSpec(mode="independent"),
+            execution=ExecutionPolicy(
+                max_parallel=1,
+                max_attempts_per_shard=4,
+                resume_enabled=True,
+            ),
+            security_profile="offline",
+            provenance=Provenance(
+                producer="a1-unix-broker-hf-direct",
+                revision="v1",
+                created_at=now,
+            ),
+            operation_params=validated_params,
+        )
+        shard = ShardSpec(
+            logical_run_id=run_id,
+            shard_id="shard-000000",
+            ordinal=0,
+            correctness=job.sharding,
+            input_refs=(input_ref,),
+            input_digest=input_digest,
+            execution_fingerprint=execution_fingerprint,
+        )
+        wave = WaveSpec(
+            logical_run_id=run_id,
+            wave_id=wave_id,
+            ordinal=0,
+            shard_ids=(shard.shard_id,),
             max_parallel=1,
-            max_attempts_per_shard=4,
-            resume_enabled=True,
-        ),
-        security_profile="offline",
-        provenance=Provenance(
-            producer="a1-unix-broker-hf-direct",
-            revision="v1",
-            created_at=now,
-        ),
-        operation_params=validated_params,
-    )
-    shard = ShardSpec(
-        logical_run_id=run_id,
-        shard_id="shard-000000",
-        ordinal=0,
-        correctness=job.sharding,
-        input_refs=(input_ref,),
-        input_digest=input_digest,
-        execution_fingerprint=execution_fingerprint,
-    )
-    wave = WaveSpec(
-        logical_run_id=run_id,
-        wave_id=wave_id,
-        ordinal=0,
-        shard_ids=(shard.shard_id,),
-        max_parallel=1,
-    )
-    registry.register_closed_wave(job, wave, (shard,))
-    manifest = _initial_manifest(job, wave, shard)
-    plane.write_next_manifest(manifest, -1)
+        )
+        registry.register_closed_wave(job, wave, (shard,))
+        manifest = _initial_manifest(job, wave, shard)
+        plane.write_next_manifest_with_caller_lifecycle_lock(manifest, -1)
     return job, wave, shard, manifest

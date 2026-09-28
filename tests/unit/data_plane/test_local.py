@@ -1,8 +1,10 @@
 from datetime import UTC, datetime
+from unittest.mock import patch
 
 import pytest
 
 from portable_batch_execution.contracts import (
+    ArtifactRef,
     Provenance,
     RunManifest,
     ShardAttemptRecord,
@@ -11,6 +13,7 @@ from portable_batch_execution.data_plane import (
     LocalFilesystemDataPlane,
     RevisionConflictError,
 )
+from portable_batch_execution.lifecycle.lock import LifecycleStateLock
 
 
 def manifest(revision: int) -> RunManifest:
@@ -84,3 +87,44 @@ def test_attempt_id_must_be_safe_file_component(tmp_path, attempt_id):
     attempts_dir = tmp_path / "runs" / "run" / "attempts"
     if attempts_dir.exists():
         assert list(attempts_dir.glob("*.json")) == []
+
+
+def test_local_data_plane_write_acquires_lifecycle_lock(tmp_path):
+    with patch.object(LifecycleStateLock, "acquire", autospec=True) as acquire:
+        LocalFilesystemDataPlane(tmp_path).write(b"new-artifact", "application/octet-stream")
+    acquire.assert_called_once()
+
+
+def test_manifest_accepts_external_output_ref_without_local_payload(tmp_path):
+    store = LocalFilesystemDataPlane(tmp_path)
+    store.write_next_manifest(manifest(0), -1)
+    external = ArtifactRef(
+        object_id="external-model",
+        uri="pbe://local/external-model",
+        sha256="sha256:" + ("a" * 64),
+        media_type="application/octet-stream",
+        size_bytes=123,
+    )
+    record = _attempt_record("run", "attempt-external").model_copy(
+        update={"output_refs": (external,)}
+    )
+    store.append_attempt(record)
+
+
+def test_manifest_rejects_malformed_local_file_ref(tmp_path):
+    store = LocalFilesystemDataPlane(tmp_path)
+    store.write_next_manifest(manifest(0), -1)
+    escaped = tmp_path / "escaped.bin"
+    escaped.write_bytes(b"not-in-artifacts")
+    bad = ArtifactRef(
+        object_id="deadbeef",
+        uri=escaped.as_uri(),
+        sha256="sha256:" + ("b" * 64),
+        media_type="application/octet-stream",
+        size_bytes=14,
+    )
+    record = _attempt_record("run", "attempt-bad-local").model_copy(
+        update={"output_refs": (bad,)}
+    )
+    with pytest.raises(ValueError, match="outside this data plane"):
+        store.append_attempt(record)

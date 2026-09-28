@@ -159,7 +159,15 @@ def test_register_rejects_static_ref_digest_mismatch(tmp_path):
 def test_register_rejects_missing_static_ref(tmp_path):
     state_root = tmp_path / "state"
     state_root.mkdir()
-    missing = _artifact_ref("missing", b"x")
+    payload = b"x"
+    digest_hex = sha256(payload).hexdigest()
+    missing = ArtifactRef(
+        object_id=digest_hex,
+        uri=(state_root / "artifacts" / digest_hex).as_uri(),
+        sha256=f"sha256:{digest_hex}",
+        media_type="application/octet-stream",
+        size_bytes=len(payload),
+    )
     with pytest.raises(ValueError, match="static input reference"):
         register_broker_private_run(
             state_root=state_root,
@@ -170,8 +178,26 @@ def test_register_rejects_missing_static_ref(tmp_path):
             input_bytes=b"{}",
             input_media_type="application/json",
             public_sha=_PUBLIC_SHA,
-            static_input_refs=(ArtifactRef.model_validate(missing),),
+            static_input_refs=(missing,),
         )
+
+
+def test_register_allows_external_static_ref_without_local_payload(tmp_path):
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    external = ArtifactRef.model_validate(_artifact_ref("external-model", b"weights"))
+    _, _, shard, _ = register_broker_private_run(
+        state_root=state_root,
+        request_id="req-external-static",
+        pack="ml-batch",
+        operation="ml.distilbert_pair_binary_scores",
+        operation_params={},
+        input_bytes=b"{}",
+        input_media_type="application/json",
+        public_sha=_PUBLIC_SHA,
+        static_input_refs=(external,),
+    )
+    assert shard.input_refs[-1] == external
 
 
 def test_register_creates_ordered_multi_ref_shard(tmp_path):
