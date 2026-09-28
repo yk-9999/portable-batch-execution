@@ -38,6 +38,7 @@ from portable_batch_execution.contracts import (
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.controller.closed_wave_registry import ClosedWaveRegistry
 from portable_batch_execution.data_plane import LocalFilesystemDataPlane
+from portable_batch_execution.lifecycle import gc as gc_module
 from portable_batch_execution.lifecycle.cli import main as lifecycle_cli_main
 from portable_batch_execution.lifecycle.deletion import (
     DeletionIntentStore,
@@ -501,6 +502,66 @@ def test_apply_gc_refuses_deletion_when_authoritative_state_unreadable(tmp_path)
     apply_report = apply_gc(tmp_path, policy, mode="normal")
     assert apply_report.blocked is True
     assert artifact_payload_path(tmp_path, digest).is_file()
+
+
+def test_apply_gc_uses_constant_reachability_snapshots_for_many_candidates(
+    tmp_path, monkeypatch
+):
+    policy = _write_policy(tmp_path, legacy=0)
+    now = datetime.now(UTC) + timedelta(days=30)
+    digests = []
+    for payload in (b"candidate-one", b"candidate-two", b"candidate-three"):
+        digest = "sha256:" + sha256(payload).hexdigest()
+        path = artifact_payload_path(tmp_path, digest)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        old = (now - timedelta(days=30)).timestamp()
+        os.utime(path, (old, old))
+        digests.append(digest)
+
+    real_build = gc_module.build_reachability_index
+    build_count = 0
+
+    def counted_build(*args, **kwargs):
+        nonlocal build_count
+        build_count += 1
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(gc_module, "build_reachability_index", counted_build)
+    report = apply_gc(tmp_path, policy, mode="legacy", now=now)
+
+    assert len(report.deleted) == len(digests)
+    assert build_count == 2  # one review plan scan plus one locked apply snapshot
+
+
+def test_apply_gc_honors_protection_in_fresh_locked_snapshot(tmp_path, monkeypatch):
+    policy = _write_policy(tmp_path, legacy=0)
+    now = datetime.now(UTC) + timedelta(days=30)
+    payload = b"freshly-protected"
+    digest = "sha256:" + sha256(payload).hexdigest()
+    path = artifact_payload_path(tmp_path, digest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    old = (now - timedelta(days=30)).timestamp()
+    os.utime(path, (old, old))
+
+    real_build = gc_module.build_reachability_index
+    build_count = 0
+
+    def protect_on_locked_scan(*args, **kwargs):
+        nonlocal build_count
+        build_count += 1
+        index = real_build(*args, **kwargs)
+        if build_count == 2:
+            index.protected_by_digest[digest].add("fresh-lock-reference")
+        return index
+
+    monkeypatch.setattr(gc_module, "build_reachability_index", protect_on_locked_scan)
+    report = apply_gc(tmp_path, policy, mode="legacy", now=now)
+
+    assert path.is_file()
+    assert report.deleted == ()
+    assert build_count == 2
 
 
 def test_local_data_plane_write_acquires_lifecycle_lock(tmp_path):
