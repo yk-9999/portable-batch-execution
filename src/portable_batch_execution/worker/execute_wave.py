@@ -28,7 +28,8 @@ from portable_batch_execution.packs.ml.cosine_similarity_matrix import (
     execute_cosine_similarity_matrix,
 )
 from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
-    execute_distilbert_pair_binary_scores,
+    DistilbertStaticModelPair,
+    distilbert_static_model_fingerprint,
 )
 from portable_batch_execution.packs.replay_reduction.canonicalize import (
     BUCKET_MEDIA_TYPE,
@@ -480,6 +481,10 @@ def execute_private_wave(
     media_pack = MediaPack()
     replay_pack = ReplayReductionPack()
     wave_failures = 0
+    # DistilBERT shards in one workflow reuse one loaded static model pair when the
+    # four model artifact refs match; tensor inputs are processed sequentially because
+    # PyTorch inference on shared models is not parallelized in-process here.
+    distilbert_static_pair: DistilbertStaticModelPair | None = None
     for shard in shards:
         current = _matching_current_attempts(prior, shard)
         if any(item.status == "succeeded" for item in current):
@@ -542,11 +547,30 @@ def execute_private_wave(
                 if len(shard.input_refs) != 5:
                     raise _ShardStageFailure("input_artifact_invalid")
                 refs = shard.input_refs
+                model_fingerprint = distilbert_static_model_fingerprint(
+                    refs[1],
+                    refs[2],
+                    refs[3],
+                    refs[4],
+                )
+                if (
+                    distilbert_static_pair is None
+                    or distilbert_static_pair.fingerprint != model_fingerprint
+                ):
+                    model_a_config = _read_verified_artifact_bytes(plane, refs[1])
+                    model_a_weights = _read_verified_artifact_bytes(plane, refs[2])
+                    model_b_config = _read_verified_artifact_bytes(plane, refs[3])
+                    model_b_weights = _read_verified_artifact_bytes(plane, refs[4])
+                    distilbert_static_pair = (
+                        DistilbertStaticModelPair.from_verified_artifact_bytes(
+                            model_a_config=model_a_config,
+                            model_a_weights=model_a_weights,
+                            model_b_config=model_b_config,
+                            model_b_weights=model_b_weights,
+                            fingerprint=model_fingerprint,
+                        )
+                    )
                 tensor_bytes = _read_verified_artifact_bytes(plane, refs[0])
-                model_a_config = _read_verified_artifact_bytes(plane, refs[1])
-                model_a_weights = _read_verified_artifact_bytes(plane, refs[2])
-                model_b_config = _read_verified_artifact_bytes(plane, refs[3])
-                model_b_weights = _read_verified_artifact_bytes(plane, refs[4])
                 try:
                     text = tensor_bytes.decode("utf-8")
                 except UnicodeDecodeError as exc:
@@ -560,12 +584,8 @@ def execute_private_wave(
                         _execution_failure_code(exc, stage="input_parse")
                     ) from None
                 try:
-                    result_payload = execute_distilbert_pair_binary_scores(
-                        parsed_input,
-                        model_a_config=model_a_config,
-                        model_a_weights=model_a_weights,
-                        model_b_config=model_b_config,
-                        model_b_weights=model_b_weights,
+                    result_payload = distilbert_static_pair.execute_pair_binary_scores(
+                        parsed_input
                     )
                 except Exception as exc:  # noqa: BLE001
                     raise _ShardStageFailure(

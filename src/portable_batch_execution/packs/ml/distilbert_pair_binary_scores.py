@@ -5,8 +5,19 @@ from __future__ import annotations
 import json
 import math
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from portable_batch_execution.contracts import ArtifactRef
+
+DistilbertStaticRefIdentity = tuple[str, str, int | None, str | None, str]
+DistilbertStaticModelFingerprint = tuple[
+    DistilbertStaticRefIdentity,
+    DistilbertStaticRefIdentity,
+    DistilbertStaticRefIdentity,
+    DistilbertStaticRefIdentity,
+]
 
 INPUT_SCHEMA_VERSION = "pbe.ml.distilbert-pair-binary-scores.v1"
 OUTPUT_SCHEMA_VERSION = "pbe.ml.distilbert-pair-binary-scores-output.v1"
@@ -149,18 +160,13 @@ def _stage_model_bundle(config_bytes: bytes, weights_bytes: bytes, directory: Pa
     _validate_staged_distilbert_classifier_config(directory)
 
 
-def _infer_class1_probabilities(
-    model_dir: Path,
+def _infer_class1_probabilities_from_model(
+    model: Any,
     input_ids: list[list[int]],
     attention_mask: list[list[int]],
 ) -> list[float]:
     import torch
-    from transformers import DistilBertForSequenceClassification
 
-    model = DistilBertForSequenceClassification.from_pretrained(
-        model_dir,
-        local_files_only=True,
-    )
     model.eval()
     ids_tensor = torch.tensor(input_ids, dtype=torch.long)
     mask_tensor = torch.tensor(attention_mask, dtype=torch.long)
@@ -173,6 +179,124 @@ def _infer_class1_probabilities(
     return [float(score) for score in scores]
 
 
+def _load_classifier_from_staged_directory(model_dir: Path) -> Any:
+    from transformers import DistilBertForSequenceClassification
+
+    return DistilBertForSequenceClassification.from_pretrained(
+        model_dir,
+        local_files_only=True,
+    )
+
+
+def distilbert_static_artifact_ref_identity(ref: ArtifactRef) -> DistilbertStaticRefIdentity:
+    """Immutable ArtifactRef fields used for per-shard static model cache identity."""
+    return (
+        ref.object_id,
+        ref.sha256,
+        ref.size_bytes,
+        ref.media_type,
+        ref.uri,
+    )
+
+
+def distilbert_static_model_fingerprint(
+    model_a_config: ArtifactRef,
+    model_a_weights: ArtifactRef,
+    model_b_config: ArtifactRef,
+    model_b_weights: ArtifactRef,
+) -> DistilbertStaticModelFingerprint:
+    """Fingerprint the four static model ArtifactRefs shared across DistilBERT shards."""
+    return (
+        distilbert_static_artifact_ref_identity(model_a_config),
+        distilbert_static_artifact_ref_identity(model_a_weights),
+        distilbert_static_artifact_ref_identity(model_b_config),
+        distilbert_static_artifact_ref_identity(model_b_weights),
+    )
+
+
+def distilbert_static_model_fingerprint_from_bytes(
+    model_a_config: bytes,
+    model_a_weights: bytes,
+    model_b_config: bytes,
+    model_b_weights: bytes,
+) -> DistilbertStaticModelFingerprint:
+    """Content-only fingerprint for callers without ArtifactRef metadata."""
+    from hashlib import sha256
+
+    def _content_identity(payload: bytes, slot: str) -> DistilbertStaticRefIdentity:
+        digest = f"sha256:{sha256(payload).hexdigest()}"
+        return (
+            f"content:{slot}:{digest}",
+            digest,
+            len(payload),
+            None,
+            f"pbe://inline/{slot}",
+        )
+
+    return (
+        _content_identity(model_a_config, "model-a-config"),
+        _content_identity(model_a_weights, "model-a-weights"),
+        _content_identity(model_b_config, "model-b-config"),
+        _content_identity(model_b_weights, "model-b-weights"),
+    )
+
+
+@dataclass
+class DistilbertStaticModelPair:
+    """Staged and loaded DistilBERT classifiers reused across shard tensor inputs."""
+
+    fingerprint: DistilbertStaticModelFingerprint
+    _temporary: tempfile.TemporaryDirectory[str]
+    _model_a: Any
+    _model_b: Any
+
+    @classmethod
+    def from_verified_artifact_bytes(
+        cls,
+        *,
+        model_a_config: bytes,
+        model_a_weights: bytes,
+        model_b_config: bytes,
+        model_b_weights: bytes,
+        fingerprint: DistilbertStaticModelFingerprint,
+    ) -> DistilbertStaticModelPair:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        model_a_dir = root / "model_a"
+        model_b_dir = root / "model_b"
+        model_a_dir.mkdir()
+        model_b_dir.mkdir()
+        _stage_model_bundle(model_a_config, model_a_weights, model_a_dir)
+        _stage_model_bundle(model_b_config, model_b_weights, model_b_dir)
+        return cls(
+            fingerprint=fingerprint,
+            _temporary=temporary,
+            _model_a=_load_classifier_from_staged_directory(model_a_dir),
+            _model_b=_load_classifier_from_staged_directory(model_b_dir),
+        )
+
+    def execute_pair_binary_scores(self, payload: Any) -> dict[str, Any]:
+        validated = validate_distilbert_pair_binary_scores_input(payload)
+        model_a_ids, model_a_mask = validated["model_a"]
+        model_b_ids, model_b_mask = validated["model_b"]
+        model_a_scores = _infer_class1_probabilities_from_model(
+            self._model_a, model_a_ids, model_a_mask
+        )
+        model_b_scores = _infer_class1_probabilities_from_model(
+            self._model_b, model_b_ids, model_b_mask
+        )
+        if len(model_a_scores) != len(validated["row_ids"]) or len(model_b_scores) != len(
+            validated["row_ids"]
+        ):
+            raise ValueError("model output row count mismatch")
+        return {
+            "schema_version": OUTPUT_SCHEMA_VERSION,
+            "row_ids": list(validated["row_ids"]),
+            "model_a_scores": model_a_scores,
+            "model_b_scores": model_b_scores,
+        }
+
+
 def execute_distilbert_pair_binary_scores(
     payload: Any,
     *,
@@ -181,26 +305,17 @@ def execute_distilbert_pair_binary_scores(
     model_b_config: bytes,
     model_b_weights: bytes,
 ) -> dict[str, Any]:
-    validated = validate_distilbert_pair_binary_scores_input(payload)
-    model_a_ids, model_a_mask = validated["model_a"]
-    model_b_ids, model_b_mask = validated["model_b"]
-    with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary)
-        model_a_dir = root / "model_a"
-        model_b_dir = root / "model_b"
-        model_a_dir.mkdir()
-        model_b_dir.mkdir()
-        _stage_model_bundle(model_a_config, model_a_weights, model_a_dir)
-        _stage_model_bundle(model_b_config, model_b_weights, model_b_dir)
-        model_a_scores = _infer_class1_probabilities(model_a_dir, model_a_ids, model_a_mask)
-        model_b_scores = _infer_class1_probabilities(model_b_dir, model_b_ids, model_b_mask)
-    if len(model_a_scores) != len(validated["row_ids"]) or len(model_b_scores) != len(
-        validated["row_ids"]
-    ):
-        raise ValueError("model output row count mismatch")
-    return {
-        "schema_version": OUTPUT_SCHEMA_VERSION,
-        "row_ids": list(validated["row_ids"]),
-        "model_a_scores": model_a_scores,
-        "model_b_scores": model_b_scores,
-    }
+    fingerprint = distilbert_static_model_fingerprint_from_bytes(
+        model_a_config,
+        model_a_weights,
+        model_b_config,
+        model_b_weights,
+    )
+    pair = DistilbertStaticModelPair.from_verified_artifact_bytes(
+        model_a_config=model_a_config,
+        model_a_weights=model_a_weights,
+        model_b_config=model_b_config,
+        model_b_weights=model_b_weights,
+        fingerprint=fingerprint,
+    )
+    return pair.execute_pair_binary_scores(payload)
