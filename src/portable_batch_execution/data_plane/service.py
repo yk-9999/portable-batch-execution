@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hmac
 import json
+import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import unquote
 
 from portable_batch_execution.contracts import (
@@ -18,6 +20,10 @@ from portable_batch_execution.controller.closed_wave_registry import (
 )
 from portable_batch_execution.data_plane.base import ArtifactContentStream
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
+from portable_batch_execution.lifecycle.lock import LifecycleLockError
+
+_LIFECYCLE_LOCK_RETRY_DELAYS_S = (0.05, 0.1, 0.2, 0.4, 0.8)
+_T = TypeVar("_T")
 
 
 class PrivateDataPlaneService:
@@ -37,6 +43,18 @@ class PrivateDataPlaneService:
             return False
         provided = authorization[7:].encode("utf-8")
         return hmac.compare_digest(provided, self._expected_token)
+
+    @staticmethod
+    def _invoke_replay_safe_write(operation: Callable[[], _T]) -> _T:
+        for attempt in range(len(_LIFECYCLE_LOCK_RETRY_DELAYS_S) + 1):
+            try:
+                return operation()
+            except LifecycleLockError:
+                if attempt < len(_LIFECYCLE_LOCK_RETRY_DELAYS_S):
+                    time.sleep(_LIFECYCLE_LOCK_RETRY_DELAYS_S[attempt])
+                    continue
+                raise
+        raise AssertionError("unreachable")
 
     def resolve_wave(self, run_id: str, wave_id: str) -> dict[str, Any]:
         return self.registry.resolve_wave(run_id, wave_id)
@@ -82,7 +100,9 @@ class PrivateDataPlaneService:
                     stream,
                 )
             if method == "POST" and segments == ["v1", "artifacts"]:
-                ref = self.store.write(body or b"", headers.get("content-type"))
+                ref = self._invoke_replay_safe_write(
+                    lambda: self.store.write(body or b"", headers.get("content-type"))
+                )
                 return 200, {"Content-Type": "application/json"}, ref.model_dump_json().encode("utf-8")
             if method == "GET" and len(segments) == 4 and segments[:2] == ["v1", "runs"] and segments[3] == "attempts":
                 run_id = opaque_identifier(segments[2], "run_id")
@@ -97,7 +117,9 @@ class PrivateDataPlaneService:
                 if record.logical_run_id != run_id:
                     return 400, {"Content-Type": "application/json"}, b'{"error":"run mismatch"}'
                 try:
-                    self.store.append_attempt(record)
+                    self._invoke_replay_safe_write(
+                        lambda: self.store.append_attempt(record)
+                    )
                 except ValueError:
                     return 409, {"Content-Type": "application/json"}, b'{"error":"attempt conflict"}'
                 return 204, {}, b""

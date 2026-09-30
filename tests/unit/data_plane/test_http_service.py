@@ -5,11 +5,31 @@ from portable_batch_execution.contracts import (
     RunManifest,
     ShardAttemptRecord,
 )
-from portable_batch_execution.data_plane.service import PrivateDataPlaneService
+from portable_batch_execution.data_plane.service import (
+    PrivateDataPlaneService,
+    _LIFECYCLE_LOCK_RETRY_DELAYS_S,
+)
+from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
+from portable_batch_execution.lifecycle.lock import LifecycleLockError
 
 
 def _service(tmp_path, token: str = "plane-token") -> PrivateDataPlaneService:
     return PrivateDataPlaneService(tmp_path, token)
+
+
+def _attempt_record() -> ShardAttemptRecord:
+    now = datetime.now(UTC)
+    return ShardAttemptRecord(
+        logical_run_id="opaque-run",
+        shard_id="shard",
+        attempt_id="attempt-1",
+        status="failed",
+        input_digest="d",
+        execution_fingerprint="f",
+        started_at=now,
+        finished_at=now,
+        failure="shard_execution_failed",
+    )
 
 
 def test_auth_fails_closed_without_leaking_token(tmp_path):
@@ -178,3 +198,134 @@ def test_manifest_put_is_controller_only(tmp_path):
     assert again_status == 200
     stored = RunManifest.model_validate_json(again_body or b"{}")
     assert stored.revision == 0
+
+
+def test_attempt_post_retries_lifecycle_lock_then_succeeds(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    record = _attempt_record()
+    calls = {"count": 0}
+
+    def append_attempt(record):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise LifecycleLockError("lifecycle state root is locked")
+        return LocalFilesystemDataPlane.append_attempt(service.store, record)
+
+    monkeypatch.setattr(service.store, "append_attempt", append_attempt)
+    monkeypatch.setattr(
+        "portable_batch_execution.data_plane.service.time.sleep",
+        lambda _delay: None,
+    )
+    status, _, _ = service.dispatch(
+            "POST",
+            "/v1/runs/opaque-run/attempts",
+            authorization="Bearer plane-token",
+        body=record.model_dump_json().encode("utf-8"),
+    )
+    assert status == 204
+    assert calls["count"] == 2
+
+
+def test_artifact_post_retries_lifecycle_lock_then_succeeds(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    calls = {"count": 0}
+
+    def write(data, media_type=None, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise LifecycleLockError("lifecycle state root is locked")
+        return LocalFilesystemDataPlane.write(service.store, data, media_type)
+
+    monkeypatch.setattr(service.store, "write", write)
+    monkeypatch.setattr(
+        "portable_batch_execution.data_plane.service.time.sleep",
+        lambda _delay: None,
+    )
+    status, _, body = service.dispatch(
+        "POST",
+        "/v1/artifacts",
+        authorization="Bearer plane-token",
+        body=b'{"retry":true}',
+    )
+    assert status == 200
+    assert calls["count"] == 2
+    assert json.loads(body or b"{}")["object_id"]
+
+
+def test_replay_safe_write_lock_retry_exhaustion_returns_internal_error(
+    tmp_path, monkeypatch
+):
+    service = _service(tmp_path)
+
+    def locked_write(*_args, **_kwargs):
+        raise LifecycleLockError("lifecycle state root is locked")
+
+    monkeypatch.setattr(service.store, "write", locked_write)
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "portable_batch_execution.data_plane.service.time.sleep",
+        lambda delay: sleeps.append(delay),
+    )
+    status, _, body = service.dispatch(
+        "POST",
+        "/v1/artifacts",
+        authorization="Bearer plane-token",
+        body=b"payload",
+    )
+    assert status == 500
+    assert json.loads(body or b"{}") == {"error": "internal"}
+    assert sleeps == list(_LIFECYCLE_LOCK_RETRY_DELAYS_S)
+
+
+def test_conflicting_attempt_still_409_without_lock_retry(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    record = _attempt_record()
+    first, _, _ = service.dispatch(
+        "POST",
+        "/v1/runs/opaque-run/attempts",
+        authorization="Bearer plane-token",
+        body=record.model_dump_json().encode("utf-8"),
+    )
+    assert first == 204
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "portable_batch_execution.data_plane.service.time.sleep",
+        lambda delay: sleeps.append(delay),
+    )
+    conflict, _, _ = service.dispatch(
+        "POST",
+        "/v1/runs/opaque-run/attempts",
+        authorization="Bearer plane-token",
+        body=record.model_copy(update={"failure": "other"})
+        .model_dump_json()
+        .encode("utf-8"),
+    )
+    assert conflict == 409
+    assert sleeps == []
+
+
+def test_unrelated_os_error_on_artifact_write_is_not_retried(tmp_path, monkeypatch):
+    service = _service(tmp_path)
+    calls = {"count": 0}
+
+    def failing_write(*_args, **_kwargs):
+        calls["count"] += 1
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service.store, "write", failing_write)
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        "portable_batch_execution.data_plane.service.time.sleep",
+        lambda delay: sleeps.append(delay),
+    )
+    status, _, body = service.dispatch(
+        "POST",
+        "/v1/artifacts",
+        authorization="Bearer plane-token",
+        body=b"payload",
+    )
+    assert status == 500
+    assert json.loads(body or b"{}") == {"error": "internal"}
+    assert calls["count"] == 1
+    assert sleeps == []
