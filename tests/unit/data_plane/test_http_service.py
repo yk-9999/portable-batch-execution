@@ -5,11 +5,11 @@ from portable_batch_execution.contracts import (
     RunManifest,
     ShardAttemptRecord,
 )
-from portable_batch_execution.data_plane.service import (
-    PrivateDataPlaneService,
-    _LIFECYCLE_LOCK_RETRY_DELAYS_S,
-)
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
+from portable_batch_execution.data_plane.service import (
+    _LIFECYCLE_LOCK_RETRY_DELAYS_S,
+    PrivateDataPlaneService,
+)
 from portable_batch_execution.lifecycle.lock import LifecycleLockError
 
 
