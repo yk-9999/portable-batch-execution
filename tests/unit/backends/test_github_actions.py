@@ -9,6 +9,7 @@ from portable_batch_execution.backends.github_actions import (
     BackendExecutionRef,
     GitHubActionsAPIError,
     GitHubActionsBackend,
+    GitHubActionsTransportError,
     map_run_status,
 )
 from portable_batch_execution.contracts import WaveSpec
@@ -162,6 +163,80 @@ def test_api_error_is_structured():
     with pytest.raises(GitHubActionsAPIError, match=r"get run failed \(403\): denied") as error:
         backend.get_run(BackendExecutionRef("github-actions", "7"))
     assert error.value.status_code == 403
+
+
+def test_safe_read_transport_retry_recovers():
+    calls = 0
+    sleeps = []
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.RemoteProtocolError("server disconnected", request=request)
+        return httpx.Response(
+            200,
+            json={"status": "completed", "conclusion": "success", "updated_at": "t"},
+        )
+
+    backend = GitHubActionsBackend(
+        "o",
+        "r",
+        "w",
+        client=client(handler),
+        safe_read_transport_retry_delays_s=(0.1, 0.2),
+        sleeper=sleeps.append,
+    )
+    status = backend.get_run(BackendExecutionRef("github-actions", "7"))
+    assert status.status == "succeeded"
+    assert calls == 2
+    assert sleeps == [0.1]
+
+
+def test_safe_read_transport_retry_exhaustion_is_bounded():
+    calls = 0
+    sleeps = []
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        raise httpx.RemoteProtocolError("server disconnected", request=request)
+
+    backend = GitHubActionsBackend(
+        "o",
+        "r",
+        "w",
+        client=client(handler),
+        safe_read_transport_retry_delays_s=(0.1, 0.2),
+        sleeper=sleeps.append,
+    )
+    with pytest.raises(GitHubActionsTransportError, match="get run transport failed"):
+        backend.get_run(BackendExecutionRef("github-actions", "7"))
+    assert calls == 3
+    assert sleeps == [0.1, 0.2]
+
+
+def test_submit_wave_transport_failure_is_not_retried():
+    calls = 0
+    sleeps = []
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        raise httpx.RemoteProtocolError("server disconnected", request=request)
+
+    backend = GitHubActionsBackend(
+        "o",
+        "r",
+        "w",
+        client=client(handler),
+        safe_read_transport_retry_delays_s=(0.1, 0.2),
+        sleeper=sleeps.append,
+    )
+    with pytest.raises(GitHubActionsTransportError, match="submit wave transport failed"):
+        backend.submit_wave(submission())
+    assert calls == 1
+    assert sleeps == []
 
 
 def test_github_backend_structurally_satisfies_shared_protocol_signatures():

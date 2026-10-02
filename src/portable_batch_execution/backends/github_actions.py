@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -28,6 +30,14 @@ class GitHubActionsAPIError(RuntimeError):
             detail = response.text[:200]
         suffix = f": {detail}" if detail else ""
         super().__init__(f"GitHub Actions {operation} failed ({response.status_code}){suffix}")
+
+
+class GitHubActionsTransportError(RuntimeError):
+    """A GitHub Actions request failed at the transport layer."""
+
+    def __init__(self, operation: str):
+        self.operation = operation
+        super().__init__(f"GitHub Actions {operation} transport failed")
 
 
 def _opaque_identifier(value: str, name: str) -> None:
@@ -65,6 +75,8 @@ class GitHubActionsBackend:
         token: str | None = None,
         client: httpx.Client | None = None,
         private_data_plane: bool = False,
+        safe_read_transport_retry_delays_s: tuple[float, ...] = (0.25, 0.5, 1.0),
+        sleeper: Callable[[float], None] | None = None,
     ):
         self.owner = owner
         self.repo = repo
@@ -75,6 +87,10 @@ class GitHubActionsBackend:
         self.client = client or httpx.Client(
             base_url="https://api.github.com", timeout=30.0
         )
+        self.safe_read_transport_retry_delays_s = tuple(
+            safe_read_transport_retry_delays_s
+        )
+        self._sleep = sleeper or time.sleep
 
     def capabilities(self) -> BackendCapabilities:
         return BackendCapabilities("github-actions", 256, True, True)
@@ -91,10 +107,28 @@ class GitHubActionsBackend:
     def _request(
         self, operation: str, method: str, path: str, **kwargs: Any
     ) -> httpx.Response:
-        response = self.client.request(method, path, headers=self._headers(), **kwargs)
+        try:
+            response = self.client.request(
+                method, path, headers=self._headers(), **kwargs
+            )
+        except httpx.TransportError as exc:
+            raise GitHubActionsTransportError(operation) from exc
         if response.is_error:
             raise GitHubActionsAPIError(operation, response)
         return response
+
+    def _safe_read_request(
+        self, operation: str, path: str, **kwargs: Any
+    ) -> httpx.Response:
+        delays = self.safe_read_transport_retry_delays_s
+        for attempt in range(len(delays) + 1):
+            try:
+                return self._request(operation, "GET", path, **kwargs)
+            except GitHubActionsTransportError:
+                if attempt >= len(delays):
+                    raise
+                self._sleep(delays[attempt])
+        raise AssertionError("unreachable")
 
     def submit_wave(self, request: WaveSubmission) -> BackendExecutionRef:
         if self.private_data_plane:
@@ -131,9 +165,8 @@ class GitHubActionsBackend:
         )
 
     def get_run(self, execution: BackendExecutionRef) -> BackendRunStatus:
-        run = self._request(
+        run = self._safe_read_request(
             "get run",
-            "GET",
             f"/repos/{self.owner}/{self.repo}/actions/runs/{execution.execution_id}",
         ).json()
         if not isinstance(run, dict):
@@ -153,9 +186,8 @@ class GitHubActionsBackend:
         )
 
     def collect_execution_evidence(self, execution: BackendExecutionRef) -> BackendEvidence:
-        raw = self._request(
+        raw = self._safe_read_request(
             "get run",
-            "GET",
             f"/repos/{self.owner}/{self.repo}/actions/runs/{execution.execution_id}",
         ).json()
         if not isinstance(raw, dict):

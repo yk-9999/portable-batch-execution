@@ -13,6 +13,7 @@ import pytest
 from portable_batch_execution.backends.github_actions import (
     GitHubActionsAPIError,
     GitHubActionsBackend,
+    GitHubActionsTransportError,
 )
 from portable_batch_execution.broker.config import BrokerConfig, max_request_frame_bytes
 from portable_batch_execution.broker.planning import (
@@ -575,6 +576,96 @@ def test_server_survives_transient_backend_lookup(tmp_path):
     client_sock.close()
     server_sock.close()
     payload = json.loads(response_line.decode())
+    assert payload["error_code"] == "backend_transient"
+
+
+def test_poll_transport_error_preserves_state_and_recovers_without_duplicate_dispatch(tmp_path):
+    config = _config(tmp_path)
+    dispatch_calls = 0
+
+    def handler(request):
+        nonlocal dispatch_calls
+        if request.method == "POST":
+            dispatch_calls += 1
+            return httpx.Response(
+                201, json={"workflow_run_id": 6, "html_url": "https://run"}
+            )
+        return httpx.Response(
+            200,
+            json={"status": "in_progress", "conclusion": None, "updated_at": "t"},
+        )
+
+    service = _service(tmp_path, config, handler)
+    with patch.object(
+        service.controller.backend,
+        "get_run",
+        side_effect=GitHubActionsTransportError("get run"),
+    ):
+        response = service.handle_payload(
+            _UID, _request(request_id="req-transport-recover")
+        )
+    assert response.status == "failed"
+    assert response.error_code == "backend_transient"
+    assert dispatch_calls == 1
+    state = BrokerRequestStore(service.state_root / "controller").load(
+        "req-transport-recover"
+    )
+    assert state is not None
+    assert state.dispatch_count == 1
+    assert state.execution_id == "6"
+
+    _append_success_attempt(
+        service.controller, "req-transport-recover", b'[{"id":1}]'
+    )
+    with patch.object(
+        service.controller,
+        "dispatch_private_wave",
+        side_effect=AssertionError("must not duplicate dispatch after transport recovery"),
+    ):
+        recovered = service.handle_payload(
+            _UID, _request(request_id="req-transport-recover")
+        )
+    assert recovered.status == "succeeded"
+    assert dispatch_calls == 1
+
+
+@pytest.mark.skipif(not hasattr(socket, "socketpair"), reason="socketpair required")
+def test_server_survives_exhausted_transport_lookup(tmp_path):
+    config = _config(tmp_path)
+
+    def handler(request):
+        if request.method == "POST":
+            return httpx.Response(
+                201, json={"workflow_run_id": 6, "html_url": "https://run"}
+            )
+        return httpx.Response(
+            200,
+            json={"status": "in_progress", "conclusion": None, "updated_at": "t"},
+        )
+
+    service = _service(tmp_path, config, handler)
+    client_sock, server_sock = socket.socketpair()
+    request = (
+        json.dumps(_request(request_id="req-srv-transport")) + "\n"
+    ).encode()
+    client_sock.sendall(request)
+    with (
+        patch(
+            "portable_batch_execution.broker.server.read_peer_credentials",
+            return_value=(1, _UID, 1),
+        ),
+        patch.object(
+            service.controller.backend,
+            "get_run",
+            side_effect=GitHubActionsTransportError("get run"),
+        ),
+    ):
+        _handle_connection(server_sock, service)
+    response_line = client_sock.recv(65536)
+    client_sock.close()
+    server_sock.close()
+    payload = json.loads(response_line.decode())
+    assert payload["status"] == "failed"
     assert payload["error_code"] == "backend_transient"
 
 

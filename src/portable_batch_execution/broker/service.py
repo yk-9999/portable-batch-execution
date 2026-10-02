@@ -13,6 +13,7 @@ from portable_batch_execution.backends.base import BackendExecutionRef
 from portable_batch_execution.backends.github_actions import (
     GitHubActionsAPIError,
     GitHubActionsBackend,
+    GitHubActionsTransportError,
 )
 from portable_batch_execution.contracts import PACK_OPS, ShardAttemptRecord, ShardSpec
 from portable_batch_execution.controller.a1_controller import A1Controller
@@ -347,7 +348,7 @@ class UnixBrokerService:
                 )
             try:
                 backend_status = self._backend_status(state)
-            except GitHubActionsAPIError:
+            except (GitHubActionsAPIError, GitHubActionsTransportError):
                 return self._failed(request_id, "backend_transient")
             backend_terminal = backend_status in {"failed", "cancelled", "succeeded"}
             if backend_status == "running":
@@ -381,7 +382,7 @@ class UnixBrokerService:
                 execution = self.controller.dispatch_private_wave(
                     state.logical_run_id, state.wave_id
                 )
-            except GitHubActionsAPIError:
+            except (GitHubActionsAPIError, GitHubActionsTransportError):
                 return self._failed(request_id, "backend_transient")
             except ValueError:
                 return self._failed(request_id, "dispatch_failed")
