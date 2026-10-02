@@ -30,7 +30,25 @@ jobs:
           python-version: "3.11"
       - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
       - run: uv sync --dev --extra distilbert
+      - name: Resolve runtime profile
+        id: profile
+        env:
+          PBE_WAVE_ID: ${{ inputs.wave_id }}
+          PBE_RUN_ID: ${{ inputs.run_id }}
+          PBE_MODE: ${{ inputs.private && 'private' || 'public' }}
+          PBE_PRIVATE_DATA_PLANE_BASE_URL: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BASE_URL || '' }}
+          PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN: ${{ inputs.private && secrets.PBE_PRIVATE_DATA_PLANE_BEARER_TOKEN || '' }}
+        run: |
+          if [ "$PBE_MODE" = "private" ]; then
+            PROFILE="$(uv run python -m portable_batch_execution.worker.runtime_profile --wave-id "$PBE_WAVE_ID" --run-id "$PBE_RUN_ID" --mode private)"
+          else
+            PROFILE="$(uv run python -m portable_batch_execution.worker.runtime_profile --wave-id "$PBE_WAVE_ID" --mode public)"
+          fi
+          echo "resolved runtime profile: $PROFILE"
+          echo "profile=$PROFILE" >> "$GITHUB_OUTPUT"
       - name: Install FFmpeg
+        if: steps.profile.outputs.profile == 'media'
+        timeout-minutes: 15
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg
