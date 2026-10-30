@@ -13,7 +13,8 @@ OUTPUT_SCHEMA_VERSION = "pbe.ml.distilbert-pair-binary-scores-output.v1"
 
 _TOP_LEVEL_KEYS = frozenset({"schema_version", "row_ids", "model_a", "model_b"})
 _MODEL_TENSOR_KEYS = frozenset({"input_ids", "attention_mask"})
-_MAX_ROWS = 128
+_MAX_ROWS = 512
+_INFER_SUBBATCH_MAX_ROWS = 128
 _MIN_SEQ_LEN = 1
 _MAX_SEQ_LEN = 256
 
@@ -149,6 +150,37 @@ def _stage_model_bundle(config_bytes: bytes, weights_bytes: bytes, directory: Pa
     _validate_staged_distilbert_classifier_config(directory)
 
 
+def _effective_subbatch_seq_len(attention_mask: list[list[int]]) -> int:
+    last_active = 0
+    for row in attention_mask:
+        last_one = -1
+        for index, mask_value in enumerate(row):
+            if mask_value == 1:
+                last_one = index
+        if last_one >= 0:
+            last_active = max(last_active, last_one + 1)
+    return max(last_active, _MIN_SEQ_LEN)
+
+
+def _subbatch_tensors(
+    input_ids: list[list[int]],
+    attention_mask: list[list[int]],
+    start: int,
+    end: int,
+    *,
+    trim_trailing_padding: bool,
+) -> tuple[list[list[int]], list[list[int]]]:
+    batch_ids = input_ids[start:end]
+    batch_mask = attention_mask[start:end]
+    if not trim_trailing_padding:
+        return batch_ids, batch_mask
+    effective_len = _effective_subbatch_seq_len(batch_mask)
+    return (
+        [row[:effective_len] for row in batch_ids],
+        [row[:effective_len] for row in batch_mask],
+    )
+
+
 def _infer_class1_probabilities(
     model_dir: Path,
     input_ids: list[list[int]],
@@ -157,20 +189,50 @@ def _infer_class1_probabilities(
     import torch
     from transformers import DistilBertForSequenceClassification
 
+    row_count = len(input_ids)
+    if row_count != len(attention_mask):
+        raise ValueError("input_ids and attention_mask row count mismatch")
+
     model = DistilBertForSequenceClassification.from_pretrained(
         model_dir,
         local_files_only=True,
     )
     model.eval()
-    ids_tensor = torch.tensor(input_ids, dtype=torch.long)
-    mask_tensor = torch.tensor(attention_mask, dtype=torch.long)
+
+    trim_trailing_padding = row_count > _INFER_SUBBATCH_MAX_ROWS
+    scores: list[float] = []
+
     with torch.no_grad():
-        logits = model(input_ids=ids_tensor, attention_mask=mask_tensor).logits
-        probabilities = torch.softmax(logits, dim=1)[:, 1]
-    scores = probabilities.tolist()
+        if row_count <= _INFER_SUBBATCH_MAX_ROWS:
+            ids_tensor = torch.tensor(input_ids, dtype=torch.long)
+            mask_tensor = torch.tensor(attention_mask, dtype=torch.long)
+            logits = model(input_ids=ids_tensor, attention_mask=mask_tensor).logits
+            probabilities = torch.softmax(logits, dim=1)[:, 1]
+            scores = [float(score) for score in probabilities.tolist()]
+        else:
+            for start in range(0, row_count, _INFER_SUBBATCH_MAX_ROWS):
+                end = min(start + _INFER_SUBBATCH_MAX_ROWS, row_count)
+                batch_ids, batch_mask = _subbatch_tensors(
+                    input_ids,
+                    attention_mask,
+                    start,
+                    end,
+                    trim_trailing_padding=trim_trailing_padding,
+                )
+                subbatch_rows = end - start
+                if subbatch_rows > _INFER_SUBBATCH_MAX_ROWS:
+                    raise ValueError("internal subbatch row bound exceeded")
+                ids_tensor = torch.tensor(batch_ids, dtype=torch.long)
+                mask_tensor = torch.tensor(batch_mask, dtype=torch.long)
+                logits = model(input_ids=ids_tensor, attention_mask=mask_tensor).logits
+                probabilities = torch.softmax(logits, dim=1)[:, 1]
+                scores.extend(float(score) for score in probabilities.tolist())
+
+    if len(scores) != row_count:
+        raise ValueError("model output row count mismatch")
     if not all(_is_finite_number(score) for score in scores):
         raise ValueError("model output is not finite")
-    return [float(score) for score in scores]
+    return scores
 
 
 def execute_distilbert_pair_binary_scores(
