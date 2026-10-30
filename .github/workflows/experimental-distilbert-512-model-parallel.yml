@@ -1,0 +1,30 @@
+name: Experimental 512-row DistilBERT model A B parallel
+
+on:
+  push:
+    branches:
+      - experiment/distilbert-512-model-parallel-20261030
+
+permissions:
+  contents: read
+
+jobs:
+  compare_512_model_parallel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
+      - run: uv sync --dev --extra distilbert
+      - name: Run same seeded 512 rows with two models in parallel
+        env:
+          PBE_BENCH_CASE_ID: scaling_1x512_model_parallel
+          PBE_BENCH_MODE: model_parallel
+          PBE_BENCH_OFFSET: "0"
+          PBE_BENCH_ROW_COUNT: "512"
+        run: |
+          set -euo pipefail
+          uv run python tests/performance/distilbert_fullsize_public_benchmark.py | tee benchmark-case.json
