@@ -1,0 +1,178 @@
+name: Experimental 512-row DistilBERT shard scaling
+
+on:
+  push:
+    branches:
+      - experiment/distilbert-512-shard-scaling-20261030
+
+permissions:
+  contents: read
+
+jobs:
+  group1_by_512:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: 1x512 offset-${{ matrix.offset }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - offset: 0
+            row_count: 512
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
+      - run: uv sync --dev --extra distilbert
+      - name: Run seeded fullsize synthetic DistilBERT benchmark
+        env:
+          PBE_BENCH_CASE_ID: scaling_1x512
+          PBE_BENCH_MODE: sequential
+          PBE_BENCH_OFFSET: ${{ matrix.offset }}
+          PBE_BENCH_ROW_COUNT: ${{ matrix.row_count }}
+        run: |
+          set -euo pipefail
+          uv run python tests/performance/distilbert_fullsize_public_benchmark.py | tee benchmark-case.json
+          python - <<'PYCODE'
+          import json, os
+          x = json.load(open("benchmark-case.json"))
+          t = x["timing_wall_s"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"rows={x['row_count']} offset={x['partition_offset']} infer={t['infer']:.3f}s total={t['total']:.3f}s peak_rss={x['peak_rss_bytes']} bytes\n")
+          PYCODE
+
+  group2_by_256:
+    needs: group1_by_512
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: 2x256 offset-${{ matrix.offset }}
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - offset: 0
+            row_count: 256
+          - offset: 256
+            row_count: 256
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
+      - run: uv sync --dev --extra distilbert
+      - name: Run seeded fullsize synthetic DistilBERT benchmark
+        env:
+          PBE_BENCH_CASE_ID: scaling_2x256
+          PBE_BENCH_MODE: sequential
+          PBE_BENCH_OFFSET: ${{ matrix.offset }}
+          PBE_BENCH_ROW_COUNT: ${{ matrix.row_count }}
+        run: |
+          set -euo pipefail
+          uv run python tests/performance/distilbert_fullsize_public_benchmark.py | tee benchmark-case.json
+          python - <<'PYCODE'
+          import json, os
+          x = json.load(open("benchmark-case.json"))
+          t = x["timing_wall_s"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"rows={x['row_count']} offset={x['partition_offset']} infer={t['infer']:.3f}s total={t['total']:.3f}s peak_rss={x['peak_rss_bytes']} bytes\n")
+          PYCODE
+
+  group4_by_128:
+    needs: group2_by_256
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: 4x128 offset-${{ matrix.offset }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - offset: 0
+            row_count: 128
+          - offset: 128
+            row_count: 128
+          - offset: 256
+            row_count: 128
+          - offset: 384
+            row_count: 128
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
+      - run: uv sync --dev --extra distilbert
+      - name: Run seeded fullsize synthetic DistilBERT benchmark
+        env:
+          PBE_BENCH_CASE_ID: scaling_4x128
+          PBE_BENCH_MODE: sequential
+          PBE_BENCH_OFFSET: ${{ matrix.offset }}
+          PBE_BENCH_ROW_COUNT: ${{ matrix.row_count }}
+        run: |
+          set -euo pipefail
+          uv run python tests/performance/distilbert_fullsize_public_benchmark.py | tee benchmark-case.json
+          python - <<'PYCODE'
+          import json, os
+          x = json.load(open("benchmark-case.json"))
+          t = x["timing_wall_s"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"rows={x['row_count']} offset={x['partition_offset']} infer={t['infer']:.3f}s total={t['total']:.3f}s peak_rss={x['peak_rss_bytes']} bytes\n")
+          PYCODE
+
+  group8_by_64:
+    needs: group4_by_128
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    name: 8x64 offset-${{ matrix.offset }}
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include:
+          - offset: 0
+            row_count: 64
+          - offset: 64
+            row_count: 64
+          - offset: 128
+            row_count: 64
+          - offset: 192
+            row_count: 64
+          - offset: 256
+            row_count: 64
+          - offset: 320
+            row_count: 64
+          - offset: 384
+            row_count: 64
+          - offset: 448
+            row_count: 64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
+      - run: uv sync --dev --extra distilbert
+      - name: Run seeded fullsize synthetic DistilBERT benchmark
+        env:
+          PBE_BENCH_CASE_ID: scaling_8x64
+          PBE_BENCH_MODE: sequential
+          PBE_BENCH_OFFSET: ${{ matrix.offset }}
+          PBE_BENCH_ROW_COUNT: ${{ matrix.row_count }}
+        run: |
+          set -euo pipefail
+          uv run python tests/performance/distilbert_fullsize_public_benchmark.py | tee benchmark-case.json
+          python - <<'PYCODE'
+          import json, os
+          x = json.load(open("benchmark-case.json"))
+          t = x["timing_wall_s"]
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"rows={x['row_count']} offset={x['partition_offset']} infer={t['infer']:.3f}s total={t['total']:.3f}s peak_rss={x['peak_rss_bytes']} bytes\n")
+          PYCODE
