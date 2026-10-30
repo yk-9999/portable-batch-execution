@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from portable_batch_execution.contracts import ArtifactRef
+from portable_batch_execution.data_plane.base import ArtifactContentStream
 from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
     INPUT_SCHEMA_VERSION,
 )
@@ -126,6 +127,10 @@ def _distilbert_plane(tmp_path, *, input_refs=None, read_map=None):
             if key not in payloads:
                 raise OSError("missing")
             return payloads[key]
+
+        def open_content(self, ref):
+            data = self.read(ref)
+            return ArtifactContentStream(size_bytes=len(data), chunks=iter((data,)))
 
         def write(self, payload, media_type):
             self.last_written = payload

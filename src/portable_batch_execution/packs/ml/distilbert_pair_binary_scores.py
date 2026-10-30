@@ -150,6 +150,17 @@ def _stage_model_bundle(config_bytes: bytes, weights_bytes: bytes, directory: Pa
     _validate_staged_distilbert_classifier_config(directory)
 
 
+def _validate_staged_model_bundle(directory: Path) -> None:
+    # Configs are tiny; weights remain on disk and are never materialized as
+    # Python bytes while the public worker prepares the model.
+    try:
+        config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError("model config is not valid JSON") from exc
+    _validate_raw_distilbert_config_json(config)
+    _validate_staged_distilbert_classifier_config(directory)
+
+
 def _effective_subbatch_seq_len(attention_mask: list[list[int]]) -> int:
     last_active = 0
     for row in attention_mask:
@@ -244,8 +255,6 @@ def execute_distilbert_pair_binary_scores(
     model_b_weights: bytes,
 ) -> dict[str, Any]:
     validated = validate_distilbert_pair_binary_scores_input(payload)
-    model_a_ids, model_a_mask = validated["model_a"]
-    model_b_ids, model_b_mask = validated["model_b"]
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         model_a_dir = root / "model_a"
@@ -254,8 +263,26 @@ def execute_distilbert_pair_binary_scores(
         model_b_dir.mkdir()
         _stage_model_bundle(model_a_config, model_a_weights, model_a_dir)
         _stage_model_bundle(model_b_config, model_b_weights, model_b_dir)
-        model_a_scores = _infer_class1_probabilities(model_a_dir, model_a_ids, model_a_mask)
-        model_b_scores = _infer_class1_probabilities(model_b_dir, model_b_ids, model_b_mask)
+        return _score_staged_models(validated, model_a_dir, model_b_dir)
+
+
+def execute_distilbert_pair_binary_scores_from_staged_models(
+    payload: Any, *, model_a_dir: Path, model_b_dir: Path
+) -> dict[str, Any]:
+    """Score verified, ephemeral model files without re-reading weights into RAM."""
+    validated = validate_distilbert_pair_binary_scores_input(payload)
+    _validate_staged_model_bundle(model_a_dir)
+    _validate_staged_model_bundle(model_b_dir)
+    return _score_staged_models(validated, model_a_dir, model_b_dir)
+
+
+def _score_staged_models(
+    validated: dict[str, Any], model_a_dir: Path, model_b_dir: Path
+) -> dict[str, Any]:
+    model_a_ids, model_a_mask = validated["model_a"]
+    model_b_ids, model_b_mask = validated["model_b"]
+    model_a_scores = _infer_class1_probabilities(model_a_dir, model_a_ids, model_a_mask)
+    model_b_scores = _infer_class1_probabilities(model_b_dir, model_b_ids, model_b_mask)
     if len(model_a_scores) != len(validated["row_ids"]) or len(model_b_scores) != len(
         validated["row_ids"]
     ):

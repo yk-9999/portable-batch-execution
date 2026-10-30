@@ -1,5 +1,6 @@
 from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 from portable_batch_execution.contracts import (
@@ -15,6 +16,8 @@ class ArtifactContentStream:
 
     size_bytes: int
     chunks: Iterator[bytes]
+    # Private loopback HTTP may use kernel sendfile; this path is never serialized.
+    file_path: Path | None = None
 
 
 class ArtifactStore(Protocol):

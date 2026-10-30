@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -86,6 +88,20 @@ class _PrivateDataPlaneHandler(BaseHTTPRequestHandler):
         if method == "HEAD":
             return
         if isinstance(payload, ArtifactContentStream):
+            # Only the authenticated loopback response can access a local file
+            # descriptor. On Linux sendfile avoids per-64KiB Python read/write
+            # copies on A1; no model bytes or paths enter GitHub artifacts/logs.
+            sender = getattr(self.connection, "sendfile", None)
+            if payload.file_path is not None and callable(sender):
+                with payload.file_path.open("rb") as source:
+                    info = os.fstat(source.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_size != payload.size_bytes:
+                        raise OSError("artifact changed before transfer")
+                    self.wfile.flush()
+                    sent = sender(source, offset=0, count=payload.size_bytes)
+                    if sent != payload.size_bytes:
+                        raise ConnectionError("incomplete artifact transfer")
+                return
             for chunk in payload.chunks:
                 if chunk:
                     self.wfile.write(chunk)

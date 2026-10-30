@@ -178,6 +178,7 @@ class LocalFilesystemDataPlane:
         return ArtifactContentStream(
             size_bytes=path.stat().st_size,
             chunks=self._iter_artifact_chunks(path),
+            file_path=path,
         )
 
     @staticmethod

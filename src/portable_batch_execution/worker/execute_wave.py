@@ -28,7 +28,7 @@ from portable_batch_execution.packs.ml.cosine_similarity_matrix import (
     execute_cosine_similarity_matrix,
 )
 from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
-    execute_distilbert_pair_binary_scores,
+    execute_distilbert_pair_binary_scores_from_staged_models,
 )
 from portable_batch_execution.packs.replay_reduction.canonicalize import (
     BUCKET_MEDIA_TYPE,
@@ -543,10 +543,6 @@ def execute_private_wave(
                     raise _ShardStageFailure("input_artifact_invalid")
                 refs = shard.input_refs
                 tensor_bytes = _read_verified_artifact_bytes(plane, refs[0])
-                model_a_config = _read_verified_artifact_bytes(plane, refs[1])
-                model_a_weights = _read_verified_artifact_bytes(plane, refs[2])
-                model_b_config = _read_verified_artifact_bytes(plane, refs[3])
-                model_b_weights = _read_verified_artifact_bytes(plane, refs[4])
                 try:
                     text = tensor_bytes.decode("utf-8")
                 except UnicodeDecodeError as exc:
@@ -560,13 +556,25 @@ def execute_private_wave(
                         _execution_failure_code(exc, stage="input_parse")
                     ) from None
                 try:
-                    result_payload = execute_distilbert_pair_binary_scores(
-                        parsed_input,
-                        model_a_config=model_a_config,
-                        model_a_weights=model_a_weights,
-                        model_b_config=model_b_config,
-                        model_b_weights=model_b_weights,
-                    )
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        model_a_dir, model_b_dir = root / "model_a", root / "model_b"
+                        model_a_dir.mkdir()
+                        model_b_dir.mkdir()
+                        for ref, destination in (
+                            (refs[1], model_a_dir / "config.json"),
+                            (refs[2], model_a_dir / "model.safetensors"),
+                            (refs[3], model_b_dir / "config.json"),
+                            (refs[4], model_b_dir / "model.safetensors"),
+                        ):
+                            # Stream, SHA-verify, and stage directly on ephemeral disk.
+                            # Keep input-stage failures distinct from model inference.
+                            _materialize_verified_artifact(plane, ref, destination)
+                        result_payload = execute_distilbert_pair_binary_scores_from_staged_models(
+                            parsed_input, model_a_dir=model_a_dir, model_b_dir=model_b_dir
+                        )
+                except _ShardStageFailure:
+                    raise
                 except Exception as exc:  # noqa: BLE001
                     raise _ShardStageFailure(
                         _execution_failure_code(exc, stage="pack")

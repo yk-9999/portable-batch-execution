@@ -12,6 +12,7 @@ from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
     OUTPUT_SCHEMA_VERSION,
     _effective_subbatch_seq_len,
     execute_distilbert_pair_binary_scores,
+    execute_distilbert_pair_binary_scores_from_staged_models,
     validate_distilbert_classifier_config,
     validate_distilbert_pair_binary_scores_input,
 )
@@ -351,3 +352,32 @@ def test_execute_matches_reference_scores_and_preserves_row_order(tmp_path):
     expected_b = _reference_scores(model_b[0], model_b[1], input_ids, attention_mask, tmp_path)
     assert result["model_a_scores"] == expected_a
     assert result["model_b_scores"] == expected_b
+
+
+def test_staged_models_match_existing_bytes_api(tmp_path):
+    """Pre-staging weights must not change numerical predictions or row order."""
+    a_config, a_weights = _tiny_model_bundle(tmp_path, 101)
+    b_config, b_weights = _tiny_model_bundle(tmp_path, 102)
+    request = _tensor_request(
+        ["row2", "row1"], [[3, 4, 0], [5, 6, 0]], [[1, 1, 0], [1, 1, 0]]
+    )
+    expected = execute_distilbert_pair_binary_scores(
+        request,
+        model_a_config=a_config,
+        model_a_weights=a_weights,
+        model_b_config=b_config,
+        model_b_weights=b_weights,
+    )
+    a_dir, b_dir = tmp_path / "pre-staged-a", tmp_path / "pre-staged-b"
+    for directory, config, weights in (
+        (a_dir, a_config, a_weights),
+        (b_dir, b_config, b_weights),
+    ):
+        directory.mkdir()
+        (directory / "config.json").write_bytes(config)
+        (directory / "model.safetensors").write_bytes(weights)
+    actual = execute_distilbert_pair_binary_scores_from_staged_models(
+        request, model_a_dir=a_dir, model_b_dir=b_dir
+    )
+    assert actual == expected
+    assert actual["row_ids"] == ["row2", "row1"]
