@@ -13,7 +13,7 @@ OUTPUT_SCHEMA_VERSION = "pbe.ml.distilbert-pair-binary-scores-output.v1"
 
 _TOP_LEVEL_KEYS = frozenset({"schema_version", "row_ids", "model_a", "model_b"})
 _MODEL_TENSOR_KEYS = frozenset({"input_ids", "attention_mask"})
-_MAX_ROWS = 512
+_MAX_ROWS = 2048
 _INFER_SUBBATCH_MAX_ROWS = 128
 _MIN_SEQ_LEN = 1
 _MAX_SEQ_LEN = 256

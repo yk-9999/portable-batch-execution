@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +22,8 @@ from transformers import (
     DistilBertConfig,
     DistilBertForSequenceClassification,
 )
+
+torch.set_num_threads(int(os.environ.get("PBE_TORCH_NUM_THREADS", "2")))
 
 
 def _tiny_model_bundle(tmp_path: Path, seed: int) -> tuple[bytes, bytes]:
@@ -120,26 +123,26 @@ def _synthetic_rows(
     return row_ids, input_ids, attention_mask
 
 
-def test_validate_input_row_bounds_128_129_512_513():
+def test_validate_input_row_bounds_through_2048_rejects_2049():
     base_ids = [[1, 2]]
     base_mask = [[1, 1]]
-    for count in (128, 129, 512):
+    for count in (128, 129, 1024, 2048):
         row_ids = [f"r{index}" for index in range(count)]
         payload = _tensor_request(row_ids, base_ids * count, base_mask * count)
         validated = validate_distilbert_pair_binary_scores_input(payload)
         assert len(validated["row_ids"]) == count
-    row_ids = [f"r{index}" for index in range(513)]
-    payload = _tensor_request(row_ids, base_ids * 513, base_mask * 513)
+    row_ids = [f"r{index}" for index in range(2049)]
+    payload = _tensor_request(row_ids, base_ids * 2049, base_mask * 2049)
     with pytest.raises(ValueError, match="row bound"):
         validate_distilbert_pair_binary_scores_input(payload)
-    assert _MAX_ROWS == 512
+    assert _MAX_ROWS == 2048
 
 
 def test_execute_large_requests_preserve_row_order_and_output_shape(tmp_path):
     model_a = _tiny_model_bundle(tmp_path, 31)
     model_b = _tiny_model_bundle(tmp_path, 32)
-    for row_count in (129, 257, 512):
-        row_ids, input_ids, attention_mask = _synthetic_rows(row_count, seq_len=12)
+    for row_count in (129, 257, 512, 1024, 2048):
+        row_ids, input_ids, attention_mask = _synthetic_rows(row_count, seq_len=8)
         payload = _tensor_request(row_ids, input_ids, attention_mask)
         result = execute_distilbert_pair_binary_scores(
             payload,
@@ -156,8 +159,8 @@ def test_execute_large_requests_preserve_row_order_and_output_shape(tmp_path):
 def test_execute_large_requests_match_subbatched_reference_scores(tmp_path):
     model_a = _tiny_model_bundle(tmp_path, 41)
     model_b = _tiny_model_bundle(tmp_path, 42)
-    for row_count in (129, 257, 512):
-        row_ids, input_ids, attention_mask = _synthetic_rows(row_count, seq_len=16)
+    for row_count in (129, 257, 512, 1024, 2048):
+        row_ids, input_ids, attention_mask = _synthetic_rows(row_count, seq_len=8)
         payload = _tensor_request(row_ids, input_ids, attention_mask)
         result = execute_distilbert_pair_binary_scores(
             payload,
