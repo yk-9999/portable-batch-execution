@@ -6,10 +6,10 @@ import pytest
 
 from portable_batch_execution.broker.planning import canonical_operation_params
 from portable_batch_execution.packs.ml.distilbert_pair_binary_scores import (
-    INPUT_SCHEMA_VERSION,
-    OUTPUT_SCHEMA_VERSION,
     _INFER_SUBBATCH_MAX_ROWS,
     _MAX_ROWS,
+    INPUT_SCHEMA_VERSION,
+    OUTPUT_SCHEMA_VERSION,
     _effective_subbatch_seq_len,
     execute_distilbert_pair_binary_scores,
     validate_distilbert_classifier_config,
