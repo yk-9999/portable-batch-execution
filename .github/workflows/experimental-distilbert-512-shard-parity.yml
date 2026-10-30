@@ -1,0 +1,77 @@
+name: Experimental 512-row DistilBERT shard score parity
+
+on:
+  push:
+    branches:
+      - experiment/distilbert-512-shard-parity-20261030
+
+permissions:
+  contents: read
+
+jobs:
+  parity_synthetic_512:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
+      - run: uv sync --dev --extra distilbert
+      - name: Compare full batch with four per-shard trimmed batches
+        run: |
+          set -euo pipefail
+          uv run python - <<'PYCODE'
+          import json
+          import sys
+          sys.path.insert(0, 'tests/performance')
+          from distilbert_fullsize_public_benchmark import (
+              _build_model_bundle,
+              _payload_from_partition,
+              benchmark_synthetic_model_seed_pair,
+              generate_global_synthetic_rows,
+              run_sequential_pair_scores,
+              scores_digest,
+          )
+
+          seeds = benchmark_synthetic_model_seed_pair()
+          model_a = _build_model_bundle(seed=seeds[0], tiny=False)
+          model_b = _build_model_bundle(seed=seeds[1], tiny=False)
+          row_ids, ids, masks = generate_global_synthetic_rows(total_rows=512)
+          whole, whole_seconds = run_sequential_pair_scores(
+              _payload_from_partition(row_ids, ids, masks), model_a=model_a, model_b=model_b
+          )
+          merged = {'row_ids': [], 'model_a_scores': [], 'model_b_scores': []}
+          shards = []
+          for start in range(0, 512, 128):
+              end = start + 128
+              subset_ids = ids[start:end]
+              subset_masks = masks[start:end]
+              # Identical trimming rule to the original >128-row Public microbatch.
+              effective = max(1, max((i + 1 for mask in subset_masks for i, bit in enumerate(mask) if bit == 1), default=0))
+              p = _payload_from_partition(
+                  row_ids[start:end],
+                  [r[:effective] for r in subset_ids],
+                  [r[:effective] for r in subset_masks],
+              )
+              part, _wall = run_sequential_pair_scores(p, model_a=model_a, model_b=model_b)
+              shards.append({'offset': start, 'seq_len': effective})
+              for key in merged:
+                  merged[key].extend(part[key])
+          assert whole['row_ids'] == merged['row_ids']
+          diffs = {
+              key: max(abs(float(a) - float(b)) for a, b in zip(whole[key], merged[key], strict=True))
+              for key in ('model_a_scores', 'model_b_scores')
+          }
+          report = {
+              'rows': 512, 'shards': shards,
+              'original_digest': scores_digest(whole),
+              'sharded_digest': scores_digest(merged),
+              'exact_digest_match': scores_digest(whole) == scores_digest(merged),
+              'max_abs_difference': diffs,
+              'whole_infer_wall_s': whole_seconds,
+          }
+          print('SHARD_PARITY_RESULT', json.dumps(report, sort_keys=True))
+          assert max(diffs.values()) <= 1e-6, report
+          PYCODE
