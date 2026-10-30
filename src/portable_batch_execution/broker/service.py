@@ -6,8 +6,10 @@ import base64
 import json
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
+from threading import Lock
 
 from portable_batch_execution.backends.base import BackendExecutionRef
 from portable_batch_execution.backends.github_actions import (
@@ -54,6 +56,36 @@ _ALLOWED_BROKER_PACKS = frozenset(
 _BROKER_REPLAY_EVAL_OPERATION = "replay_eval.external_api_evaluation"
 
 
+class _RequestIdSerializer:
+    """Serialize same-ID state transitions, without retaining idle lock entries."""
+
+    def __init__(self) -> None:
+        self._guard = Lock()
+        self._locks: dict[str, tuple[Lock, int]] = {}
+
+    @contextmanager
+    def hold(self, request_id: str):
+        with self._guard:
+            current = self._locks.get(request_id)
+            if current is None:
+                lock, users = Lock(), 0
+            else:
+                lock, users = current
+            self._locks[request_id] = (lock, users + 1)
+        try:
+            with lock:
+                yield
+        finally:
+            with self._guard:
+                current_lock, users = self._locks[request_id]
+                if current_lock is not lock or users < 1:
+                    raise RuntimeError("broker request lock bookkeeping corrupt")
+                if users == 1:
+                    del self._locks[request_id]
+                else:
+                    self._locks[request_id] = (lock, users - 1)
+
+
 class UnixBrokerService:
     """Synchronous closed execution broker for local Unix clients."""
 
@@ -73,8 +105,20 @@ class UnixBrokerService:
         self._sleep = sleeper or time.sleep
         self._store = BrokerRequestStore(self.state_root / "controller")
         self._deliveries = DeliveryRecordStore(self.state_root)
+        self._request_serializer = _RequestIdSerializer()
 
     def handle_message(self, peer_uid: int, payload: object) -> bytes:
+        request_id = payload.get("request_id") if isinstance(payload, dict) else None
+        if (
+            isinstance(request_id, str)
+            and 0 < len(request_id) <= 128
+            and not any(c in request_id for c in "/\\?#")
+        ):
+            with self._request_serializer.hold(request_id):
+                return self._handle_message_unlocked(peer_uid, payload)
+        return self._handle_message_unlocked(peer_uid, payload)
+
+    def _handle_message_unlocked(self, peer_uid: int, payload: object) -> bytes:
         version = message_schema_version(payload)
         if version == _DELIVERY_COMMIT_SCHEMA:
             response = self.handle_delivery_commit(peer_uid, payload)

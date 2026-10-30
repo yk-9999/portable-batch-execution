@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterator
 from hashlib import sha256
 from pathlib import Path
@@ -18,6 +19,14 @@ from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
 from .base import ArtifactContentStream, RevisionConflictError
 
 _ARTIFACT_CHUNK_BYTES = 64 * 1024
+_STATIC_VALIDATED_CACHE_LIMIT = 64
+_STATIC_VALIDATED_CACHE_LOCK = RLock()
+_STATIC_VALIDATED_CACHE: OrderedDict[tuple, bool] = OrderedDict()
+
+
+def _static_file_stamp(path: Path) -> tuple[int, int, int, int, int]:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
 class LocalFilesystemDataPlane:
@@ -67,19 +76,41 @@ class LocalFilesystemDataPlane:
                 raise ValueError(f"local artifact size mismatch for {ref.sha256}")
 
     def validate_static_ref(self, ref: ArtifactRef) -> bool:
-        """Validate a static input ref; external refs are accepted without local checks."""
+        """Verify each immutable local file version once per process, using bounded RAM.
+
+        The cache key includes inode, device, size, mtime and ctime, so replacing
+        or modifying a file forces a fresh streaming hash even if its size stays
+        unchanged. Fail closed on missing files or mutations during verification.
+        """
         try:
             path = self._local_payload_path(ref)
         except ValueError:
             return False
         if path is None:
             return True
-        if not path.is_file():
-            return False
-        if ref.size_bytes is not None and path.stat().st_size != ref.size_bytes:
-            return False
-        digest = f"sha256:{sha256(path.read_bytes()).hexdigest()}"
-        return digest == ref.sha256
+        with _STATIC_VALIDATED_CACHE_LOCK:
+            try:
+                before = _static_file_stamp(path)
+                if ref.size_bytes is not None and before[2] != ref.size_bytes:
+                    return False
+                key = (str(path), ref.sha256, before)
+                if key in _STATIC_VALIDATED_CACHE:
+                    _STATIC_VALIDATED_CACHE.move_to_end(key)
+                    return True
+                digest = sha256()
+                with path.open("rb") as stream:
+                    while chunk := stream.read(_ARTIFACT_CHUNK_BYTES * 16):
+                        digest.update(chunk)
+                if _static_file_stamp(path) != before:
+                    return False
+            except (OSError, ValueError):
+                return False
+            if f"sha256:{digest.hexdigest()}" != ref.sha256:
+                return False
+            _STATIC_VALIDATED_CACHE[key] = True
+            while len(_STATIC_VALIDATED_CACHE) > _STATIC_VALIDATED_CACHE_LIMIT:
+                _STATIC_VALIDATED_CACHE.popitem(last=False)
+            return True
 
     def _artifact_ref_for_payload(
         self, digest: str, data: bytes, media_type: str | None

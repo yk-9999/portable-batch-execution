@@ -5,11 +5,15 @@ from __future__ import annotations
 import json
 import os
 import socket
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .peers import read_peer_credentials
 from .protocol import BrokerExecuteResponse, response_to_json
 from .service import UnixBrokerService
+
+MAX_ACTIVE_CONNECTIONS = 8
 
 
 def serve_unix_broker(
@@ -25,11 +29,32 @@ def serve_unix_broker(
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(socket_path))
     os.chmod(socket_path, socket_mode or service.config.socket_mode)
-    listener.listen(8)
-    while True:
-        connection, _address = listener.accept()
+    listener.listen(MAX_ACTIVE_CONNECTIONS)
+    slots = threading.BoundedSemaphore(MAX_ACTIVE_CONNECTIONS)
+    with ThreadPoolExecutor(max_workers=MAX_ACTIVE_CONNECTIONS) as workers:
+        while True:
+            # Block before accept: backpressure rather than rejecting live callers.
+            # This also keeps the executor queue bounded by the active slot count.
+            slots.acquire()
+            try:
+                connection, _address = listener.accept()
+            except BaseException:
+                slots.release()
+                raise
+            try:
+                workers.submit(_serve_connection, connection, service, slots)
+            except BaseException:
+                connection.close()
+                slots.release()
+                raise
+
+
+def _serve_connection(connection: socket.socket, service: UnixBrokerService, slots) -> None:
+    try:
         with connection:
             _handle_connection(connection, service)
+    finally:
+        slots.release()
 
 
 def _handle_connection(connection: socket.socket, service: UnixBrokerService) -> None:
