@@ -23,6 +23,7 @@ from portable_batch_execution.controller.closed_wave_registry import ClosedWaveR
 from portable_batch_execution.data_plane.base import RevisionConflictError
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
 from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
+from portable_batch_execution.model_delivery import HFPrivateModelDelivery
 from portable_batch_execution.packs import MLPack, TabularPack
 from portable_batch_execution.worker.external_api_evaluation import (
     validate_closed_operation_params,
@@ -206,12 +207,17 @@ def register_broker_private_run(
     input_media_type: str,
     public_sha: str,
     static_input_refs: tuple[ArtifactRef, ...] = (),
+    model_delivery: HFPrivateModelDelivery | None = None,
 ) -> tuple[JobSpec, WaveSpec, ShardSpec, RunManifest]:
     state_root = Path(state_root).resolve()
     plane = LocalFilesystemDataPlane(state_root)
     registry = ClosedWaveRegistry(state_root / "controller")
     input_digest = broker_shard_input_digest(input_bytes, static_input_refs)
     validated_params = canonical_operation_params(pack, operation, operation_params)
+    if model_delivery is not None and (
+        pack != "ml-batch" or operation != "ml.distilbert_pair_binary_scores"
+    ):
+        raise ValueError("model delivery requires the closed DistilBERT operation")
     execution_fingerprint = broker_execution_fingerprint(
         request_id=request_id,
         input_digest=input_digest,
@@ -256,7 +262,11 @@ def register_broker_private_run(
                 raise ValueError("registered run missing manifest")
         return job, wave, shard, manifest
     now = datetime.now(UTC)
-    security_profile = "external-api" if pack == "replay-eval-batch" else "offline"
+    security_profile = (
+        "external-api" if pack == "replay-eval-batch"
+        else "bounded-network" if model_delivery is not None
+        else "offline"
+    )
     with lifecycle_state_lock(state_root):
         _validate_static_input_refs(plane, static_input_refs)
         input_ref = plane.write(
@@ -281,6 +291,7 @@ def register_broker_private_run(
                 created_at=now,
             ),
             operation_params=validated_params,
+            model_delivery=model_delivery,
         )
         shard = ShardSpec(
             logical_run_id=run_id,

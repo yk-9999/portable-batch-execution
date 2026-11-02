@@ -219,6 +219,9 @@ class UnixBrokerService:
         static_input_refs = self.config.static_input_refs_for(
             request.pack, request.operation
         )
+        model_delivery = self.config.model_delivery_for(
+            request.pack, request.operation
+        )
         input_digest = broker_shard_input_digest(input_bytes, static_input_refs)
         binding = RequestBinding(
             input_digest=input_digest,
@@ -244,7 +247,7 @@ class UnixBrokerService:
             except KeyError:
                 try:
                     state = self._register_request(
-                        request, binding, input_bytes, static_input_refs
+                        request, binding, input_bytes, static_input_refs, model_delivery
                     )
                 except ValueError:
                     return self._failed(request.request_id, "broker_internal_error")
@@ -269,6 +272,7 @@ class UnixBrokerService:
         binding: RequestBinding,
         input_bytes: bytes,
         static_input_refs,
+        model_delivery,
     ) -> BrokerRequestState:
         _, wave, shard, _ = register_broker_private_run(
             state_root=self.state_root,
@@ -280,6 +284,7 @@ class UnixBrokerService:
             input_media_type=request.input_media_type,
             public_sha=self.config.public_sha,
             static_input_refs=static_input_refs,
+            model_delivery=model_delivery,
         )
         state = BrokerRequestState(
             request_id=request.request_id,

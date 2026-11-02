@@ -41,6 +41,10 @@ from portable_batch_execution.packs.replay_reduction.canonicalize import (
 from portable_batch_execution.packs.replay_reduction.models import (
     BUCKET_COUNT_MAX,
 )
+from portable_batch_execution.worker.hf_private_models import (
+    HFModelDownloadError,
+    stage_private_hf_models,
+)
 from portable_batch_execution.worker.external_api_evaluation import (
     ExternalApiEvaluationError,
     execute_nvidia_openai_compatible_request,
@@ -558,18 +562,25 @@ def execute_private_wave(
                 try:
                     with tempfile.TemporaryDirectory() as temporary:
                         root = Path(temporary)
-                        model_a_dir, model_b_dir = root / "model_a", root / "model_b"
-                        model_a_dir.mkdir()
-                        model_b_dir.mkdir()
-                        for ref, destination in (
-                            (refs[1], model_a_dir / "config.json"),
-                            (refs[2], model_a_dir / "model.safetensors"),
-                            (refs[3], model_b_dir / "config.json"),
-                            (refs[4], model_b_dir / "model.safetensors"),
-                        ):
-                            # Stream, SHA-verify, and stage directly on ephemeral disk.
-                            # Keep input-stage failures distinct from model inference.
-                            _materialize_verified_artifact(plane, ref, destination)
+                        if job.model_delivery is None:
+                            model_a_dir, model_b_dir = root / "model_a", root / "model_b"
+                            model_a_dir.mkdir()
+                            model_b_dir.mkdir()
+                            for ref, destination in (
+                                (refs[1], model_a_dir / "config.json"),
+                                (refs[2], model_a_dir / "model.safetensors"),
+                                (refs[3], model_b_dir / "config.json"),
+                                (refs[4], model_b_dir / "model.safetensors"),
+                            ):
+                                # Retained legacy A1 transport, byte-verified.
+                                _materialize_verified_artifact(plane, ref, destination)
+                        else:
+                            try:
+                                model_a_dir, model_b_dir = stage_private_hf_models(
+                                    job.model_delivery, tuple(refs[1:]), root
+                                )
+                            except HFModelDownloadError as exc:
+                                raise _ShardStageFailure(exc.code) from None
                         result_payload = execute_distilbert_pair_binary_scores_from_staged_models(
                             parsed_input, model_a_dir=model_a_dir, model_b_dir=model_b_dir
                         )

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from portable_batch_execution.contracts import ArtifactRef
+from portable_batch_execution.model_delivery import HFPrivateModelDelivery
 
 _FORBIDDEN_ID_CHARS = "/\\?#"
 _MAX_ID_LEN = 128
@@ -16,6 +17,7 @@ _DEFAULT_SOCKET_MODE = 0o666
 _JSON_FRAME_OVERHEAD_BYTES = 65_536
 _MAX_STATIC_INPUT_REFS = 16
 _STATIC_BINDING_KEYS = frozenset({"pack", "operation", "input_refs"})
+_STATIC_MODEL_DELIVERY_KEY = "model_delivery"
 
 
 def max_request_frame_bytes(max_input_bytes: int) -> int:
@@ -44,6 +46,9 @@ class BrokerConfig:
     socket_mode: int
     allowed_operations_by_uid: dict[int, frozenset[tuple[str, str]]]
     static_input_bindings: dict[tuple[str, str], tuple[ArtifactRef, ...]]
+    model_deliveries: dict[tuple[str, str], HFPrivateModelDelivery] = field(
+        default_factory=dict
+    )
 
     @property
     def max_request_frame_bytes(self) -> int:
@@ -89,9 +94,9 @@ class BrokerConfig:
                     raise ValueError("allowed operation entries must be [pack, operation]")
                 pairs.add((item[0], item[1]))
             allowed[uid] = frozenset(pairs)
-        static_input_bindings = _parse_static_input_bindings(
-            payload.get("static_input_bindings", [])
-        )
+        raw_bindings = payload.get("static_input_bindings", [])
+        static_input_bindings = _parse_static_input_bindings(raw_bindings)
+        model_deliveries = _parse_model_deliveries(raw_bindings, static_input_bindings)
         return cls(
             schema_version=version,
             public_sha=public_sha,
@@ -99,10 +104,16 @@ class BrokerConfig:
             socket_mode=socket_mode,
             allowed_operations_by_uid=allowed,
             static_input_bindings=static_input_bindings,
+            model_deliveries=model_deliveries,
         )
 
     def static_input_refs_for(self, pack: str, operation: str) -> tuple[ArtifactRef, ...]:
         return self.static_input_bindings.get((pack, operation), ())
+
+    def model_delivery_for(
+        self, pack: str, operation: str
+    ) -> HFPrivateModelDelivery | None:
+        return self.model_deliveries.get((pack, operation))
 
     def authorize(self, uid: int, pack: str, operation: str) -> bool:
         allowed = self.allowed_operations_by_uid.get(uid)
@@ -135,7 +146,10 @@ def _parse_static_input_bindings(
     for entry in raw_bindings:
         if not isinstance(entry, dict):
             raise TypeError("static_input_bindings entries must be objects")
-        if frozenset(entry.keys()) != _STATIC_BINDING_KEYS:
+        if frozenset(entry.keys()) not in (
+            _STATIC_BINDING_KEYS,
+            _STATIC_BINDING_KEYS | {_STATIC_MODEL_DELIVERY_KEY},
+        ):
             raise ValueError("static_input_bindings entry has unexpected fields")
         pack = entry.get("pack")
         operation = entry.get("operation")
@@ -157,3 +171,22 @@ def _parse_static_input_bindings(
             raise ValueError("static_input_bindings input_refs contain duplicate object_id")
         bindings[key] = refs
     return bindings
+
+def _parse_model_deliveries(
+    raw_bindings: object,
+    static_bindings: dict[tuple[str, str], tuple[ArtifactRef, ...]],
+) -> dict[tuple[str, str], HFPrivateModelDelivery]:
+    deliveries: dict[tuple[str, str], HFPrivateModelDelivery] = {}
+    if not isinstance(raw_bindings, list):
+        return deliveries
+    for entry in raw_bindings:
+        if "model_delivery" not in entry:
+            continue
+        key = (entry["pack"], entry["operation"])
+        if key != ("ml-batch", "ml.distilbert_pair_binary_scores"):
+            raise ValueError("HF model delivery is only available to the closed DistilBERT operation")
+        refs = static_bindings[key]
+        if len(refs) != 4 or any(ref.size_bytes is None for ref in refs):
+            raise ValueError("HF model delivery requires four size-pinned static model refs")
+        deliveries[key] = HFPrivateModelDelivery.model_validate(entry["model_delivery"])
+    return deliveries

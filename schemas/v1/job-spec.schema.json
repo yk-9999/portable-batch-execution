@@ -171,6 +171,53 @@
       "title": "Extent",
       "type": "object"
     },
+    "HFPrivateModelDelivery": {
+      "additionalProperties": false,
+      "description": "One private model repository pinned to one immutable Git commit.",
+      "properties": {
+        "kind": {
+          "const": "hf-private-repo-oidc",
+          "title": "Kind",
+          "type": "string"
+        },
+        "repo_id": {
+          "title": "Repo Id",
+          "type": "string"
+        },
+        "revision": {
+          "title": "Revision",
+          "type": "string"
+        },
+        "filenames": {
+          "maxItems": 4,
+          "minItems": 4,
+          "prefixItems": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "string"
+            },
+            {
+              "type": "string"
+            }
+          ],
+          "title": "Filenames",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "repo_id",
+        "revision",
+        "filenames"
+      ],
+      "title": "HFPrivateModelDelivery",
+      "type": "object"
+    },
     "Provenance": {
       "additionalProperties": false,
       "properties": {
@@ -346,6 +393,17 @@
     },
     "compatibility": {
       "$ref": "#/$defs/CompatibilitySpec"
+    },
+    "model_delivery": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/HFPrivateModelDelivery"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     }
   },
   "required": [

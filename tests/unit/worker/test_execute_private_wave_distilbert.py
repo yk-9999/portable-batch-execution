@@ -175,3 +175,77 @@ def test_distilbert_rejects_digest_mismatch(tmp_path):
     with pytest.raises(PrivateWaveExecutionError):
         execute_private_wave("opaque-run", "opaque-wave", plane=plane)
     assert plane.appended[0].failure == "input_artifact_mismatch"
+
+
+def test_hf_pinned_delivery_has_numerical_parity_with_legacy_stream(tmp_path, monkeypatch):
+    """Public model bytes come from HF; output must match the existing A1 model path."""
+    from portable_batch_execution.worker import execute_wave as worker
+    from portable_batch_execution.model_delivery import HFPrivateModelDelivery
+
+    old_root, new_root = tmp_path / "old", tmp_path / "new"
+    old_root.mkdir()
+    new_root.mkdir()
+    old_plane = _distilbert_plane(old_root)
+    execute_private_wave("opaque-run", "opaque-wave", plane=old_plane)
+    old_output = json.loads(old_plane.last_written)
+
+    hf_plane = _distilbert_plane(new_root)
+    resolved = hf_plane.resolve_wave("opaque-run", "opaque-wave")
+    resolved["job"]["security_profile"] = "bounded-network"
+    resolved["job"]["model_delivery"] = {
+        "kind": "hf-private-repo-oidc",
+        "repo_id": "namespace/model",
+        "revision": "e" * 40,
+        "filenames": [
+            "a/config.json", "a/model.safetensors",
+            "b/config.json", "b/model.safetensors",
+        ],
+    }
+    refs = [ArtifactRef.model_validate(ref) for ref in resolved["shards"][0]["input_refs"][1:]]
+    source_contents = [hf_plane.read(ref) for ref in refs]
+    def reject_a1_model_read(ref):
+        raise AssertionError("HF execution must not read model weight bytes from A1")
+    monkeypatch.setattr(hf_plane, "open_content", reject_a1_model_read)
+    def fake_hf_stage(source, model_refs, root):
+        assert isinstance(source, HFPrivateModelDelivery)
+        assert tuple(model_refs) == tuple(refs)
+        directories = (root / "model_a", root / "model_b")
+        for d in directories:
+            d.mkdir()
+        for i, data in enumerate(source_contents):
+            target = directories[i // 2] / ("config.json" if i % 2 == 0 else "model.safetensors")
+            target.write_bytes(data)
+        return directories
+    monkeypatch.setattr(worker, "stage_private_hf_models", fake_hf_stage)
+
+    execute_private_wave("opaque-run", "opaque-wave", plane=hf_plane)
+    hf_output = json.loads(hf_plane.last_written)
+    assert hf_output["row_ids"] == old_output["row_ids"]
+    assert hf_output["model_a_scores"] == pytest.approx(old_output["model_a_scores"], abs=1e-8)
+    assert hf_output["model_b_scores"] == pytest.approx(old_output["model_b_scores"], abs=1e-8)
+
+
+def test_hf_failure_records_retryable_sanitized_attempt(tmp_path, monkeypatch):
+    from portable_batch_execution.worker import execute_wave as worker
+    from portable_batch_execution.worker.hf_private_models import HFModelDownloadError
+
+    plane = _distilbert_plane(tmp_path)
+    resolved = plane.resolve_wave("opaque-run", "opaque-wave")
+    resolved["job"]["security_profile"] = "bounded-network"
+    resolved["job"]["model_delivery"] = {
+        "kind": "hf-private-repo-oidc",
+        "repo_id": "namespace/model",
+        "revision": "e" * 40,
+        "filenames": [
+            "a/config.json", "a/model.safetensors",
+            "b/config.json", "b/model.safetensors",
+        ],
+    }
+    def fail(*args):
+        raise HFModelDownloadError("hf_model_rate_limited")
+    monkeypatch.setattr(worker, "stage_private_hf_models", fail)
+    with pytest.raises(PrivateWaveExecutionError):
+        execute_private_wave("opaque-run", "opaque-wave", plane=plane)
+    assert plane.appended[0].status == "failed"
+    assert plane.appended[0].failure == "hf_model_rate_limited"
+    assert plane.appended[0].output_refs == ()

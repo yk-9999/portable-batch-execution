@@ -19,6 +19,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write  # Exchange ephemeral OIDC with HF read-only repo publisher.
 
 jobs:
   execute-wave:

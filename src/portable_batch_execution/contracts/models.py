@@ -5,6 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from portable_batch_execution.model_delivery import HFPrivateModelDelivery
+
 PACK_OPS = {
     "tabular-batch": {
         "tabular.normalize",
@@ -266,9 +268,19 @@ class JobSpec(Frozen):
     adapter: AdapterDescriptor | None = None
     operation_params: dict[str, Any] = Field(default_factory=dict)
     compatibility: CompatibilitySpec = Field(default_factory=CompatibilitySpec)
+    # Exclude absent metadata so legacy serialized contracts and digests are unchanged.
+    model_delivery: HFPrivateModelDelivery | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @model_validator(mode="after")
     def closed(self):
+        if self.model_delivery is not None and (
+            self.pack != "ml-batch"
+            or self.operation != "ml.distilbert_pair_binary_scores"
+            or self.security_profile != "bounded-network"
+        ):
+            raise ValueError("model delivery requires a bounded-network DistilBERT job")
         if self.operation not in PACK_OPS[self.pack] or {
             "shell",
             "command",
