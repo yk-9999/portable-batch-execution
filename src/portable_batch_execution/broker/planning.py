@@ -23,6 +23,8 @@ from portable_batch_execution.controller.closed_wave_registry import ClosedWaveR
 from portable_batch_execution.data_plane.base import RevisionConflictError
 from portable_batch_execution.data_plane.local import LocalFilesystemDataPlane
 from portable_batch_execution.lifecycle.lock import lifecycle_state_lock
+
+_BROKER_REGISTRATION_LOCK_ACQUIRE_TIMEOUT_S = 10.0
 from portable_batch_execution.model_delivery import HFPrivateModelDelivery
 from portable_batch_execution.packs import MLPack, TabularPack
 from portable_batch_execution.worker.external_api_evaluation import (
@@ -181,6 +183,66 @@ def validate_registered_wave_binding(
         raise ValueError(_BINDING_CONFLICT)
 
 
+def _broker_registration_lock(state_root: Path):
+    return lifecycle_state_lock(
+        state_root,
+        acquire_timeout=_BROKER_REGISTRATION_LOCK_ACQUIRE_TIMEOUT_S,
+    )
+
+
+def _materialize_existing_registration(
+    *,
+    existing: dict[str, object],
+    state_root: Path,
+    plane: LocalFilesystemDataPlane,
+    request_id: str,
+    run_id: str,
+    input_digest: str,
+    pack: str,
+    operation: str,
+    validated_params: dict[str, Any],
+    execution_fingerprint: str,
+    static_input_refs: tuple[ArtifactRef, ...],
+    lifecycle_lock_held: bool = False,
+) -> tuple[JobSpec, WaveSpec, ShardSpec, RunManifest]:
+    job = JobSpec.model_validate(existing["job"])
+    wave = WaveSpec.model_validate(existing["wave"])
+    shard = ShardSpec.model_validate(existing["shards"][0])
+    validate_registered_wave_binding(
+        request_id=request_id,
+        binding_input_digest=input_digest,
+        binding_pack=pack,
+        binding_operation=operation,
+        binding_operation_params=validated_params,
+        binding_execution_fingerprint=execution_fingerprint,
+        job=job,
+        shard=shard,
+        expected_static_input_refs=static_input_refs,
+    )
+    manifest = plane.read_manifest(run_id)
+    if manifest is not None:
+        return job, wave, shard, manifest
+    manifest = _initial_manifest(job, wave, shard)
+
+    def _repair_manifest() -> RunManifest | None:
+        _validate_static_input_refs(plane, static_input_refs)
+        plane._validate_local_refs(tuple(shard.input_refs))
+        try:
+            plane.write_next_manifest_with_caller_lifecycle_lock(manifest, -1)
+        except RevisionConflictError:
+            return plane.read_manifest(run_id)
+        return manifest
+
+    if lifecycle_lock_held:
+        repaired = _repair_manifest()
+    else:
+        with _broker_registration_lock(state_root):
+            repaired = _repair_manifest()
+    if repaired is None:
+        raise ValueError("registered run missing manifest")
+    return job, wave, shard, repaired
+
+
 def _initial_manifest(job: JobSpec, wave: WaveSpec, shard: ShardSpec) -> RunManifest:
     created_at = job.provenance.created_at
     return RunManifest(
@@ -234,40 +296,45 @@ def register_broker_private_run(
     except KeyError:
         existing = None
     if existing is not None:
-        job = JobSpec.model_validate(existing["job"])
-        wave = WaveSpec.model_validate(existing["wave"])
-        shard = ShardSpec.model_validate(existing["shards"][0])
-        validate_registered_wave_binding(
+        return _materialize_existing_registration(
+            existing=existing,
+            state_root=state_root,
+            plane=plane,
             request_id=request_id,
-            binding_input_digest=input_digest,
-            binding_pack=pack,
-            binding_operation=operation,
-            binding_operation_params=validated_params,
-            binding_execution_fingerprint=execution_fingerprint,
-            job=job,
-            shard=shard,
-            expected_static_input_refs=static_input_refs,
+            run_id=run_id,
+            input_digest=input_digest,
+            pack=pack,
+            operation=operation,
+            validated_params=validated_params,
+            execution_fingerprint=execution_fingerprint,
+            static_input_refs=static_input_refs,
         )
-        manifest = plane.read_manifest(run_id)
-        if manifest is None:
-            manifest = _initial_manifest(job, wave, shard)
-            with lifecycle_state_lock(state_root):
-                _validate_static_input_refs(plane, static_input_refs)
-                plane._validate_local_refs(tuple(shard.input_refs))
-                try:
-                    plane.write_next_manifest_with_caller_lifecycle_lock(manifest, -1)
-                except RevisionConflictError:
-                    manifest = plane.read_manifest(run_id)
-            if manifest is None:
-                raise ValueError("registered run missing manifest")
-        return job, wave, shard, manifest
     now = datetime.now(UTC)
     security_profile = (
         "external-api" if pack == "replay-eval-batch"
         else "bounded-network" if model_delivery is not None
         else "offline"
     )
-    with lifecycle_state_lock(state_root):
+    with _broker_registration_lock(state_root):
+        try:
+            raced = registry.resolve_wave(run_id, wave_id)
+        except KeyError:
+            raced = None
+        if raced is not None:
+            return _materialize_existing_registration(
+                existing=raced,
+                state_root=state_root,
+                plane=plane,
+                request_id=request_id,
+                run_id=run_id,
+                input_digest=input_digest,
+                pack=pack,
+                operation=operation,
+                validated_params=validated_params,
+                execution_fingerprint=execution_fingerprint,
+                static_input_refs=static_input_refs,
+                lifecycle_lock_held=True,
+            )
         _validate_static_input_refs(plane, static_input_refs)
         input_ref = plane.write(
             input_bytes, input_media_type, _caller_holds_lifecycle_lock=True
