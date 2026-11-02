@@ -64,7 +64,9 @@ def _mint_oidc_token(repo_id: str, root: Path) -> str:
         detail = result.stderr
         match = re.search(r"\b(401|403|429)\b", detail)
         status = int(match.group(1)) if match else None
-        if status is None and re.search(r"\b(?:invalid_grant|invalid_request)\b", detail, re.I):
+        if status is None and re.search(
+            r"\b(?:invalid_grant|invalid_request)\b", detail, re.IGNORECASE
+        ):
             raise HFModelDownloadError("hf_model_auth_failed")
         raise HFModelDownloadError(_failure_from_status(status))
     token = result.stdout.strip()
