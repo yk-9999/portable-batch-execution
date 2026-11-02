@@ -252,7 +252,9 @@ class UnixBrokerService:
                     )
                 except LifecycleLockTimeoutError:
                     return self._failed(request.request_id, "broker_busy")
-                except ValueError:
+                except ValueError as exc:
+                    if str(exc) == "request_binding_conflict":
+                        return self._failed(request.request_id, "request_id_conflict")
                     return self._failed(request.request_id, "broker_internal_error")
             else:
                 try:

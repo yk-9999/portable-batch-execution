@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import errno
 import json
 import multiprocessing
@@ -15,9 +16,12 @@ import pytest
 
 from portable_batch_execution.broker.config import BrokerConfig
 from portable_batch_execution.broker.planning import (
+    opaque_run_id,
+    opaque_wave_id,
     register_broker_private_run,
 )
 from portable_batch_execution.broker.service import UnixBrokerService
+from portable_batch_execution.broker.state import BrokerRequestStore
 from portable_batch_execution.controller.a1_controller import A1Controller
 from portable_batch_execution.lifecycle.lock import (
     LifecycleLockError,
@@ -75,6 +79,13 @@ def _wave_count(state_root: Path) -> int:
     if not waves_root.is_dir():
         return 0
     return len(list(waves_root.glob("*/*.wave.json")))
+
+
+def _artifact_count(state_root: Path) -> int:
+    artifacts = state_root / "artifacts"
+    if not artifacts.is_dir():
+        return 0
+    return len(list(artifacts.iterdir()))
 
 
 def test_concurrent_distinct_request_ids_register_without_lock_errors(tmp_path):
@@ -191,6 +202,55 @@ def test_register_broker_busy_when_lifecycle_lock_held(tmp_path):
         holder.release()
     assert response.status == "failed"
     assert response.error_code == "broker_busy"
+
+
+def test_service_register_after_resolve_miss_reports_request_id_conflict(tmp_path):
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    request_id = "req-service-binding-race"
+    winner_input = b"[1,2,3]"
+    loser_input = b"[9,8,7]"
+    winner_job, _, winner_shard, _ = _register(
+        state_root, request_id, input_bytes=winner_input
+    )
+    artifacts_before = _artifact_count(state_root)
+    run_id = opaque_run_id(request_id)
+    wave_id = opaque_wave_id(request_id)
+
+    config = _config(tmp_path)
+    controller = A1Controller(state_root, backend=None)
+    service = UnixBrokerService(
+        state_root=state_root,
+        config=config,
+        controller=controller,
+        poll_interval_seconds=0.0,
+    )
+
+    def resolve_optimistic_miss(_run_id: str, _wave_id: str):
+        raise KeyError(_run_id, _wave_id)
+
+    with patch.object(controller.registry, "resolve_wave", side_effect=resolve_optimistic_miss):
+        response = service.handle_payload(
+            _UID,
+            {
+                "schema_version": "pbe.a1-unix-broker.request.v1",
+                "request_id": request_id,
+                "pack": "tabular-batch",
+                "operation": "tabular.sort",
+                "operation_params": _SORT_PARAMS,
+                "input_media_type": "application/json",
+                "input_b64": base64.b64encode(loser_input).decode("ascii"),
+            },
+        )
+
+    assert response.status == "failed"
+    assert response.error_code == "request_id_conflict"
+    assert _wave_count(state_root) == 1
+    assert _artifact_count(state_root) == artifacts_before
+    payload = controller.registry.resolve_wave(run_id, wave_id)
+    assert payload["job"]["job_id"] == winner_job.job_id
+    assert payload["shards"][0]["input_digest"] == winner_shard.input_digest
+    assert BrokerRequestStore(state_root / "controller").load(request_id) is None
 
 
 def _process_register(state_root_str: str, request_id: str, queue: multiprocessing.Queue) -> None:
