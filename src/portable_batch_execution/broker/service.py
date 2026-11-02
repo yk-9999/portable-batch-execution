@@ -25,6 +25,7 @@ from portable_batch_execution.lifecycle.delivery import (
     DeliveryRecordStore,
     utc_now,
 )
+from portable_batch_execution.lifecycle.lock import LifecycleLockTimeoutError
 
 from .config import BrokerConfig
 from .planning import (
@@ -249,7 +250,11 @@ class UnixBrokerService:
                     state = self._register_request(
                         request, binding, input_bytes, static_input_refs, model_delivery
                     )
-                except ValueError:
+                except LifecycleLockTimeoutError:
+                    return self._failed(request.request_id, "broker_busy")
+                except ValueError as exc:
+                    if str(exc) == "request_binding_conflict":
+                        return self._failed(request.request_id, "request_id_conflict")
                     return self._failed(request.request_id, "broker_internal_error")
             else:
                 try:
