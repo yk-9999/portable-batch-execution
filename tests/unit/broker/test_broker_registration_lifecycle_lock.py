@@ -5,8 +5,9 @@ from __future__ import annotations
 import base64
 import errno
 import json
-import multiprocessing
 import os
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -32,6 +33,30 @@ from portable_batch_execution.lifecycle.lock import (
 _PUBLIC_SHA = "ac3a69d2c818526b87f38c848d324221e2dc2775"
 _UID = 1000
 _SORT_PARAMS = {"by": [{"column": "id"}]}
+_CROSS_PROCESS_REGISTER_WORKER = """
+import json
+import sys
+from pathlib import Path
+
+from portable_batch_execution.broker.planning import register_broker_private_run
+
+state_root = Path(sys.argv[1])
+request_id = sys.argv[2]
+public_sha = sys.argv[3]
+operation_params = json.loads(sys.argv[4])
+input_bytes = f"[{request_id}]".encode()
+job, _, _, _ = register_broker_private_run(
+    state_root=state_root,
+    request_id=request_id,
+    pack="tabular-batch",
+    operation="tabular.sort",
+    operation_params=operation_params,
+    input_bytes=input_bytes,
+    input_media_type="application/json",
+    public_sha=public_sha,
+)
+print(json.dumps({"status": "ok", "job_id": job.job_id}))
+"""
 
 
 def _register_kwargs(
@@ -253,37 +278,44 @@ def test_service_register_after_resolve_miss_reports_request_id_conflict(tmp_pat
     assert BrokerRequestStore(state_root / "controller").load(request_id) is None
 
 
-def _process_register(state_root_str: str, request_id: str, queue: multiprocessing.Queue) -> None:
-    state_root = Path(state_root_str)
-    try:
-        job, _, _, _ = register_broker_private_run(**_register_kwargs(state_root, request_id))
-        queue.put(("ok", job.job_id))
-    except Exception as exc:  # noqa: BLE001 - child must report failure
-        queue.put(("err", type(exc).__name__, str(exc)))
-
-
 def test_cross_process_concurrent_registrations(tmp_path):
     state_root = tmp_path / "mp-state"
     state_root.mkdir()
-    ctx = multiprocessing.get_context("spawn")
-    queue: multiprocessing.Queue = ctx.Queue()
     ids = [f"req-mp-{index}" for index in range(4)]
-    processes = [
-        ctx.Process(
-            target=_process_register,
-            args=(str(state_root.resolve()), request_id, queue),
+    sort_params_json = json.dumps(_SORT_PARAMS)
+    state_root_str = str(state_root.resolve())
+    processes: list[subprocess.Popen[str]] = []
+    for request_id in ids:
+        processes.append(
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    _CROSS_PROCESS_REGISTER_WORKER,
+                    state_root_str,
+                    request_id,
+                    _PUBLIC_SHA,
+                    sort_params_json,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
         )
-        for request_id in ids
-    ]
-    for process in processes:
-        process.start()
-    for process in processes:
-        process.join(timeout=30)
-        assert process.exitcode == 0
 
-    outcomes = [queue.get(timeout=5) for _ in ids]
-    assert all(item[0] == "ok" for item in outcomes)
-    assert len({item[1] for item in outcomes}) == 4
+    outcomes: list[dict[str, str]] = []
+    for process in processes:
+        try:
+            stdout, stderr = process.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise
+        assert process.returncode == 0, stderr
+        outcomes.append(json.loads(stdout))
+
+    assert all(item["status"] == "ok" for item in outcomes)
+    assert len({item["job_id"] for item in outcomes}) == 4
     assert _wave_count(state_root) == 4
 
 
