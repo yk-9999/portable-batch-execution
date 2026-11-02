@@ -146,9 +146,9 @@ def test_source_requires_four_digest_size_pinned_refs(tmp_path):
 
 
 def test_service_uses_source_only_from_private_broker_config(tmp_path, monkeypatch):
+    from portable_batch_execution.broker import service as broker_service
     from portable_batch_execution.broker.service import UnixBrokerService
     from portable_batch_execution.controller.a1_controller import A1Controller
-    from portable_batch_execution.broker import service as broker_service
 
     root = tmp_path / "state"
     refs = _refs(root)

@@ -41,14 +41,14 @@ from portable_batch_execution.packs.replay_reduction.canonicalize import (
 from portable_batch_execution.packs.replay_reduction.models import (
     BUCKET_COUNT_MAX,
 )
-from portable_batch_execution.worker.hf_private_models import (
-    HFModelDownloadError,
-    stage_private_hf_models,
-)
 from portable_batch_execution.worker.external_api_evaluation import (
     ExternalApiEvaluationError,
     execute_nvidia_openai_compatible_request,
     validate_closed_operation_params,
+)
+from portable_batch_execution.worker.hf_private_models import (
+    HFModelDownloadError,
+    stage_private_hf_models,
 )
 
 _WAVE_ID = re.compile(r"wave-[0-9]{4}")

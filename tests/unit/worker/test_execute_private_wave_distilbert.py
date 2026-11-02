@@ -179,8 +179,8 @@ def test_distilbert_rejects_digest_mismatch(tmp_path):
 
 def test_hf_pinned_delivery_has_numerical_parity_with_legacy_stream(tmp_path, monkeypatch):
     """Public model bytes come from HF; output must match the existing A1 model path."""
-    from portable_batch_execution.worker import execute_wave as worker
     from portable_batch_execution.model_delivery import HFPrivateModelDelivery
+    from portable_batch_execution.worker import execute_wave as worker
 
     old_root, new_root = tmp_path / "old", tmp_path / "new"
     old_root.mkdir()
