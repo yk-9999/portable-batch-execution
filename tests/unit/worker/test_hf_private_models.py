@@ -112,11 +112,16 @@ def test_oidc_unavailable_never_falls_back_to_static_hf_token(tmp_path, monkeypa
         hf.stage_private_hf_models(_SOURCE, _refs(), tmp_path)
 
 
-def test_oidc_exchange_errors_fail_closed(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stderr", [
+    "403 Unauthorized token=PRIVATE",
+    "400 Bad Request: invalid_grant token=PRIVATE",
+    "400 Bad Request: invalid_request token=PRIVATE",
+])
+def test_oidc_exchange_errors_fail_closed(tmp_path, monkeypatch, stderr):
     monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://github.example")
     monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "oidc-identity")
     monkeypatch.setattr(hf.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(
-        returncode=1, stdout="", stderr="403 Unauthorized token=PRIVATE"
+        returncode=1, stdout="", stderr=stderr
     ))
     with pytest.raises(hf.HFModelDownloadError, match="hf_model_auth_failed"):
         hf.stage_private_hf_models(_SOURCE, _refs(), tmp_path)

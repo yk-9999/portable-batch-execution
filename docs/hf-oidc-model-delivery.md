@@ -38,8 +38,9 @@ original delivery route across retries/restarts.
 4. In this private model repository's Settings > Trusted Publishers, add a
    **Read-only** repository publisher for GitHub Actions with claims restricted
    to GitHub repository `yk-9999/portable-batch-execution`, branch `main`,
-   and workflow `.github/workflows/execute-wave.yml`. Do not create an account
-   CI/CD identity: those do not read private model repos. Do not grant write.
+   and HF workflow claim `execute-wave.yml` (the GitHub file is
+   `.github/workflows/execute-wave.yml`). Do not create an account CI/CD
+   identity: those do not read private model repos. Do not grant write.
 5. Check account-wide private storage quota and per-job concurrent download
    behavior. Record 4/8-parallel performance and 401/403/429 behavior prior
    to changing production routing. No manual token or old HF backup token is
