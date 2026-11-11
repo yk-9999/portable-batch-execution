@@ -20,6 +20,7 @@ from .json_scalar_projection import (
     apply_json_scalar_projections_to_lazy,
 )
 from .models import EventWindowExtractRequest, SentinelPredicate
+from .row_invariants import invariant_columns, validate_row_invariants
 
 RESULT_SCHEMA_VERSION = "pbe.replay.event-window-extract-result.v2"
 
@@ -28,6 +29,18 @@ def _validated(request: dict[str, Any] | EventWindowExtractRequest) -> EventWind
     if isinstance(request, EventWindowExtractRequest):
         return request
     return EventWindowExtractRequest.model_validate(request)
+
+
+_SOURCE_INPUT_INDEX = "_source_input_index"
+_SOURCE_ROW_OFFSET = "_source_row_offset"
+
+
+def _effective_tie_break(
+    model: EventWindowExtractRequest,
+) -> tuple[str, ...]:
+    if not model.source_order_tie_break:
+        return model.tie_break_columns
+    return (*model.tie_break_columns, _SOURCE_INPUT_INDEX, _SOURCE_ROW_OFFSET)
 
 
 def _tie_break_key(row: dict[str, Any], columns: tuple[str, ...]) -> tuple[Any, ...]:
@@ -77,7 +90,7 @@ class _FactAccumulators:
         timestamp_ms = int(row["_timestamp_ms"])
         decision_ms = int(model.decision_timestamp_ms)
         causal = int(model.causal_cutoff_block)
-        tie_break = model.tie_break_columns
+        tie_break = _effective_tie_break(model)
 
         if block <= causal:
             for spec in model.trailing_windows:
@@ -174,13 +187,19 @@ def _validate_positive_row(
     return identity
 
 
-def _symbol_lazy_frame(path: str | Path, model: EventWindowExtractRequest) -> pl.LazyFrame:
-    lazy = pl.scan_parquet(str(path))
+def _symbol_lazy_frame(
+    path: str | Path,
+    model: EventWindowExtractRequest,
+    *,
+    input_index: int,
+) -> pl.LazyFrame:
+    lazy = pl.scan_parquet(str(path)).with_row_index(_SOURCE_ROW_OFFSET)
     profile = model.canonical_trade_profile
     try:
         lazy = apply_json_scalar_projections_to_lazy(lazy, profile.json_scalar_projections)
     except JsonScalarProjectionError as exc:
         raise StructuralCanonicalizeError(str(exc)) from exc
+    invariant_cols = invariant_columns(profile.row_invariants)
     _require_columns(
         lazy.collect_schema(),
         (
@@ -194,6 +213,7 @@ def _symbol_lazy_frame(path: str | Path, model: EventWindowExtractRequest) -> pl
             model.as_of_measurement_field,
             *(spec.measurement_field for spec in model.trailing_windows),
             *(spec.measurement_field for spec in model.future_windows),
+            *invariant_cols,
         ),
     )
     sentinel = profile.sentinel
@@ -206,6 +226,8 @@ def _symbol_lazy_frame(path: str | Path, model: EventWindowExtractRequest) -> pl
         pl.col(model.block_column).cast(pl.Int64, strict=False).alias("_block_int"),
         pl.col(model.timestamp_column).cast(pl.Int64, strict=False).alias("_timestamp_ms"),
         pl.col(identity_col).cast(pl.Int64, strict=False).alias("_identity_int"),
+        pl.col(_SOURCE_ROW_OFFSET).cast(pl.Int64).alias(_SOURCE_ROW_OFFSET),
+        pl.lit(input_index).cast(pl.Int64).alias(_SOURCE_INPUT_INDEX),
     )
     return lazy
 
@@ -235,9 +257,12 @@ def _stream_canonical_rows(
                 *(spec.measurement_field for spec in model.trailing_windows),
                 *(spec.measurement_field for spec in model.future_windows),
                 *(sentinel.exact_match_fields if sentinel is not None else ()),
+                *invariant_columns(profile.row_invariants),
                 "_block_int",
                 "_timestamp_ms",
                 "_identity_int",
+                _SOURCE_ROW_OFFSET,
+                _SOURCE_INPUT_INDEX,
             ]
         )
     )
@@ -252,8 +277,8 @@ def _stream_canonical_rows(
             accumulators.ingest(representative, model)
         representative = None
 
-    for path in paths:
-        lazy = _symbol_lazy_frame(path, model)
+    for input_index, path in enumerate(paths):
+        lazy = _symbol_lazy_frame(path, model, input_index=input_index)
         row_count = int(lazy.select(pl.len()).collect().item())
         offset = 0
         while offset < row_count:
@@ -268,6 +293,7 @@ def _stream_canonical_rows(
                     normalized_col=normalized_col,
                     core_fields=core_fields,
                 )
+                validate_row_invariants(row, profile.row_invariants)
                 if previous_identity is None or identity != previous_identity:
                     finalize_group()
                     previous_identity = identity
