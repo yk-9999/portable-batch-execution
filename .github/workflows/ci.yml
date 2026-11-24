@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: "3.11"
-      - uses: astral-sh/setup-uv@22695119d769bdb6f7032ad67b9bca0ef8c4a174
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d
       - run: uv sync --dev --extra distilbert
       - run: uv lock --check
       - name: Verify HF OIDC CLI command is installed
